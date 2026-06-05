@@ -49,8 +49,25 @@ fiber/coro threading — these are unnecessary for offline policy simulation.
 ## Building
 
 ```bash
-buck2 build //neteng/fboss/bgp/cpp/sim:bgp_config_parser
-buck2 build //neteng/fboss/bgp/cpp/sim:bgp_simulator     # (future)
+buck2 build //neteng/fboss/bgp/cpp/sim:bgp_config_summary
+buck2 build //neteng/fboss/bgp/cpp/sim:bgp_simulator
+```
+
+## Running
+
+`bgp_simulator` takes one or more per-switch config files, or a directory of
+them, runs the simulation to convergence, and dumps each switch's RIB:
+
+```bash
+buck2 run //neteng/fboss/bgp/cpp/sim:bgp_simulator -- <config_dir | config_file>...
+```
+
+## Testing
+
+```bash
+buck2 test //neteng/fboss/bgp/cpp/sim:BgpSwitchTest
+buck2 test //neteng/fboss/bgp/cpp/sim:BgpSimulatorTest
+buck2 test //neteng/fboss/bgp/cpp/sim:BgpSimulatorCliTest
 ```
 
 ## References
