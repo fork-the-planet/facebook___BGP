@@ -149,4 +149,42 @@ void BgpSimulator::resolvePeerLinks() {
   }
 }
 
+size_t BgpSimulator::run(size_t maxIterations) {
+  for (auto& sw : switches_) {
+    sw->originateRoutes();
+  }
+  /*
+   * Select best paths for the freshly originated routes before the first
+   * propagate pass: origination inserts paths but does not run selection, so
+   * without this the first iteration would propagate nothing and the returned
+   * iteration count would overstate the true convergence depth by one.
+   */
+  for (auto& sw : switches_) {
+    sw->runBestPathSelection();
+  }
+
+  size_t iterations = 0;
+  while (iterations < maxIterations) {
+    ++iterations;
+    for (auto& sw : switches_) {
+      sw->propagateRoutes();
+    }
+    bool changed = false;
+    for (auto& sw : switches_) {
+      if (sw->runBestPathSelection()) {
+        changed = true;
+      }
+    }
+    if (!changed) {
+      return iterations; // converged
+    }
+  }
+
+  XLOGF(
+      WARN,
+      "BgpSimulator: did not converge after {} iterations",
+      maxIterations);
+  return iterations;
+}
+
 } // namespace facebook::bgp

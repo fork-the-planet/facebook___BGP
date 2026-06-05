@@ -370,4 +370,106 @@ TEST_F(BgpSimulatorTest, ReceiveDropsAsPathLoop) {
   EXPECT_TRUE(b.peers().front().receivedRoutes().empty());
 }
 
+/*
+ * Drive a 3-switch linear topology A--B--C (A originates 10.50.0.0/24) to a
+ * bounded run() and assert the convergence outcome, parameterized over the
+ * iteration cap:
+ *   - ConvergesWellUnderCap: a generous cap lets the route reach every switch's
+ *     RIB; C learns it from B and run() stops well before the cap.
+ *   - DoesNotConvergeWithinCap: a cap of 1 cannot deliver A's prefix all the
+ * way to C, so run() returns the cap and C is left without the route (covers
+ * the non-convergence branch of run()).
+ */
+struct LinearConvergenceCase {
+  std::string name;
+  size_t maxIterations;
+  bool expectConverged;
+};
+
+class BgpLinearConvergenceTest
+    : public ::testing::TestWithParam<LinearConvergenceCase> {
+ protected:
+  /*
+   * Build A--B--C linked as A(10.0.1.1)--(10.0.1.2)B(10.0.2.2)--(10.0.2.3)C,
+   * with A originating 10.50.0.0/24, into sim_ and resolve the peer links.
+   *
+   * Note: this is an all-iBGP topology (local_as == remote_as). The simulator
+   * intentionally does not model iBGP split-horizon / re-advertisement
+   * restrictions (RFC 4271), so an iBGP-learned route is re-advertised to the
+   * next iBGP peer. Termination here relies on receiveRoutes() idempotency and
+   * AS-path loop detection rather than iBGP re-advertisement rules.
+   */
+  void buildLinearTopology() {
+    thrift::BgpConfig cfgA = makeConfig("10.0.0.1", 65000);
+    cfgA.peers() = {
+        makePeer(/*peerAddr=*/"10.0.1.2", /*localAddr=*/"10.0.1.1")};
+    cfgA.networks4() = {makeNetwork("10.50.0.0/24")};
+
+    thrift::BgpConfig cfgB = makeConfig("10.0.0.2", 65000);
+    cfgB.peers() = {
+        makePeer(/*peerAddr=*/"10.0.1.1", /*localAddr=*/"10.0.1.2"),
+        makePeer(/*peerAddr=*/"10.0.2.3", /*localAddr=*/"10.0.2.2")};
+
+    thrift::BgpConfig cfgC = makeConfig("10.0.0.3", 65000);
+    cfgC.peers() = {
+        makePeer(/*peerAddr=*/"10.0.2.2", /*localAddr=*/"10.0.2.3")};
+
+    sim_.addSwitch(std::make_shared<BgpSwitch>("A", cfgA));
+    sim_.addSwitch(std::make_shared<BgpSwitch>("B", cfgB));
+    sim_.addSwitch(std::make_shared<BgpSwitch>("C", cfgC));
+    sim_.resolvePeerLinks();
+  }
+
+  BgpSimulator sim_;
+};
+
+TEST_P(BgpLinearConvergenceTest, RunRespectsIterationCap) {
+  const auto& tc = GetParam();
+  buildLinearTopology();
+
+  const size_t iterations = sim_.run(tc.maxIterations);
+
+  const auto prefix = folly::IPAddress::createNetwork("10.50.0.0/24");
+  const BgpSwitch& c = *sim_.switches()[2];
+
+  if (tc.expectConverged) {
+    EXPECT_LT(iterations, tc.maxIterations); // converged before the safety cap
+
+    // The originated prefix reached every switch's RIB with a best path.
+    for (const auto& sw : sim_.switches()) {
+      const SimRibEntry* entry = sw->routingTable().getEntry(prefix);
+      ASSERT_NE(nullptr, entry) << sw->name();
+      EXPECT_NE(nullptr, entry->getBestPath()) << sw->name();
+    }
+    // C's best path was learned from B (B's address on the B--C link).
+    const SimRibEntry* cEntry = c.routingTable().getEntry(prefix);
+    ASSERT_NE(nullptr, cEntry);
+    const auto& cBestPath = cEntry->getBestPath();
+    ASSERT_NE(nullptr, cBestPath);
+    EXPECT_EQ("10.0.2.2", cBestPath->peerAddr);
+  } else {
+    EXPECT_EQ(tc.maxIterations, iterations); // hit the safety cap
+
+    const SimRibEntry* cEntry = c.routingTable().getEntry(prefix);
+    if (cEntry != nullptr) {
+      // C may have an entry, but it must not have selected a best path.
+      EXPECT_EQ(nullptr, cEntry->getBestPath());
+    }
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    LinearTopology,
+    BgpLinearConvergenceTest,
+    ::testing::Values(
+        LinearConvergenceCase{/*name=*/"ConvergesWellUnderCap",
+                              /*maxIterations=*/50,
+                              /*expectConverged=*/true},
+        LinearConvergenceCase{/*name=*/"DoesNotConvergeWithinCap",
+                              /*maxIterations=*/1,
+                              /*expectConverged=*/false}),
+    [](const ::testing::TestParamInfo<LinearConvergenceCase>& info) {
+      return info.param.name;
+    });
+
 } // namespace facebook::bgp

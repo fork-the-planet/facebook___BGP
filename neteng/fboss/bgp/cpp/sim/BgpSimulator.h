@@ -38,6 +38,9 @@ class BgpSwitch;
  */
 class BgpSimulator {
  public:
+  // Safety cap on convergence iterations.
+  static constexpr size_t kDefaultMaxIterations = 100;
+
   BgpSimulator() = default;
   ~BgpSimulator();
 
@@ -62,6 +65,25 @@ class BgpSimulator {
    * unmodeled neighbors). Call once after all switches are loaded.
    */
   void resolvePeerLinks();
+
+  /*
+   * Run the simulation to convergence: originate routes on every switch, then
+   * repeatedly propagate and re-run best-path selection until an iteration
+   * produces no best-path change (converged) or maxIterations is reached.
+   *
+   * Returns the number of iterations performed (>= 1 once switches exist).
+   * Convergence is indicated by a return value strictly less than
+   * maxIterations; a return value equal to maxIterations means convergence was
+   * not detected within the budget (also logged as a WARN).
+   *
+   * Contract: because convergence detected on the maxIterations-th iteration
+   * would also return maxIterations, callers that test convergence via
+   * `result < maxIterations` MUST pass a maxIterations strictly greater than
+   * the largest expected convergence count. The default kDefaultMaxIterations
+   * is a safety cap with ample headroom and satisfies this for all realistic
+   * topologies.
+   */
+  size_t run(size_t maxIterations = kDefaultMaxIterations);
 
   const std::vector<std::shared_ptr<BgpSwitch>>& switches() const {
     return switches_;

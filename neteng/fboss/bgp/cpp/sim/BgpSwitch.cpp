@@ -577,6 +577,22 @@ void BgpSwitch::receiveRoutes(
     }
 
     /*
+     * Idempotent: skip re-processing a path identical to what this peer already
+     * advertised. This keeps the convergence loop terminating and avoids
+     * duplicate received-route bookkeeping. The comparison uses the post-policy
+     * path so it matches the post-policy path stored below.
+     */
+    const SimRibEntry* existing = routingTable_.getEntry(update.prefix);
+    if (existing != nullptr) {
+      const auto& existingPaths = existing->getAllPaths();
+      const auto existingIt = existingPaths.find(peerKey);
+      if (existingIt != existingPaths.end() && existingIt->second->attrs &&
+          *existingIt->second->attrs == *path) {
+        continue;
+      }
+    }
+
+    /*
      * Publish the path before storing it (mirrors originateNetwork): a later
      * egress-policy pass in propagateRoutes const-casts the stored path and
      * feeds it to PolicyManager, which clones-on-write only for published
