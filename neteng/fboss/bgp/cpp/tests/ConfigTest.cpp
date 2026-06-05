@@ -1547,11 +1547,13 @@ TEST_F(ConfigTestFixture, lbwConfigTest) {
   }
   {
     /*
-     * link_bandwidth_bps is NOT resolved when neither advertise nor receive
-     * LBW is SET_LINK_BPS -- the value is never consumed in that case, so we
-     * skip resolving/logging it (avoids per-peer warning spam).
+     * link_bandwidth_bps is resolved whenever it is configured, even when
+     * neither advertise nor receive LBW is SET_LINK_BPS. The value is consumed
+     * independently of per-peer config by the policy engine (SET_LINK_BPS route
+     * action) and AGGREGATE_LOCAL; skipping resolution here CHECK-crashed peers
+     * that pull LBW in via a route policy.
      */
-    XLOG(INFO, "Test LBW not resolved when advertise/receive LBW disabled");
+    XLOG(INFO, "Test LBW is resolved even when advertise/receive LBW disabled");
     thrift::BgpConfig myNewConfig;
     myNewConfig.router_id() = kLocalAddr1.str();
     myNewConfig.local_as_4_byte() = kAsn1;
@@ -1577,7 +1579,7 @@ TEST_F(ConfigTestFixture, lbwConfigTest) {
         peerConfig.advertiseLinkBandwidth.value());
     EXPECT_EQ(
         ReceiveLinkBandwidth::DISABLE, peerConfig.receiveLinkBandwidth.value());
-    EXPECT_FALSE(peerConfig.linkBandwidthBps.has_value());
+    EXPECT_EQ(kLbw100G, peerConfig.linkBandwidthBps.value());
 
     // test PeeringParams
     auto params = config.getPeeringParamsForPeer(*peerToConfig.at(kPeerAddr1));
@@ -1585,15 +1587,16 @@ TEST_F(ConfigTestFixture, lbwConfigTest) {
     EXPECT_EQ(kAsn1, params.localAs);
     EXPECT_EQ(AdvertiseLinkBandwidth::DISABLE, params.advertiseLinkBandwidth);
     EXPECT_EQ(ReceiveLinkBandwidth::DISABLE, params.receiveLinkBandwidth);
-    EXPECT_FALSE(params.linkBandwidthBps.has_value());
+    EXPECT_EQ(kLbw100G, params.linkBandwidthBps.value());
   }
   {
     /*
-     * link_bandwidth_bps = "auto" but advertise/receive LBW are left unset.
-     * LBW is not in use, so "auto" must NOT be resolved (no FSDB lookup, no
-     * throw, no warning) and linkBandwidthBps stays unset.
+     * link_bandwidth_bps = "auto" but advertise/receive LBW are left unset and
+     * no peer-subnet LBW map is provided. Resolution is attempted but "auto"
+     * has no FSDB data to resolve against, so linkBandwidthBps stays unset --
+     * and with LBW not advertised/received there is no throw.
      */
-    XLOG(INFO, "Test lbw=auto with LBW unset is not resolved");
+    XLOG(INFO, "Test lbw=auto with no FSDB data resolves to unset, no throw");
     thrift::BgpConfig myNewConfig;
     myNewConfig.router_id() = kLocalAddr1.str();
     myNewConfig.local_as_4_byte() = kAsn1;

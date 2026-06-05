@@ -533,11 +533,13 @@ BgpCommonPeerGroupConfig Config::createCommonPeerGroupConfig(
       [](auto&& peer) { return peer.link_bandwidth_bps(); }, peerGroup, peer);
   std::optional<float> linkBandwidthBps = std::nullopt;
   /*
-   * link_bandwidth_bps is only meaningful when the peer actually advertises or
-   * receives link bandwidth (UCMP). When neither is SET_LINK_BPS, the value is
-   * never consumed, so we skip resolving and logging it entirely -- otherwise
-   * peers that set lbw "auto" without enabling LBW spam a warning per peer on
-   * every config load.
+   * lbwEnabled tracks whether the per-peer config actively advertises or
+   * receives link bandwidth (UCMP). It gates the per-peer log lines below (to
+   * avoid spam at scale), but NOT the value resolution: linkBandwidthBps is
+   * also consumed independently of per-peer config by the policy engine
+   * (LbwExtCommunityActionType::SET_LINK_BPS, which CHECK-fails on a missing
+   * value) and by AGGREGATE_LOCAL UCMP. Resolving it only when lbwEnabled would
+   * crash peers that pull LBW in via a route policy instead of per-peer config.
    */
   const bool lbwEnabled =
       (advertiseLinkBandwidth.has_value() &&
@@ -550,25 +552,31 @@ BgpCommonPeerGroupConfig Config::createCommonPeerGroupConfig(
         fmt::format("Peer [{}] link_bandwidth_bps not set", *peer.peer_addr()));
   }
 
-  // Resolve link-bandwidth value only when LBW is in use and a value is set
+  // Resolve link-bandwidth value whenever it is configured -- downstream
+  // consumers (policy engine, AGGREGATE_LOCAL) read it regardless of per-peer
+  // advertise/receive config.
   bool staticPeer = folly::IPAddress::validate(*peer.peer_addr());
-  if (lbwEnabled && lbwStr.has_value()) {
+  if (lbwStr.has_value()) {
     linkBandwidthBps = getLinkBandwidthBytesPerSec(*lbwStr, peer);
-    if (!linkBandwidthBps.has_value()) {
-      XLOGF(
-          WARNING,
-          "{} peer [{}] did not get a valid link_bandwidth_bps value, configured lbw {}",
-          staticPeer ? "Static" : "Dynamic",
-          *peer.peer_addr(),
-          *lbwStr);
-    } else {
-      XLOGF(
-          INFO,
-          "{} peer [{}] link_bandwidth_bps: {} BytesPerSec, configured lbw: {}",
-          staticPeer ? "Static" : "Dynamic",
-          *peer.peer_addr(),
-          *linkBandwidthBps,
-          *lbwStr);
+
+    // Only log when LBW is in use per-peer to avoid per-peer spam at scale.
+    if (lbwEnabled) {
+      if (!linkBandwidthBps.has_value()) {
+        XLOGF(
+            WARNING,
+            "{} peer [{}] did not get a valid link_bandwidth_bps value, configured lbw {}",
+            staticPeer ? "Static" : "Dynamic",
+            *peer.peer_addr(),
+            *lbwStr);
+      } else {
+        XLOGF(
+            INFO,
+            "{} peer [{}] link_bandwidth_bps: {} BytesPerSec, configured lbw: {}",
+            staticPeer ? "Static" : "Dynamic",
+            *peer.peer_addr(),
+            *linkBandwidthBps,
+            *lbwStr);
+      }
     }
   }
 
