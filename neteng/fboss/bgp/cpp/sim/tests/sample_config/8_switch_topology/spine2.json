@@ -1,0 +1,14 @@
+{
+  "router_id": "10.255.0.2",
+  "local_as_4_byte": 65000,
+  "hold_time": 30,
+  "networks4": [{"prefix": "10.255.0.2/32"}],
+  "networks6": [],
+  "peers": [
+    {"peer_addr": "10.10.0.1", "local_addr": "10.10.0.2", "next_hop4": "10.10.0.2", "next_hop6": "::1", "remote_as_4_byte": 65000},
+    {"peer_addr": "10.2.0.2", "local_addr": "10.2.0.1", "next_hop4": "10.2.0.1", "next_hop6": "::1", "remote_as_4_byte": 65002},
+    {"peer_addr": "10.4.0.2", "local_addr": "10.4.0.1", "next_hop4": "10.4.0.1", "next_hop6": "::1", "remote_as_4_byte": 65004},
+    {"peer_addr": "10.6.0.2", "local_addr": "10.6.0.1", "next_hop4": "10.6.0.1", "next_hop6": "::1", "remote_as_4_byte": 65100},
+    {"peer_addr": "10.8.0.2", "local_addr": "10.8.0.1", "next_hop4": "10.8.0.1", "next_hop6": "::1", "remote_as_4_byte": 65200}
+  ]
+}

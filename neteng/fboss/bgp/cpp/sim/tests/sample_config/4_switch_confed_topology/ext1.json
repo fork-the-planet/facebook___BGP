@@ -1,0 +1,10 @@
+{
+  "router_id": "10.255.9.1",
+  "local_as_4_byte": 64600,
+  "hold_time": 30,
+  "peers": [
+    {"peer_addr": "10.2.0.1", "local_addr": "10.2.0.2", "next_hop4": "10.2.0.2", "next_hop6": "::1", "remote_as_4_byte": 65111, "description": "external peer; sees r2 via its local-AS override 65111 (local 64600 != remote 65111) -> EXTERNAL"}
+  ],
+  "networks4": [{"prefix": "203.0.113.0/24"}],
+  "networks6": []
+}

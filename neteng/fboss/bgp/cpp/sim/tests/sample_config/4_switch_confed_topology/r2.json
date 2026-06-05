@@ -1,0 +1,12 @@
+{
+  "router_id": "10.255.0.2",
+  "local_as_4_byte": 65002,
+  "local_confed_as_4_byte": 65500,
+  "hold_time": 30,
+  "peers": [
+    {"peer_addr": "10.1.12.1", "local_addr": "10.1.12.2", "next_hop4": "10.1.12.2", "next_hop6": "::1", "remote_as_4_byte": 65001, "is_confed_peer": true, "description": "confed sub-AS peer (local 65002 != remote 65001) -> CONFED_EXTERNAL"},
+    {"peer_addr": "10.2.0.2", "local_addr": "10.2.0.1", "next_hop4": "10.2.0.1", "next_hop6": "::1", "remote_as_4_byte": 64600, "local_as_4_byte": 65111, "description": "true eBGP peer with RFC 7705 local-AS override 65111 (global 65002, remote 64600) -> EXTERNAL, effective localAsn=65111"}
+  ],
+  "networks4": [{"prefix": "10.255.0.2/32"}],
+  "networks6": []
+}

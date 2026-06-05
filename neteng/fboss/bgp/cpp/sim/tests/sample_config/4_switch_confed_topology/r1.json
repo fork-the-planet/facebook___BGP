@@ -1,0 +1,20 @@
+{
+  "router_id": "10.255.0.1",
+  "local_as_4_byte": 65001,
+  "local_confed_as_4_byte": 65500,
+  "hold_time": 30,
+  "peer_groups": [
+    {
+      "name": "confed-members",
+      "description": "Intra-confederation members of confederation 65500",
+      "is_confed_peer": true,
+      "next_hop_self": true
+    }
+  ],
+  "peers": [
+    {"peer_addr": "10.1.12.2", "local_addr": "10.1.12.1", "next_hop4": "10.1.12.1", "next_hop6": "::1", "remote_as_4_byte": 65002, "peer_group_name": "confed-members", "description": "confed sub-AS peer (local 65001 != remote 65002) -> CONFED_EXTERNAL; inherits is_confed_peer and next_hop_self from group"},
+    {"peer_addr": "10.1.13.2", "local_addr": "10.1.13.1", "next_hop4": "10.1.13.1", "next_hop6": "::1", "remote_as_4_byte": 65001, "peer_group_name": "confed-members", "next_hop_self": false, "description": "intra-confed peer sharing local sub-AS (local 65001 == remote 65001) -> INTERNAL; peer next_hop_self=false overrides group true"}
+  ],
+  "networks4": [{"prefix": "10.255.0.1/32"}],
+  "networks6": []
+}

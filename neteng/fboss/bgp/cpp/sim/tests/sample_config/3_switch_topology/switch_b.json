@@ -1,0 +1,13 @@
+{
+  "router_id": "10.0.0.2",
+  "local_as_4_byte": 65000,
+  "hold_time": 30,
+  "peers": [
+    {"peer_addr": "10.0.1.1", "local_addr": "10.0.1.2", "next_hop4": "10.0.1.2", "next_hop6": "::1", "remote_as_4_byte": 65000},
+    {"peer_addr": "10.0.2.3", "local_addr": "10.0.2.2", "next_hop4": "10.0.2.2", "next_hop6": "::1", "remote_as_4_byte": 65000}
+  ],
+  "networks4": [
+    {"prefix": "10.60.0.0/24"}
+  ],
+  "networks6": []
+}
