@@ -191,4 +191,183 @@ TEST_F(BgpSimulatorTest, DuplicateSwitchNamesWarn) {
       << "expected a WARN about the duplicate switch name";
 }
 
+/*
+ * A two-switch iBGP topology where switch A originates 10.50.0.0/24 and
+ * advertises it to switch B, parameterized over the policy attachment so the
+ * on/off matrix is explicit:
+ *   - NoPolicy:     the route reaches B's RIB and receiving peer.
+ *   - EgressBlocks: A's egress PROPAGATE_NOTHING stops it leaving A.
+ *   - IngressBlocks: B's ingress PROPAGATE_NOTHING drops it on reception.
+ */
+struct PropagationPolicyCase {
+  std::string name;
+  bool egressBlocksOnA;
+  bool ingressBlocksOnB;
+  bool expectReceivedOnB;
+};
+
+class BgpPropagationPolicyTest
+    : public ::testing::TestWithParam<PropagationPolicyCase> {};
+
+TEST_P(BgpPropagationPolicyTest, PolicyControlsPropagation) {
+  const auto& tc = GetParam();
+
+  thrift::BgpConfig cfgA = makeConfig("10.0.0.1", 65000);
+  thrift::BgpPeer peerA = makePeer("10.0.0.2", "10.0.0.1");
+  if (tc.egressBlocksOnA) {
+    cfgA.policies() = loadSamplePolicies();
+    peerA.egress_policy_name() = "PROPAGATE_NOTHING";
+  }
+  cfgA.peers() = {peerA};
+  cfgA.networks4() = {makeNetwork("10.50.0.0/24")};
+
+  thrift::BgpConfig cfgB = makeConfig("10.0.0.2", 65000);
+  thrift::BgpPeer peerB = makePeer("10.0.0.1", "10.0.0.2");
+  if (tc.ingressBlocksOnB) {
+    cfgB.policies() = loadSamplePolicies();
+    peerB.ingress_policy_name() = "PROPAGATE_NOTHING";
+  }
+  cfgB.peers() = {peerB};
+
+  BgpSimulator sim;
+  sim.addSwitch(std::make_shared<BgpSwitch>("A", cfgA));
+  sim.addSwitch(std::make_shared<BgpSwitch>("B", cfgB));
+  sim.resolvePeerLinks();
+  BgpSwitch& a = *sim.switches()[0];
+  BgpSwitch& b = *sim.switches()[1];
+
+  a.originateRoutes();
+  a.routingTable().runBestPathSelection();
+  a.propagateRoutes();
+
+  const auto prefix = folly::IPAddress::createNetwork("10.50.0.0/24");
+  if (tc.expectReceivedOnB) {
+    EXPECT_NE(nullptr, b.routingTable().getEntry(prefix));
+    ASSERT_EQ(1u, b.peers().front().receivedRoutes().size());
+    const ReceivedRoute& received = b.peers().front().receivedRoutes().front();
+    EXPECT_EQ(prefix, received.cidr);
+    EXPECT_EQ("A", received.fromSwitch);
+  } else {
+    EXPECT_EQ(nullptr, b.routingTable().getEntry(prefix));
+    EXPECT_TRUE(b.peers().front().receivedRoutes().empty());
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Policies,
+    BgpPropagationPolicyTest,
+    ::testing::Values(
+        PropagationPolicyCase{/*name=*/"NoPolicy",
+                              /*egressBlocksOnA=*/false,
+                              /*ingressBlocksOnB=*/false,
+                              /*expectReceivedOnB=*/true},
+        PropagationPolicyCase{/*name=*/"EgressBlocks",
+                              /*egressBlocksOnA=*/true,
+                              /*ingressBlocksOnB=*/false,
+                              /*expectReceivedOnB=*/false},
+        PropagationPolicyCase{/*name=*/"IngressBlocks",
+                              /*egressBlocksOnA=*/false,
+                              /*ingressBlocksOnB=*/true,
+                              /*expectReceivedOnB=*/false}),
+    [](const ::testing::TestParamInfo<PropagationPolicyCase>& info) {
+      return info.param.name;
+    });
+
+/*
+ * On eBGP advertisement a switch prepends its own ASN to the AS-path (mirrors
+ * production AdjRibCommon::updateAsPathAttributesCommon). A (AS 65000) eBGP to
+ * B (AS 65001): the route A originates with an empty AS-path arrives at B
+ * carrying A's ASN.
+ */
+TEST_F(BgpSimulatorTest, EbgpPropagationPrependsLocalAsn) {
+  thrift::BgpConfig cfgA = makeConfig("10.0.0.1", 65000);
+  thrift::BgpPeer peerAtoB = makePeer("10.0.0.2", "10.0.0.1");
+  peerAtoB.remote_as_4_byte() = 65001; // eBGP toward B
+  cfgA.peers() = {peerAtoB};
+  cfgA.networks4() = {makeNetwork("10.50.0.0/24")};
+
+  thrift::BgpConfig cfgB = makeConfig("10.0.0.2", 65001);
+  thrift::BgpPeer peerBtoA = makePeer("10.0.0.1", "10.0.0.2");
+  peerBtoA.remote_as_4_byte() = 65000; // eBGP toward A
+  cfgB.peers() = {peerBtoA};
+
+  BgpSimulator sim;
+  sim.addSwitch(std::make_shared<BgpSwitch>("A", cfgA));
+  sim.addSwitch(std::make_shared<BgpSwitch>("B", cfgB));
+  sim.resolvePeerLinks();
+  BgpSwitch& a = *sim.switches()[0];
+  BgpSwitch& b = *sim.switches()[1];
+
+  a.originateRoutes();
+  a.routingTable().runBestPathSelection();
+  a.propagateRoutes();
+
+  ASSERT_EQ(1u, b.peers().front().receivedRoutes().size());
+  const ReceivedRoute& received = b.peers().front().receivedRoutes().front();
+  const auto& asPath = received.path->getAsPath().get();
+  const std::vector<uint32_t> expectedAsSequence = {65000};
+  ASSERT_EQ(1u, asPath.size());
+  EXPECT_EQ(expectedAsSequence, asPath.front().asSequence);
+}
+
+/*
+ * AS-path prepend makes loop detection reachable in a real propagation chain.
+ * A (65000) and B (65001) are eBGP peers. A originates a route; B learns it
+ * (AS-path [65000]). When B re-advertises back to A, B prepends 65001 giving
+ * [65001, 65000]; A drops it because its own ASN is already present.
+ */
+TEST_F(BgpSimulatorTest, EbgpReadvertisementLoopIsDropped) {
+  thrift::BgpConfig cfgA = makeConfig("10.0.0.1", 65000);
+  thrift::BgpPeer peerAtoB = makePeer("10.0.0.2", "10.0.0.1");
+  peerAtoB.remote_as_4_byte() = 65001;
+  cfgA.peers() = {peerAtoB};
+  cfgA.networks4() = {makeNetwork("10.50.0.0/24")};
+
+  thrift::BgpConfig cfgB = makeConfig("10.0.0.2", 65001);
+  thrift::BgpPeer peerBtoA = makePeer("10.0.0.1", "10.0.0.2");
+  peerBtoA.remote_as_4_byte() = 65000;
+  cfgB.peers() = {peerBtoA};
+
+  BgpSimulator sim;
+  sim.addSwitch(std::make_shared<BgpSwitch>("A", cfgA));
+  sim.addSwitch(std::make_shared<BgpSwitch>("B", cfgB));
+  sim.resolvePeerLinks();
+  BgpSwitch& a = *sim.switches()[0];
+  BgpSwitch& b = *sim.switches()[1];
+
+  a.originateRoutes();
+  a.routingTable().runBestPathSelection();
+  a.propagateRoutes(); // A -> B
+
+  b.routingTable().runBestPathSelection();
+  b.propagateRoutes(); // B -> A re-advertises A's route back
+
+  // A must not accept its own route back (AS-path loop on 65000).
+  EXPECT_TRUE(a.peers().front().receivedRoutes().empty());
+}
+
+/*
+ * A received route whose AS-path already contains the receiver's ASN is a loop
+ * and is dropped.
+ */
+TEST_F(BgpSimulatorTest, ReceiveDropsAsPathLoop) {
+  thrift::BgpConfig cfgB = makeConfig("10.0.0.2", 65001);
+  cfgB.peers() = {makePeer("10.0.0.1", "10.0.0.2")};
+  BgpSwitch b("B", cfgB);
+
+  // The sender's peer (A's), whose local address identifies the session to B.
+  thrift::BgpPeer aPeerCfg = makePeer("10.0.0.2", "10.0.0.1");
+  BgpPeer fromPeerA(aPeerCfg);
+  fromPeerA.setLocalAsn(65000);
+  fromPeerA.setRouterId(folly::IPAddress("10.0.0.1").asV4().toLongHBO());
+
+  const auto prefix = folly::IPAddress::createNetwork("10.50.0.0/24");
+  // AS-path contains B's own ASN (65001) -> loop.
+  std::vector<RouteUpdate> routes = {{prefix, makePathWithAsPath({65001})}};
+  b.receiveRoutes(fromPeerA, "A", routes);
+
+  EXPECT_EQ(nullptr, b.routingTable().getEntry(prefix));
+  EXPECT_TRUE(b.peers().front().receivedRoutes().empty());
+}
+
 } // namespace facebook::bgp

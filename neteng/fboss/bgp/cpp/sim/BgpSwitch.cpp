@@ -241,6 +241,42 @@ std::optional<uint32_t> asPathLoopAsn(
   return std::nullopt;
 }
 
+/*
+ * Apply outbound AS-path handling before advertising to a peer of type
+ * `egressType`, mirroring production
+ * AdjRibCommon::updateAsPathAttributesCommon:
+ *  - INTERNAL (iBGP): the AS-path is left unchanged.
+ *  - EXTERNAL (eBGP): drop confederation segments, then prepend the local ASN
+ *    (the confederation identifier for a confed member) to the AS_SEQUENCE.
+ *  - CONFED_EXTERNAL (confed-eBGP): prepend the confederation sub-AS
+ *    (local_confed_as) to the AS_CONFED_SEQUENCE.
+ * The input path is immutable (published); a clone is modified and republished
+ * so the RIB-held best path is never mutated. Each peer gets its own clone.
+ *
+ * TODO: replaceZerosInAsPath, local-pref strip, MED unset
+ */
+std::shared_ptr<const BgpPath> applyEgressAsPath(
+    const std::shared_ptr<const BgpPath>& path,
+    PeerType egressType,
+    uint32_t localAsn,
+    const std::optional<uint32_t>& localConfedAsn) {
+  if (egressType == PeerType::INTERNAL) {
+    return path;
+  }
+  auto mutablePath = std::const_pointer_cast<BgpPath>(path)->clone();
+  nettools::bgplib::BgpAttrAsPathC newAsPath = mutablePath->getAsPath().get();
+  if (egressType == PeerType::CONFED_EXTERNAL) {
+    prependAsPath(
+        newAsPath, localConfedAsn.value_or(localAsn), /*isConfedPeer=*/true);
+  } else {
+    removeConfedAsPathSegments(newAsPath);
+    prependAsPath(newAsPath, localAsn, /*isConfedPeer=*/false);
+  }
+  mutablePath->setAsPath(std::move(newAsPath));
+  mutablePath->publish();
+  return mutablePath;
+}
+
 } // namespace
 
 BgpSwitch::BgpSwitch(std::string name, thrift::BgpConfig config)
@@ -440,6 +476,44 @@ std::shared_ptr<const BgpPath> BgpSwitch::applyRoutePolicy(
     return nullptr;
   }
   return it->second->attrs;
+}
+
+// TODO: track split-horizon + route-reflection for M2 parity
+void BgpSwitch::propagateRoutes() {
+  const auto prefixes = advertisablePrefixes();
+  for (auto& peer : peers_) {
+    if (!peer.isLinked()) {
+      continue;
+    }
+    const PeerType egressType = peer.peerType();
+    std::vector<RouteUpdate> updates;
+    for (const auto& prefix : prefixes) {
+      const SimRibEntry* entry = routingTable_.getEntry(prefix);
+      if (entry == nullptr) {
+        continue;
+      }
+      const auto& bestPath = entry->getBestPath();
+      if (!bestPath) {
+        continue;
+      }
+      std::shared_ptr<const BgpPath> path = bestPath->attrs;
+      if (!peer.egressPolicyName().empty()) {
+        path = applyRoutePolicy(peer.egressPolicyName(), prefix, path);
+        if (!path) {
+          continue; // egress policy rejected this prefix for this peer
+        }
+      }
+      /*
+       * Prepend our ASN (for (confed-)external peers) before advertising so the
+       * AS-path grows across hops and downstream loop detection can fire.
+       */
+      path = applyEgressAsPath(path, egressType, localAsn_, localConfedAsn_);
+      updates.push_back(RouteUpdate{prefix, std::move(path)});
+    }
+    if (!updates.empty()) {
+      peer.getRemoteSwitch()->receiveRoutes(peer, name_, updates);
+    }
+  }
 }
 
 void BgpSwitch::receiveRoutes(
