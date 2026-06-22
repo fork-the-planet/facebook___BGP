@@ -114,7 +114,7 @@ class FiberSocket {
       const folly::SocketAddress& destAddr,
       std::chrono::milliseconds connectTimeout = std::chrono::milliseconds(0),
       const folly::SocketAddress& bindAddr = folly::AsyncSocket::anyAddress(),
-      folly::Optional<RQueue<FiberSocketInputMessageT>> iqueue = folly::none,
+      std::optional<RQueue<FiberSocketInputMessageT>> iqueue = std::nullopt,
       bool disableTSocks = false,
       std::shared_ptr<folly::SSLContext> ctx = nullptr);
 

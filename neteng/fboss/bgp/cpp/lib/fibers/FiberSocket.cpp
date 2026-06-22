@@ -17,7 +17,6 @@
 #include "neteng/fboss/bgp/cpp/lib/fibers/FiberSocket.h"
 
 #include <folly/ExceptionWrapper.h>
-#include <folly/Optional.h>
 #include <folly/fibers/FiberManagerMap.h>
 #include <folly/logging/xlog.h>
 
@@ -46,7 +45,7 @@ class ConnectCallback : public folly::AsyncSocket::ConnectCallback {
   const std::shared_ptr<folly::AsyncSocket> socket_;
 
   // this promise is used to pass the result to the caller
-  folly::Optional<Promise<void>> promise_;
+  std::optional<Promise<void>> promise_;
 
   //
   // ConnectCallbcack implementation
@@ -100,7 +99,7 @@ class ReadCallback : public folly::AsyncSocket::ReadCallback,
   const std::shared_ptr<folly::AsyncSocket> socket_;
 
   // pass the result back to the caller via this promise
-  folly::Optional<Promise<size_t>> promise_;
+  std::optional<Promise<size_t>> promise_;
 
   // the read buffer we store to hand off to callback - obtained from user
   folly::IOBuf* const buf_;
@@ -176,7 +175,7 @@ class WriteCallback : public folly::AsyncSocket::WriteCallback {
 
  private:
   // the promise to pass result back to the caller
-  folly::Optional<Promise<void>> promise_;
+  std::optional<Promise<void>> promise_;
 
   //
   // Methods of WriteCallback
@@ -267,7 +266,7 @@ folly::Expected<FiberSocket, FiberSocketError> FiberSocket::makeConnectedSocket(
     const folly::SocketAddress& destAddr,
     std::chrono::milliseconds connectTimeout,
     const folly::SocketAddress& bindAddr,
-    folly::Optional<RQueue<FiberSocketInputMessageT>> iqueue,
+    std::optional<RQueue<FiberSocketInputMessageT>> iqueue,
     bool disableTSocks,
     std::shared_ptr<folly::SSLContext> ctx) {
   // get the event base driving fibers on the current thread

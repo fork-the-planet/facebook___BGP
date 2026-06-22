@@ -16,9 +16,12 @@
 
 #pragma once
 
+#include <folly/coro/SharedMutex.h>
+
 #include "configerator/structs/neteng/bgp_policy/thrift/gen-cpp2/rib_policy_types.h"
 #include "neteng/fboss/bgp/cpp/BgpServiceBase.h"
 #include "neteng/fboss/bgp/cpp/peer/NeighborWatcher.h"
+#include "neteng/fboss/bgp/cpp/rib/RibDC.h"
 #include "neteng/fboss/bgp/if/gen-cpp2/bgp_thrift_types.h"
 
 namespace facebook::bgp {
@@ -28,7 +31,7 @@ class BgpServiceDC : public BgpServiceBase {
   BgpServiceDC(
       PeerManager& peerMgr,
       std::shared_ptr<ConfigManager> configManager,
-      RibBase& rib,
+      RibDC& rib,
       std::shared_ptr<NeighborWatcher> neighborWatcher,
       Watchdog& watchdog,
       bool enable_thrift_protection);
@@ -80,10 +83,42 @@ class BgpServiceDC : public BgpServiceBase {
   co_getActivePathSelectionCriteria(
       std::unique_ptr<std::vector<std::string>> prefixes) override;
 
+  /**
+   * [Route Filter Policy — FILE_MODE gating]
+   * Override base to reject Thrift-based CRF updates when FILE_MODE is active.
+   */
+  folly::coro::Task<std::unique_ptr<neteng::fboss::bgp::thrift::TResult>>
+  co_setRouteFilterPolicy(
+      std::unique_ptr<rib_policy::TRouteFilterPolicy> policy) override;
+
+  folly::coro::Task<void> co_clearRouteFilterPolicy() override;
+
+  /**
+   * [Route Filter Policy — File Mode]
+   * Refresh CRF policy from the local artifact file.
+   * Reads CrfPolicyArtifact, syncs dryrun mode, and applies policy if
+   * dryrun=false (FILE_MODE).
+   */
+  folly::coro::Task<std::unique_ptr<neteng::fboss::bgp::thrift::TResult>>
+  co_setCrfPolicyFromFile() override;
+
   folly::coro::Task<void> co_clearIngressEgressRouteFiltersPolicy() override;
   folly::coro::Task<void> co_clearGoldenPrefixesPolicy() override;
   folly::coro::Task<std::unique_ptr<std::map<std::string, int>>>
   co_getGoldenPrefixSubnetCounts() override;
+
+  /**
+   * [Partial Drain]
+   */
+  folly::coro::Task<
+      std::unique_ptr<neteng::fboss::bgp::thrift::TPartialDrainStatus>>
+  co_getPartialDrainStatus() override;
+  folly::coro::Task<
+      std::unique_ptr<neteng::fboss::bgp::thrift::TPartialDrainState>>
+  co_getPartialDrainState() override;
+  folly::coro::Task<std::unique_ptr<
+      std::vector<neteng::fboss::bgp::thrift::TPartiallyDrainedPrefix>>>
+  co_getPartiallyDrainedPrefixes() override;
 
   /**
    * [Local Route Injection] DC-only RPCs. Not declared in BgpServiceBase —
@@ -111,7 +146,19 @@ class BgpServiceDC : public BgpServiceBase {
           prefixes) override;
 
  private:
+  RibDC& ribDC_;
   std::shared_ptr<NeighborWatcher> neighborWatcher_;
+
+  /*
+   * DC-typed reference to the same Rib instance that the base class
+   * stores via RibBase&. Lets DC-only handlers reach RibDC's CPS
+   * surfaces (setPathSelectionPolicy / getPathSelectionPolicy /
+   * clearPathSelectionPolicy / getPathSelectionPolicyVersion /
+   * getActivePathSelectionCriteria) without a downcast at every call
+   * site. Initialized from the ctor parameter; lifetime mirrors rib_.
+   */
+  RibDC& dcRib_;
+  folly::coro::SharedMutex crfPolicyMutex_;
 };
 
 } // namespace facebook::bgp

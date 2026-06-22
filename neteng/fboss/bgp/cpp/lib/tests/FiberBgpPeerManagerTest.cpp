@@ -53,6 +53,7 @@
 #include "neteng/fboss/bgp/cpp/lib/fibers/Utils.h"
 #include "neteng/fboss/bgp/cpp/lib/tests/FiberBgpPeerManagerTestUtils.h"
 #include "neteng/fboss/bgp/cpp/stats/Stats.h"
+#include "neteng/fboss/bgp/cpp/tests/BoundedWaitUtils.h"
 
 DEFINE_bool(
     enable_egress_queue_backpressure,
@@ -72,7 +73,6 @@ using facebook::network::toIPPrefix;
 namespace thrift = facebook::network::thrift;
 using folly::IPAddress;
 using folly::IPAddressV4;
-using folly::Optional;
 using folly::SocketAddress;
 using std::make_shared;
 using std::shared_ptr;
@@ -405,8 +405,15 @@ TEST_F(FiberBgpPeerManagerFixture, MonitoredFiberBgpPeerTest) {
       EXPECT_TRUE(peerMgr2->getMonitoredItem().rlock()->contains(monitorKey));
     }
 
-    // stop peer from one end
-    peerMgr2->stopPeer(peerAddr2, true /* withGR */);
+    // Stop peer from one end. This test exercises the monitoring lifecycle
+    // (key added on session-up, removed on session-down), not graceful
+    // restart. stopPeer() retries connecting for BOTH withGR=true and
+    // withGR=false (see FiberBgpPeerManager.h), so the session reconnects and
+    // re-adds the monitor key; the poll below then only catches a transient
+    // absent window, which races under load. Use shutdownPeer() instead: it
+    // terminates the session AND stops attempting connection, keeping the peer
+    // idle so the monitor key stays removed and the assertion is deterministic.
+    peerMgr2->shutdownPeer(peerAddr2);
 
     // confirm monitored key removed after session goes down
     waitTillSessionsGoDown(fm, peerMgr2, {peerId2}, std::chrono::seconds(30));
@@ -884,15 +891,15 @@ TEST_F(FiberBgpPeerManagerFixture, BgpSessionUpCoroNotifyQueueTest) {
   evb.loop();
 
   // confirm the content inside queue
-  auto stateEvt1 =
-      folly::coro::blockingWait(peerMgr1->getNotifyCoroQueue().pop());
+  auto stateEvt1 = facebook::bgp::test::boundedBlockingPop(
+      peerMgr1->getNotifyCoroQueue(), "peerMgr1->getNotifyCoroQueue()");
   ASSERT_TRUE(
       std::holds_alternative<FiberBgpPeer::ObservableStateT>(stateEvt1));
   auto state1 = std::get<FiberBgpPeer::ObservableStateT>(stateEvt1);
   EXPECT_EQ(state1.state, BgpSessionState::ESTABLISHED);
 
-  auto stateEvt2 =
-      folly::coro::blockingWait(peerMgr1->getNotifyCoroQueue().pop());
+  auto stateEvt2 = facebook::bgp::test::boundedBlockingPop(
+      peerMgr1->getNotifyCoroQueue(), "peerMgr1->getNotifyCoroQueue()");
   ASSERT_TRUE(
       std::holds_alternative<FiberBgpPeer::ObservableStateT>(stateEvt2));
   auto state2 = std::get<FiberBgpPeer::ObservableStateT>(stateEvt2);
@@ -1202,9 +1209,24 @@ TEST_F(FiberBgpPeerManagerFixture, PeeringStateResetOnStopWithGRTest) {
     // Stop the peer with GR
     peerMgr1->stopPeer(peerAddr1, true /*withGR*/);
 
-    fm.addTask([this, &fm, peer1] {
-      waitTillSessionsGoDown(fm, peerMgr1, {peerId1});
-      waitTillSessionsGoDown(fm, peerMgr2, {peerId2});
+    fm.addTask([this, peer1] {
+      // stopPeer(withGR=true) tears the sessions down and then lets them
+      // reconnect, so the managers' isPeerUp state can flap back up and race
+      // the assertions below. Gate on the MONOTONIC terminated callback count
+      // instead: it only ever increases, so reaching 1 proves the session
+      // terminated, and breaking synchronously here (no fiber yield before the
+      // assertions) means a reconnect cannot re-establish in between. The
+      // generous timeout absorbs scheduling latency under parallel load, which
+      // the helper's silent 5s default did not.
+      auto downStart = std::chrono::steady_clock::now();
+      while (std::chrono::steady_clock::now() - downStart <
+             std::chrono::seconds(30)) {
+        if (callback1.getTerminatedCallbackCount(peerId1) >= 1 &&
+            callback2.getTerminatedCallbackCount(peerId2) >= 1) {
+          break;
+        }
+        fiberSleepFor(1ms);
+      }
 
       EXPECT_EQ(1, callback1.getEstablishedCallbackCount(peerId1));
       EXPECT_EQ(1, callback1.getTerminatedCallbackCount(peerId1));
@@ -1261,9 +1283,23 @@ TEST_F(FiberBgpPeerManagerFixture, StopPeerWithGracefulRestartAtOneEndTest) {
     // test stopPeer(GR = true)
     peerMgr1->stopPeer(peerAddr1, true /*withGR*/);
 
-    fm.addTask([this, &fm] {
-      waitTillSessionsGoDown(fm, peerMgr1, {peerId1});
-      waitTillSessionsGoDown(fm, peerMgr2, {peerId2});
+    fm.addTask([this] {
+      // Gate the GR down phase on the MONOTONIC terminated callback count
+      // rather than the manager's flapping isPeerUp state. stopPeer(withGR)
+      // lets the session reconnect, so a plain isPeerUp wait can miss the
+      // transient down window (or the helper's silent 5s default can expire
+      // under load), racing the down assertions below. Breaking synchronously
+      // once both peers report a termination keeps established at 1 (a TCP+BGP
+      // reconnect cannot complete before the assertions run).
+      auto downStart = std::chrono::steady_clock::now();
+      while (std::chrono::steady_clock::now() - downStart <
+             std::chrono::seconds(30)) {
+        if (callback1.getTerminatedCallbackCount(peerId1) >= 1 &&
+            callback2.getTerminatedCallbackCount(peerId2) >= 1) {
+          break;
+        }
+        fiberSleepFor(1ms);
+      }
 
       EXPECT_EQ(1, callback1.getEstablishedCallbackCount(peerId1));
       EXPECT_EQ(1, callback1.getTerminatedCallbackCount(peerId1));
@@ -1273,8 +1309,18 @@ TEST_F(FiberBgpPeerManagerFixture, StopPeerWithGracefulRestartAtOneEndTest) {
       EXPECT_EQ(1, callback2.getTerminatedCallbackCount(peerId2));
       EXPECT_FALSE(callback2.isSessionUp(peerId2));
 
-      waitTillSessionsComeUp(fm, peerMgr1, {peerId1});
-      waitTillSessionsComeUp(fm, peerMgr2, {peerId2});
+      // Gate the GR reconnect (up) phase on the MONOTONIC established count
+      // reaching 2 for both peers, again with a generous timeout in place of
+      // the helper's silent 5s default which expired under parallel load.
+      auto upStart = std::chrono::steady_clock::now();
+      while (std::chrono::steady_clock::now() - upStart <
+             std::chrono::seconds(30)) {
+        if (callback1.getEstablishedCallbackCount(peerId1) >= 2 &&
+            callback2.getEstablishedCallbackCount(peerId2) >= 2) {
+          break;
+        }
+        fiberSleepFor(1ms);
+      }
 
       EXPECT_EQ(2, callback1.getEstablishedCallbackCount(peerId1));
       EXPECT_EQ(1, callback1.getTerminatedCallbackCount(peerId1));
@@ -3266,8 +3312,7 @@ TEST_F(FiberBgpPeerManagerFixture, BgpSessionUpAOToPATest) {
 
 class MockFiberServerSocket : public FiberServerSocket {
  public:
-  explicit MockFiberServerSocket(
-      folly::Optional<folly::SocketAddress> localAddr)
+  explicit MockFiberServerSocket(std::optional<folly::SocketAddress> localAddr)
       : FiberServerSocket(std::move(localAddr)) {}
 
   MOCK_METHOD(
@@ -4678,7 +4723,7 @@ TEST_F(FiberBgpPeerManagerFixture, SendReceiveLongBgpUpdateTest) {
     readBaton.post();
 
     /* Wait for all messages to be received. */
-    cleanupBaton.wait();
+    facebook::bgp::test::boundedBatonWait(cleanupBaton, "cleanupBaton");
     peerMgr1->shutdownWithGR(false);
     peerMgr2->shutdownWithGR(false);
 
@@ -4695,13 +4740,13 @@ TEST_F(FiberBgpPeerManagerFixture, SendReceiveLongBgpUpdateTest) {
   });
 
   fm.addTask([&] {
-    readBaton.wait();
+    facebook::bgp::test::boundedBatonWait(readBaton, "readBaton");
     auto oqueue2 = peerMgr2->getPeerOutputQueue(r2PeerId1);
 
     /* Pop update messages until we reach EoR. */
     std::vector<std::shared_ptr<const BgpUpdate2>> rcvdUpdates;
     while (true) {
-      auto msg = folly::coro::blockingWait(oqueue2->pop());
+      auto msg = facebook::bgp::test::boundedBlockingPop(*oqueue2, "oqueue2");
       if (std::holds_alternative<BgpEndOfRib>(msg)) {
         break;
       }

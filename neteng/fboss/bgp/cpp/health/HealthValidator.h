@@ -88,6 +88,10 @@ class HealthValidator {
    * SKIPPED when NHT is disabled in config, FAIL when NHT is enabled
    * but the platform does not provide a NetlinkWrapper. */
   virtual TModuleHealthReport checkNetlinkWrapper();
+
+  /* Virtual: BB override returns SKIPPED (planned exit tracking
+   * is not meaningful in EBB context). */
+  virtual THealthCheckResult checkPlannedExit();
   TModuleHealthReport checkNexthopTracker();
   TModuleHealthReport checkFibAgent();
   TModuleHealthReport checkThriftEndpoint();

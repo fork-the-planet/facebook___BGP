@@ -35,8 +35,10 @@
 #include <folly/coro/GtestHelpers.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/logging/xlog.h>
+#include <stdexcept>
 #include "fboss/agent/gen-cpp2/switch_state_types.h"
 #include "fboss/agent/if/gen-cpp2/common_types.h"
+#include "fboss/agent/if/gen-cpp2/ctrl_types.h"
 #include "fboss/fsdb/if/facebook/gen-cpp2/fsdb_model_types.h"
 #include "fboss/fsdb/oper/instantiations/FsdbCowRoot.h"
 #include "neteng/fboss/bgp/cpp/common/RibMessage.h"
@@ -212,6 +214,61 @@ TEST_F(FsdbFibWatcherTest, RegisterPeersV4AndV6) {
   evb_.loopOnce();
 
   // No crash; paths registered with default switch ID
+}
+
+// ---------------------------------------------------------------------------
+// RIB-IN-driven runtime subscription tests
+// ---------------------------------------------------------------------------
+
+TEST_F(FsdbFibWatcherTest, FilterNewNexthopsDeDupesAndSkipsTracked) {
+  /**
+   * filterNewNexthops() returns only nexthops not already tracked, and
+   * de-dupes within the input.
+   **/
+  auto subMgr = std::make_shared<fboss::fsdb::FsdbCowStateSubManager>(
+      fboss::fsdb::SubscriptionOptions("test"),
+      fboss::utils::ConnectionOptions("::1", 0));
+  auto watcher =
+      std::make_shared<FsdbFibWatcher>(nexthopCache_, ribInQ_, &evb_, subMgr);
+
+  // Nothing tracked yet: both unique inputs returned, duplicate collapsed.
+  auto fresh = watcher->filterNewNexthops({kPeerV4, kPeerV6, kPeerV4});
+  EXPECT_EQ(fresh.size(), 2);
+  bool hasV4 = false, hasV6 = false;
+  for (const auto& ip : fresh) {
+    hasV4 |= (ip == kPeerV4);
+    hasV6 |= (ip == kPeerV6);
+  }
+  EXPECT_TRUE(hasV4);
+  EXPECT_TRUE(hasV6);
+}
+
+TEST_F(FsdbFibWatcherTest, AddNexthopPathsTracksAndDeDupes) {
+  /**
+   * addNexthopPaths() registers new nexthops for tracking; subsequently
+   * filterNewNexthops() treats them as already tracked, while a fresh
+   * nexthop is still reported as new. Re-adding is idempotent.
+   **/
+  auto subMgr = std::make_shared<fboss::fsdb::FsdbCowStateSubManager>(
+      fboss::fsdb::SubscriptionOptions("test"),
+      fboss::utils::ConnectionOptions("::1", 0));
+  auto watcher =
+      std::make_shared<FsdbFibWatcher>(nexthopCache_, ribInQ_, &evb_, subMgr);
+
+  // Agent is not running; ensureSwitchIds() falls back to "id=0".
+  watcher->addNexthopPaths({kPeerV4, kPeerV6});
+
+  // Already-tracked nexthops are filtered out.
+  EXPECT_TRUE(watcher->filterNewNexthops({kPeerV4, kPeerV6}).empty());
+
+  // A new nexthop is still reported as new.
+  auto fresh = watcher->filterNewNexthops({kPeerV6, kPeerV6_2});
+  EXPECT_EQ(fresh.size(), 1);
+  EXPECT_EQ(fresh.front(), kPeerV6_2);
+
+  // Re-adding an already-tracked nexthop is a no-op.
+  watcher->addNexthopPaths({kPeerV4});
+  EXPECT_TRUE(watcher->filterNewNexthops({kPeerV4}).empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +615,158 @@ CO_TEST_F(FsdbFibWatcherTest, ProcessFibUpdateUnreachableCostIsNullopt) {
   auto status2 = nexthopCache_->registerAndGetNexthopStatus(kPeerV4);
   EXPECT_FALSE(status2.isReachable());
   EXPECT_EQ(std::nullopt, status2.getIgpCost());
+}
+
+// ---------------------------------------------------------------------------
+// addNexthopPaths: failure handling (no crash, rollback, retry)
+// ---------------------------------------------------------------------------
+
+namespace {
+/*
+ * Test seam: a watcher whose path registration can be forced to throw, to
+ * exercise addNexthopPaths's no-crash / rollback / retry behavior without a
+ * live FSDB sub manager. addFsdbPathsForNexthop is virtual for this purpose.
+ */
+class ThrowingFsdbFibWatcher : public FsdbFibWatcher {
+ public:
+  using FsdbFibWatcher::FsdbFibWatcher;
+  int pendingFailures{0}; // next N addFsdbPathsForNexthop calls throw
+
+ private:
+  void addFsdbPathsForNexthop(const folly::IPAddress& /*nexthop*/) override {
+    if (pendingFailures > 0) {
+      --pendingFailures;
+      throw std::runtime_error("injected addPath failure");
+    }
+    /*
+     * Success path is intentionally a no-op: the base addNexthopPaths records
+     * the nexthop in subscribedPeers_ on return. We avoid touching the real sub
+     * manager so the test stays hermetic.
+     */
+  }
+};
+
+std::shared_ptr<fboss::fsdb::FsdbCowStateSubManager> makeTestSubMgr() {
+  return std::make_shared<fboss::fsdb::FsdbCowStateSubManager>(
+      fboss::fsdb::SubscriptionOptions("test"),
+      fboss::utils::ConnectionOptions("::1", 0));
+}
+} // namespace
+
+// A throw while registering paths must not escape addNexthopPaths (no crash),
+// must NOT mark the nexthop as tracked, and the nexthop must be retried (and
+// succeed) on a subsequent request.
+TEST_F(FsdbFibWatcherTest, AddNexthopPathsThrowIsCaughtRolledBackAndRetried) {
+  auto watcher = std::make_shared<ThrowingFsdbFibWatcher>(
+      nexthopCache_, ribInQ_, &evb_, makeTestSubMgr());
+
+  watcher->pendingFailures = 1; // fail the first registration
+  EXPECT_NO_THROW(watcher->addNexthopPaths({kPeerV4}));
+
+  // Failed nexthop was rolled back -> still considered new (retry-able), not
+  // silently skipped.
+  EXPECT_EQ(
+      (std::vector<folly::IPAddress>{kPeerV4}),
+      watcher->filterNewNexthops({kPeerV4}));
+
+  // Retry (no failure armed) succeeds -> nexthop becomes tracked.
+  EXPECT_NO_THROW(watcher->addNexthopPaths({kPeerV4}));
+  EXPECT_TRUE(watcher->filterNewNexthops({kPeerV4}).empty());
+}
+
+// A failure on one nexthop in a batch must not abort registration of the rest.
+TEST_F(FsdbFibWatcherTest, AddNexthopPathsFailureDoesNotBlockOtherNexthops) {
+  auto watcher = std::make_shared<ThrowingFsdbFibWatcher>(
+      nexthopCache_, ribInQ_, &evb_, makeTestSubMgr());
+
+  watcher->pendingFailures = 1; // only the first nexthop in the batch fails
+  EXPECT_NO_THROW(watcher->addNexthopPaths({kPeerV4, kPeerV6}));
+
+  // kPeerV4 failed (still new); kPeerV6 succeeded (tracked).
+  EXPECT_EQ(
+      (std::vector<folly::IPAddress>{kPeerV4}),
+      watcher->filterNewNexthops({kPeerV4, kPeerV6}));
+}
+
+// ---------------------------------------------------------------------------
+// lookupIgpCostFromRoute: protocol/client-aware IGP cost extraction
+// ---------------------------------------------------------------------------
+
+namespace {
+fboss::NextHopThrift makeNexthop(char addrByte, std::optional<int64_t> cost) {
+  fboss::NextHopThrift nh;
+  nh.address()->addr() = std::string(4, addrByte);
+  if (cost.has_value()) {
+    nh.cost() = *cost;
+  }
+  return nh;
+}
+} // namespace
+
+// With no client configured, cost is the minimum over the resolved fwd
+// nexthops (current behavior).
+TEST(FsdbFibWatcherCostTest, NoClientUsesFwdMinCost) {
+  fboss::state::RouteFields route;
+  route.fwd()->nexthops() = {makeNexthop(1, 20), makeNexthop(2, 10)};
+
+  EXPECT_EQ(10u, FsdbFibWatcher::lookupIgpCostFromRoute(route, std::nullopt));
+}
+
+// With a client configured, cost comes solely from that client's nexthops
+// (minimized). There is NO intersection with fwd: every one of the client's
+// nexthops counts, and the fwd-side costs are not consulted.
+TEST(FsdbFibWatcherCostTest, ClientCostIgnoresFwdNoIntersection) {
+  fboss::state::RouteFields route;
+  // fwd has addr 1 and 2; its costs (99) must be ignored on the client path.
+  route.fwd()->nexthops() = {makeNexthop(1, 99), makeNexthop(2, 99)};
+  // OPENR advertises addr 1 (cost 5, in fwd) and addr 3 (cost 3, NOT in fwd).
+  (*route.nexthopsmulti()->client2NextHopEntry())[fboss::ClientID::OPENR]
+      .nexthops() = {makeNexthop(1, 5), makeNexthop(3, 3)};
+
+  // Min over ALL OPENR nexthops -> 3. addr 3 is counted even though it is not
+  // in fwd (no intersection), and fwd's own cost 99 is ignored.
+  EXPECT_EQ(
+      3u,
+      FsdbFibWatcher::lookupIgpCostFromRoute(route, fboss::ClientID::OPENR));
+}
+
+// If the configured client has no entry for the route, cost is unset.
+TEST(FsdbFibWatcherCostTest, MissingClientEntryReturnsNullopt) {
+  fboss::state::RouteFields route;
+  route.fwd()->nexthops() = {makeNexthop(1, 7)};
+  (*route.nexthopsmulti()->client2NextHopEntry())[fboss::ClientID::BGPD]
+      .nexthops() = {makeNexthop(1, 5)};
+
+  EXPECT_EQ(
+      std::nullopt,
+      FsdbFibWatcher::lookupIgpCostFromRoute(route, fboss::ClientID::OPENR));
+}
+
+// Even when none of the client's nexthops overlap fwd, the cost is still taken
+// from the client's nexthops: we do not check whether the two sets intersect.
+TEST(FsdbFibWatcherCostTest, ClientCostTakenEvenWithoutFwdOverlap) {
+  fboss::state::RouteFields route;
+  route.fwd()->nexthops() = {makeNexthop(2, 99)};
+  (*route.nexthopsmulti()->client2NextHopEntry())[fboss::ClientID::OPENR]
+      .nexthops() = {makeNexthop(1, 5)};
+
+  // addr 1 is not in fwd, but its cost is still used (no intersection check).
+  EXPECT_EQ(
+      5u,
+      FsdbFibWatcher::lookupIgpCostFromRoute(route, fboss::ClientID::OPENR));
+}
+
+// If the configured client's entry exists but none of its nexthops carry a
+// cost, the cost is unset (route stays reachable, cost N/A).
+TEST(FsdbFibWatcherCostTest, ClientWithoutCostReturnsNullopt) {
+  fboss::state::RouteFields route;
+  route.fwd()->nexthops() = {makeNexthop(1, 99)};
+  (*route.nexthopsmulti()->client2NextHopEntry())[fboss::ClientID::OPENR]
+      .nexthops() = {makeNexthop(1, std::nullopt)};
+
+  EXPECT_EQ(
+      std::nullopt,
+      FsdbFibWatcher::lookupIgpCostFromRoute(route, fboss::ClientID::OPENR));
 }
 
 // ---------------------------------------------------------------------------

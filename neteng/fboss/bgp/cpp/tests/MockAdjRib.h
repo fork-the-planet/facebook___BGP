@@ -61,10 +61,28 @@ class MockAdjRib : public AdjRib {
     ON_CALL(*this, isPeerGracefulRestarting()).WillByDefault([this]() {
       return AdjRib::isPeerGracefulRestarting();
     });
+    /*
+     * By default delegate to the real implementation so existing users of
+     * MockAdjRib that don't care about rib-dump delivery are unaffected.
+     */
+    ON_CALL(*this, processRibMessage(testing::_))
+        .WillByDefault([this](const RibOutMessage& update) {
+          AdjRib::processRibMessage(update);
+        });
   }
 
   MOCK_METHOD(folly::coro::Task<void>, stop, (), (noexcept, override));
   MOCK_METHOD(bool, isPeerGracefulRestarting, (), (const, noexcept, override));
+  MOCK_METHOD(
+      folly::coro::Task<void>,
+      cleanupGrState,
+      (bool isDaemonShutdown),
+      (noexcept, override));
+  MOCK_METHOD(
+      void,
+      processRibMessage,
+      (const RibOutMessage& update),
+      (noexcept, override));
 };
 
 } // namespace facebook::bgp

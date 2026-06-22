@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include <folly/Optional.h>
 #include <folly/io/Cursor.h>
 
 #include "neteng/fboss/bgp/cpp/lib/BgpStructs.h"

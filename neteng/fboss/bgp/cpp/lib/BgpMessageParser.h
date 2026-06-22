@@ -16,9 +16,9 @@
 
 #pragma once
 
-#include <folly/Optional.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBufQueue.h>
+#include <optional>
 
 #include "neteng/fboss/bgp/cpp/lib/BgpException.h"
 #include "neteng/fboss/bgp/cpp/lib/BgpStructs.h"
@@ -111,7 +111,7 @@ class BgpMessageParser2 {
       BgpMessageParserCallbacks* bgpParseCb,
       const uint8_t* data,
       int len,
-      folly::Optional<const BgpCapabilities> capabilities = folly::none);
+      std::optional<const BgpCapabilities> capabilities = std::nullopt);
 
   /**
    * Parse BGP message and call the relevant callback functions.
@@ -121,7 +121,7 @@ class BgpMessageParser2 {
   static void parseBgpMessage(
       BgpMessageParserCallbacks*,
       folly::IOBuf,
-      folly::Optional<const BgpCapabilities> capabilities = folly::none);
+      std::optional<const BgpCapabilities> capabilities = std::nullopt);
 
   /**
    * Parse raw BGP keepalive message
@@ -169,7 +169,7 @@ class BgpMessageParser2 {
    */
   static BgpMessageHeader parseBgpMsgHdr(
       folly::io::Cursor cursor,
-      folly::Optional<BgpMessageType> msgType = folly::none);
+      std::optional<BgpMessageType> msgType = std::nullopt);
 
   /**
    * Parse and consume the common BGP Header from the buffer indicated by
@@ -182,7 +182,7 @@ class BgpMessageParser2 {
    */
   static BgpMessageHeader consumeBgpMsgHdr(
       folly::io::Cursor& cursor,
-      folly::Optional<BgpMessageType> msgType = folly::none);
+      std::optional<BgpMessageType> msgType = std::nullopt);
 
   /**
    * Parse raw BGP ROUTE_REFRESH message

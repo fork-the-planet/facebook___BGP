@@ -343,6 +343,14 @@ class NeighborWatcher : public BgpModuleBase {
    **/
   void subscribe();
 
+  /**
+   * Request that the given nexthops (learned at runtime, e.g. from RIB-IN) be
+   * tracked in FSDB. Marshals onto evb_, filters out already-tracked nexthops,
+   * and — if any are new — stops and re-subscribes the shared FSDB sub with the
+   * augmented path set. Safe to call from any thread (e.g. the RIB thread).
+   **/
+  void requestNexthopSubscribe(std::vector<folly::IPAddress> nexthops);
+
   // return nullopt if connection is not ready
   // return empty map if IO fails (cannot construct map)
   // otherwise return full map
@@ -355,6 +363,12 @@ class NeighborWatcher : public BgpModuleBase {
   //
 
  private:
+  /*
+   * Body of subscribe(); must run on evb_. Also invoked to re-subscribe after
+   * adding paths at runtime (see requestNexthopSubscribe()).
+   */
+  void subscribeLocked();
+
   std::atomic_bool isRunning_{false};
 
   // Watchers on FSDB.

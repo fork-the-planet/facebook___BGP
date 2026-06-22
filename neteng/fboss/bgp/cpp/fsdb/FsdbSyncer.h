@@ -41,6 +41,9 @@ class FsdbSyncer {
   void setRouteFilterPolicy(
       std::optional<rib_policy::TRouteFilterPolicy>&& routeFilterPolicy);
 
+  void setPartialDrainState(
+      std::optional<bgp_thrift::TPartialDrainState>&& partialDrainState);
+
   // setRibMap() must be called before start() for initial sync of RibMap to
   // FSDB.
   void setRibMap(std::map<std::string, bgp_thrift::TRibEntry> rib);

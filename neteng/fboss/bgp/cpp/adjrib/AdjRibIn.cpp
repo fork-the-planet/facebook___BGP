@@ -311,6 +311,11 @@ void AdjRib::decrementPreInPrefixCount(const folly::CIDRNetwork prefix) {
   stats_.decrementPreInPrefixCount(prefix);
 }
 
+void AdjRib::incrementPrefixesDroppedByLimit(uint32_t count) {
+  totalDroppedPrefixCount += count;
+  PeerStats::incrementTotalPrefixesDroppedByLimit(count);
+}
+
 bool AdjRib::canAddRibInEntry(
     const folly::CIDRNetwork& prefix,
     const std::shared_ptr<const BgpPath>& attrs) {
@@ -326,8 +331,7 @@ bool AdjRib::canAddRibInEntry(
      * Do NOT process the new path. Continue here because next item may be
      * an update of existing path, not a new one.
      */
-    totalDroppedPrefixCount++;
-    PeerStats::setTotalDroppedPrefixes(totalDroppedPrefixCount);
+    incrementPrefixesDroppedByLimit();
     return false;
   }
   if (capRoutesPerPeer(
@@ -339,6 +343,7 @@ bool AdjRib::canAddRibInEntry(
      * Do NOT process the new path. Continue here because next item may be
      * an update of existing path, not a new one.
      */
+    incrementPrefixesDroppedByLimit();
     return false;
   }
   return true;
@@ -431,6 +436,7 @@ uint32_t AdjRib::maybeAnnouncePrefix(
         capRoutesPerPeer(
             stats_.getPostInPrefixCount() + 1, false /* postfilter */)) {
       // If pass limit, lets check the next one.
+      incrementPrefixesDroppedByLimit();
       return 0;
     }
     // Updating rec prefix count only if it is newly learned routes.
@@ -1529,8 +1535,7 @@ folly::coro::Task<void> AdjRib::processAdjRibReEvaluationForSafeMode() {
     // Purge adjRibEntry and collect prefixes to withdraw
     processWithdrawnPrefixRibInEntry(pfxPathIds, prefix, pathId);
   }
-  totalDroppedPrefixCount += pfxPathIds.size();
-  PeerStats::setTotalDroppedPrefixes(totalDroppedPrefixCount);
+  incrementPrefixesDroppedByLimit(pfxPathIds.size());
   // Send RibInWithdrawal
   co_await sendRibInWithdrawal(pfxPathIds);
 }

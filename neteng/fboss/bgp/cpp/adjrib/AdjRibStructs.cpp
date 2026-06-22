@@ -43,7 +43,7 @@ bool UpdateGroupKey::operator==(const UpdateGroupKey& other) const {
 
 size_t UpdateGroupKey::hash() const {
   return folly::hash::hash_combine(
-      egressPolicyName,
+      egressPolicyName.value_or(""),
       routeFilterStmtName,
       outDelay.count(),
       sessionType,
@@ -63,7 +63,7 @@ size_t UpdateGroupKey::hash() const {
 }
 
 UpdateGroupKey UpdateGroupKey::buildUpdateGroupKey(
-    std::string policyName,
+    std::optional<std::string> policyName,
     std::string routeFilterStmtName,
     std::chrono::seconds outDelay,
     BgpSessionType sessionType,
@@ -105,7 +105,7 @@ UpdateGroupKey UpdateGroupKey::buildUpdateGroupKey(
 std::string UpdateGroupKey::toString(const UpdateGroupKey& key) {
   return fmt::format(
       "{}-{}-{}-{}-{}-{}-{}-{}-{}-{}-{}-{}-{}-{}-{}-{}-{}",
-      key.egressPolicyName,
+      key.egressPolicyName.value_or(""),
       key.routeFilterStmtName,
       key.outDelay.count(),
       magic_enum::enum_name(key.sessionType),
@@ -131,7 +131,7 @@ std::string UpdateGroupKey::toString(const UpdateGroupKey& key) {
 facebook::neteng::fboss::bgp::thrift::TUpdateGroupKey UpdateGroupKey::toThrift()
     const {
   facebook::neteng::fboss::bgp::thrift::TUpdateGroupKey t;
-  t.egress_policy_name() = egressPolicyName;
+  t.egress_policy_name() = egressPolicyName.value_or("");
   t.route_filter_stmt_name() = routeFilterStmtName;
   t.out_delay_seconds() = outDelay.count();
   t.session_type() = std::string(magic_enum::enum_name(sessionType));

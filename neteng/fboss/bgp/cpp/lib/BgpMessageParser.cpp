@@ -19,6 +19,7 @@
 #include <folly/io/IOBuf.h>
 #include <folly/logging/xlog.h>
 #include <thrift/lib/cpp/util/EnumUtils.h>
+#include <optional>
 #include <variant>
 
 #include "fboss/agent/AddressUtil.h"
@@ -52,7 +53,7 @@ using folly::IPAddress;
  */
 BgpMessageHeader BgpMessageParser2::parseBgpMsgHdr(
     Cursor cursor,
-    folly::Optional<BgpMessageType> msgType) {
+    std::optional<BgpMessageType> msgType) {
   size_t msglen = cursor.length();
   // Size of BgpMessage must be at least 19
   if (msglen < kBgpMsgHeaderLen) {
@@ -109,7 +110,7 @@ BgpMessageHeader BgpMessageParser2::parseBgpMsgHdr(
  */
 BgpMessageHeader BgpMessageParser2::consumeBgpMsgHdr(
     Cursor& cursor,
-    folly::Optional<BgpMessageType> msgType) {
+    std::optional<BgpMessageType> msgType) {
   size_t readable = cursor.length();
 
   BgpMessageHeader hdr = BgpMessageParser2::parseBgpMsgHdr(cursor, msgType);
@@ -639,7 +640,7 @@ BgpMessageParser2::parseBgpUpdateRaw(
 void BgpMessageParser2::parseBgpMessage(
     BgpMessageParserCallbacks* bgpParseCb,
     folly::IOBuf buf,
-    folly::Optional<const BgpCapabilities> capabilities) {
+    std::optional<const BgpCapabilities> capabilities) {
   Cursor cursor(&buf);
 
   try {
@@ -711,7 +712,7 @@ void BgpMessageParser2::parseBgpMessage(
     BgpMessageParserCallbacks* bgpParseCb,
     const uint8_t* data,
     int len,
-    folly::Optional<const BgpCapabilities> capabilities) {
+    std::optional<const BgpCapabilities> capabilities) {
   parseBgpMessage(
       bgpParseCb, folly::IOBuf::wrapBufferAsValue(data, len), capabilities);
 }

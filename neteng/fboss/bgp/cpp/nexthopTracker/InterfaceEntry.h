@@ -18,7 +18,19 @@
 
 #include <folly/IPAddress.h>
 #include <folly/container/F14Map.h>
+#include <folly/container/F14Set.h>
 #include <folly/io/async/AsyncTimeout.h>
+#include <gflags/gflags.h>
+
+/*
+ * Gate for the interface-link-state directly-connected nexthop resolution path.
+ * Defined in InterfaceEntry.cpp, which lives in the interface_entry library
+ * that is linked only into the BB/EBB daemon (bgpd_cpp_bb), so the flag cannot
+ * be enabled on the DC binary. Declared here (rather than in an implementation
+ * file) so every consumer in the BB-only netlink path picks it up from one
+ * place.
+ */
+DECLARE_bool(bgp_resolve_nexthops_from_interface_state);
 
 namespace facebook::bgp {
 
@@ -30,13 +42,24 @@ class InterfaceEntry final {
   explicit InterfaceEntry(std::string const& ifName);
 
   /**
-   * Update functions return true if there was a change
+   * Add or remove an interface address. Returns true if there was a change.
+   *
+   * Enumerates the host IPs in the prefix (bounded by kDefaultMaxIPsInCIDR) and
+   * seeds (isValid) or clears them in the reachability map. This is the legacy
+   * (default) path. When bgp_resolve_nexthops_from_interface_state is on,
+   * reachability is driven purely by interface link state and interface
+   * prefixes are tracked globally by NetlinkWrapper (InterfacePrefixTable) and
+   * per-interface via addPrefix/removePrefix below, so this is not called in
+   * that mode.
    */
   bool updateAddr(folly::CIDRNetwork const& addr, bool isValid);
   bool updateIfIndex(int ifIndex);
 
   /**
-   * Update reachability for a specific IP address. Returns true if changed.
+   * Set reachability for an IP already seeded by updateAddr. Legacy
+   * (bgp_resolve_nexthops_from_interface_state off) path only: only IPs seeded
+   * by updateAddr are tracked, so a reachability update for an untracked IP is
+   * dropped (returns false). Returns true if the tracked state changed.
    */
   bool updateReachability(const folly::IPAddress& ip, bool reachability);
 
@@ -55,6 +78,26 @@ class InterfaceEntry final {
   int getIfIndex() const;
 
   /**
+   * Interface link (operational) state. Used by the
+   * bgp_resolve_nexthops_from_interface_state path: a directly-connected
+   * nexthop is reachable iff a covering interface is up. setUp returns true if
+   * the state changed.
+   */
+  bool setUp(bool isUp);
+  bool isUp() const;
+
+  /**
+   * Per-interface set of contributed prefixes (the reverse index of
+   * InterfacePrefixTable). Used by the interface-state path to find, on a link
+   * event, which subnets this interface covers so the registered nexthops in
+   * them can be re-evaluated. Bounded by the interface's address count, not RIB
+   * scale. addPrefix/removePrefix return true if the set changed.
+   */
+  bool addPrefix(const folly::CIDRNetwork& prefix);
+  bool removePrefix(const folly::CIDRNetwork& prefix);
+  const folly::F14FastSet<folly::CIDRNetwork>& getPrefixes() const;
+
+  /**
    * Get reachability map for all IP addresses
    */
   const folly::F14NodeMap<folly::IPAddress, bool>& getIpReachabilityMap() const;
@@ -66,6 +109,12 @@ class InterfaceEntry final {
   int ifIndex_{-1};
   // Map of IP address to its reachability status
   folly::F14NodeMap<folly::IPAddress, bool> ipReachabilityMap_{};
+  // Interface operational (link) state. Only used on the
+  // bgp_resolve_nexthops_from_interface_state path.
+  bool isUp_{false};
+  // Prefixes this interface contributes to the global InterfacePrefixTable.
+  // Only populated on the bgp_resolve_nexthops_from_interface_state path.
+  folly::F14FastSet<folly::CIDRNetwork> prefixes_{};
 };
 
 } // namespace facebook::bgp

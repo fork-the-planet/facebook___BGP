@@ -435,4 +435,112 @@ TEST_F(NexthopCacheTestFixture, NhtCacheReachabilityCounters) {
       1, tcData->getCounter(RibStats::kNhtCacheNexthopUnreachable + ".count"));
 }
 
+// --- Neighbor-event resolution support (used by NetlinkWrapper on backbone)
+// ---
+
+TEST_F(NexthopCacheTestFixture, IsRegistered) {
+  folly::IPAddress ip("10.0.0.1");
+  // Unknown nexthop is not registered.
+  EXPECT_FALSE(cache_->isRegistered(ip));
+
+  // Present (pushed by a watcher) but not yet referenced by the RIB.
+  cache_->addOrUpdateNextHopStatus(
+      {NexthopStatus(ip, /*isReachable*/ true, 1, /*isConnected*/ true)});
+  EXPECT_FALSE(cache_->isRegistered(ip));
+
+  // Registered by the RIB.
+  cache_->registerAndGetNexthopStatus(ip);
+  EXPECT_TRUE(cache_->isRegistered(ip));
+}
+
+TEST_F(NexthopCacheTestFixture, GetRegisteredNexthopsInSubnet) {
+  folly::IPAddress inA("10.10.0.5");
+  folly::IPAddress inB("10.10.1.9");
+  folly::IPAddress outOfSubnet("10.20.0.1");
+  folly::IPAddress v6("2401:db00:10::5");
+  folly::IPAddress unregisteredInSubnet("10.10.0.99");
+
+  cache_->registerAndGetNexthopStatus(inA);
+  cache_->registerAndGetNexthopStatus(inB);
+  cache_->registerAndGetNexthopStatus(outOfSubnet);
+  cache_->registerAndGetNexthopStatus(v6);
+  // Present in the subnet but never registered from RIB.
+  cache_->addOrUpdateNextHopStatus(
+      {NexthopStatus(unregisteredInSubnet, true, 1, true)});
+
+  auto result = cache_->getRegisteredNexthopsInSubnet(
+      folly::IPAddress::createNetwork("10.10.0.0/16"));
+
+  // Only registered nexthops within the v4 /16 are returned; out-of-subnet, v6
+  // (family mismatch), and unregistered nexthops are excluded.
+  EXPECT_THAT(result, UnorderedElementsAre(inA, inB));
+}
+
+TEST_F(NexthopCacheTestFixture, ClearConnectedStatus) {
+  // Unknown nexthop -> nullopt.
+  EXPECT_FALSE(
+      cache_->clearConnectedStatus(folly::IPAddress("10.0.0.99")).has_value());
+
+  // Non-connected (FIB, isConnected=nullopt) entry is left untouched.
+  folly::IPAddress fibIp("10.0.0.1");
+  cache_->addOrUpdateNextHopStatus(
+      {NexthopStatus(fibIp, true, 5, std::nullopt)});
+  EXPECT_FALSE(cache_->clearConnectedStatus(fibIp).has_value());
+  EXPECT_TRUE(cache_->registerAndGetNexthopStatus(fibIp).isReachable());
+
+  // Connected + registered -> reset to unreachable with isConnected unset, and
+  // the cleared status is returned for the caller to notify the RIB.
+  folly::IPAddress connIp("10.0.0.2");
+  cache_->addOrUpdateNextHopStatus({NexthopStatus(connIp, true, 1, true)});
+  cache_->registerAndGetNexthopStatus(connIp);
+  auto cleared = cache_->clearConnectedStatus(connIp);
+  ASSERT_TRUE(cleared.has_value());
+  EXPECT_FALSE(cleared->isReachable());
+  EXPECT_THAT(cleared->isConnected(), Eq(std::nullopt));
+
+  // After clearing, a non-connected (FIB) source can take over again — the
+  // source-priority rule no longer blocks it.
+  cache_->addOrUpdateNextHopStatus(
+      {NexthopStatus(connIp, true, 7, std::nullopt)});
+  auto after = cache_->registerAndGetNexthopStatus(connIp);
+  EXPECT_TRUE(after.isReachable());
+  EXPECT_EQ(after.getIgpCost().value(), 7);
+
+  // Connected but NOT registered -> still cleared, but nothing returned (no RIB
+  // to notify).
+  folly::IPAddress connUnreg("10.0.0.3");
+  cache_->addOrUpdateNextHopStatus({NexthopStatus(connUnreg, true, 1, true)});
+  EXPECT_FALSE(cache_->clearConnectedStatus(connUnreg).has_value());
+  cache_->addOrUpdateNextHopStatus(
+      {NexthopStatus(connUnreg, true, 9, std::nullopt)});
+  EXPECT_EQ(
+      cache_->registerAndGetNexthopStatus(connUnreg).getIgpCost().value(), 9);
+}
+
+TEST_F(NexthopCacheTestFixture, OnNexthopRegisteredHook) {
+  std::vector<folly::IPAddress> fired;
+  cache_->setOnNexthopRegistered(
+      [&](folly::IPAddress ip) { fired.push_back(ip); });
+
+  // Registering an unknown nexthop (default unreachable) fires the hook.
+  folly::IPAddress unknownIp("10.0.0.1");
+  cache_->registerAndGetNexthopStatus(unknownIp);
+  ASSERT_EQ(fired.size(), 1);
+  EXPECT_EQ(fired[0], unknownIp);
+
+  // Registering an already-reachable nexthop does NOT fire the hook (BGP has
+  // its answer; no on-demand resolution needed).
+  folly::IPAddress reachableIp("10.0.0.2");
+  cache_->addOrUpdateNextHopStatus({NexthopStatus(reachableIp, true, 1, true)});
+  cache_->registerAndGetNexthopStatus(reachableIp);
+  EXPECT_EQ(fired.size(), 1);
+
+  // Registering an existing-but-unreachable nexthop fires the hook.
+  folly::IPAddress unreachableIp("10.0.0.3");
+  cache_->addOrUpdateNextHopStatus({NexthopStatus(unreachableIp, false)});
+  cache_->registerAndGetNexthopStatus(unreachableIp);
+  ASSERT_EQ(fired.size(), 2);
+  EXPECT_EQ(fired[1], unreachableIp);
+}
+
 } // namespace facebook::bgp

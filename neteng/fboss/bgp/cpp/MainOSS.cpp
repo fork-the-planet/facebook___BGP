@@ -382,8 +382,16 @@ int main(int argc, char** argv) {
   // inside stop() method.
   rib.stop();
   neighborWatcher->stop();
-  peerMgr.stop();
+
+  /*
+   * Save GR state BEFORE stopping SessionManager, which triggers
+   * sessionTerminated() and clears establishedGrPeers_.
+   */
+  peerMgr.markDaemonShutdown();
+  peerMgr.saveGrState();
+
   sessionMgr->stop();
+  peerMgr.stop();
   watchdog.stop();
 
   // Wait for all threads to finish

@@ -135,7 +135,7 @@ std::vector<BgpPrefix> parseNlri(
   }
 
   while (cursor.length()) {
-    folly::Optional<int32_t> pathId = folly::none;
+    std::optional<int32_t> pathId = std::nullopt;
     if (parsePathId) {
       if (cursor.length() < 4) {
         throw BgpUpdateMsgException(
@@ -260,7 +260,7 @@ std::vector<BgpPrefix> parseMpNlri(
       }
 
       // Parse IP prefix
-      folly::Optional<int32_t> pathId = folly::none;
+      std::optional<int32_t> pathId = std::nullopt;
       if (parsePathId) {
         pathId = cursor.readBE<uint32_t>();
       }

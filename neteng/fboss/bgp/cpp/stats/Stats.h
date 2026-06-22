@@ -469,6 +469,22 @@ void setPlannedExit();
 void markPlannedExit();
 void handlePreviousExit();
 
+// [CRF File Mode]
+constexpr auto kCrfFileModeEnabled = "bgpd.crf.file_mode_enabled"_fs;
+constexpr auto kCrfArtifactReadSuccess = "bgpd.crf.artifact_read.success"_fs;
+constexpr auto kCrfArtifactReadFailure = "bgpd.crf.artifact_read.failure"_fs;
+constexpr auto kCrfPolicyAppliedSuccess = "bgpd.crf.policy_applied.success"_fs;
+constexpr auto kCrfPolicyAppliedFailure = "bgpd.crf.policy_applied.failure"_fs;
+constexpr auto kCrfThriftRpcRejected = "bgpd.crf.thrift_rpc_rejected"_fs;
+constexpr auto kCrfForceUpdateBypass = "bgpd.crf.force_update_bypass"_fs;
+void setCrfFileModeEnabled(bool enabled);
+void incrCrfArtifactReadSuccess();
+void incrCrfArtifactReadFailure();
+void incrCrfPolicyAppliedSuccess();
+void incrCrfPolicyAppliedFailure();
+void incrCrfThriftRpcRejected();
+void incrCrfForceUpdateBypass();
+
 } // namespace BgpStats
 
 //------------------------ RibStats ------------------------//
@@ -744,7 +760,15 @@ constexpr auto kTotalPeerWithNoRouteExchange =
 constexpr auto kTotalRcvdPrefixes = "peer.totalRcvdPrefixes"_fs;
 constexpr auto kTotalAcceptedPrefixes = "peer.totalAcceptedPrefixes"_fs;
 constexpr auto kTotalSentPrefixes = "peer.totalSentPrefixes"_fs;
-constexpr auto kTotalDroppedPrefixes = "peer.totalDroppedPrefixes"_fs;
+/*
+ * Despite the "Prefixes" name, this counts dropped routes (each route is a
+ * prefix + path), not unique prefixes. Every dropped path increments it, so
+ * with add-path a single prefix can contribute multiple drops. The emitted ODS
+ * key "peer.totalDroppedPrefixes" is kept for dashboard/alert continuity even
+ * though the C++ symbol is named after the per-peer prefix-limit semantics.
+ * See S676351.
+ */
+constexpr auto kTotalPrefixesDroppedByLimit = "peer.totalDroppedPrefixes"_fs;
 constexpr auto kTotalPaths = "peer.totalPaths"_fs;
 constexpr auto kTotalUniquePrefixes = "peer.totalUniquePrefixes"_fs;
 constexpr auto kTotalVipPrefixes = "peer.totalVipPrefixes"_fs;
@@ -807,7 +831,7 @@ void initPeerCounters(const std::string& peerId);
 void clearPeerCounters(const std::string& peerId);
 void setTotalRcvdPrefixes(uint32_t val);
 void setTotalAcceptedPrefixes(uint32_t val);
-void setTotalDroppedPrefixes(uint32_t val);
+void incrementTotalPrefixesDroppedByLimit(uint32_t val);
 void setTotalPaths(uint32_t val);
 void setTotalSentPrefixes(uint32_t val);
 void setTotalUniquePrefixes(uint32_t val);

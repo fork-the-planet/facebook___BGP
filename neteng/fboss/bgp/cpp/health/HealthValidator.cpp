@@ -37,6 +37,7 @@
 #include "neteng/fboss/bgp/cpp/lib/BgpStructs.h"
 #include "neteng/fboss/bgp/cpp/peer/PeerManager.h"
 #include "neteng/fboss/bgp/cpp/rib/RibBase.h"
+#include "neteng/fboss/bgp/cpp/stats/Stats.h"
 #include "neteng/fboss/bgp/cpp/watchdog/Watchdog.h"
 
 namespace facebook::bgp {
@@ -284,25 +285,7 @@ TModuleHealthReport HealthValidator::checkGlobalSystem() {
   }
 
   /* 1.1.9 Previous exit was planned (no crash) */
-  {
-    auto val = getCounter("bgpd.plannedExit");
-    if (!val.has_value()) {
-      checks.emplace_back(makeResult(
-          HealthCheckId::GLOBAL_SYSTEM_PLANNED_EXIT,
-          HealthCheckCategory::GLOBAL_SYSTEM,
-          HealthCheckStatus::FAIL,
-          "Counter bgpd.plannedExit not found"));
-    } else {
-      bool passed = (*val == 1);
-      checks.emplace_back(makeResult(
-          HealthCheckId::GLOBAL_SYSTEM_PLANNED_EXIT,
-          HealthCheckCategory::GLOBAL_SYSTEM,
-          passed ? HealthCheckStatus::PASS : HealthCheckStatus::WARN,
-          fmt::format("plannedExit = {}", *val),
-          static_cast<double>(*val),
-          1.0));
-    }
-  }
+  checks.emplace_back(checkPlannedExit());
 
   report.overallStatus() = computeOverallStatus(checks);
   return report;
@@ -897,10 +880,12 @@ TModuleHealthReport HealthValidator::checkPeerManager() {
     }
   }
 
-  /* 1.5.3 No dropped prefixes (overload protection)
+  /* 1.5.3 No dropped prefixes (capacity/overload protection)
    * Counts prefixes dropped by per-switch overload protection
-   * (max path/prefix limits) or golden prefix policy purge.
-   * NOT normal policy rejections. */
+   * (max path/prefix limits), per-peer route caps, or golden prefix
+   * policy purge. NOT normal policy rejections. The counter is
+   * initialized to 0 and incremented on every such drop, so it is
+   * always populated: 0 means no drops, >0 means actual drops. */
   {
     auto val = getCounter("peer.totalDroppedPrefixes");
     if (!val.has_value()) {
@@ -910,15 +895,12 @@ TModuleHealthReport HealthValidator::checkPeerManager() {
           HealthCheckStatus::FAIL,
           "Counter peer.totalDroppedPrefixes not found"));
     } else {
-      /* -1 = counter initialized but never updated (no drops evaluated).
-       * 0 = drops evaluated, none dropped. >0 = actual drops. */
       bool passed = (*val <= 0);
       checks.emplace_back(makeResult(
           HealthCheckId::PEER_DROPPED_PREFIXES,
           HealthCheckCategory::PEER_MANAGER,
           passed ? HealthCheckStatus::PASS : HealthCheckStatus::WARN,
-          *val < 0 ? "No drops evaluated"
-                   : fmt::format("droppedPrefixes = {}", *val),
+          fmt::format("droppedPrefixes = {}", *val),
           static_cast<double>(std::max(0L, *val)),
           0.0));
     }
@@ -1333,13 +1315,17 @@ TModuleHealthReport HealthValidator::checkNexthopTracker() {
         config->getBgpGlobalConfig()->enableNextHopTracking;
   }
 
-  /* 1.8.1 NHT feature state consistent with config
-   * Use config enable_next_hop_tracking as SoT. If config says enabled
-   * but no NHT counters exist, something is wrong. */
-  {
-    auto nhtCounter = getCounter("bgpd.rib.nexthopCacheSize");
-    bool runtimeActive = nhtCounter.has_value();
+  /* Number of nexthops the RIB currently tracks. RibStats keeps this counter
+   * in lockstep with nexthopInfoMap_ (incremented on the route-install and
+   * nexthop-update paths, decremented on removal), so a value > 0 means the
+   * NHT pipeline is live and tracking at least one nexthop. */
+  auto nexthopInfoCount = getCounter(RibStats::kNexthopInfoCount);
+  bool runtimeActive = nexthopInfoCount.value_or(0) > 0;
 
+  /* 1.8.1 NHT feature state consistent with config
+   * Use config enable_next_hop_tracking as SoT. Runtime activity is derived
+   * from the bgpcpp.rib.nexthop_info.count counter. */
+  {
     bool consistent = (nhtEnabled == runtimeActive) || !nhtEnabled;
     checks.emplace_back(makeResult(
         HealthCheckId::NHT_CONFIG_CONSISTENT,
@@ -1351,8 +1337,10 @@ TModuleHealthReport HealthValidator::checkNexthopTracker() {
             runtimeActive ? "active" : "inactive")));
   }
 
-  /* 1.8.5 NexthopCache not empty
-   * Only meaningful if NHT is enabled in config. */
+  /* 1.8.5 NexthopCache populated
+   * Only meaningful if NHT is enabled in config. Uses the
+   * bgpcpp.rib.nexthop_info.count counter to check that the RIB is tracking
+   * at least one nexthop. */
   {
     if (!nhtEnabled) {
       checks.emplace_back(makeResult(
@@ -1361,22 +1349,12 @@ TModuleHealthReport HealthValidator::checkNexthopTracker() {
           HealthCheckStatus::SKIPPED,
           "NHT not enabled in config"));
     } else {
-      auto val = getCounter("bgpd.rib.nexthopCacheSize");
-      if (!val.has_value()) {
-        checks.emplace_back(makeResult(
-            HealthCheckId::NHT_CACHE_NOT_EMPTY,
-            HealthCheckCategory::NEXTHOP_TRACKER,
-            HealthCheckStatus::FAIL,
-            "Counter bgpd.rib.nexthopCacheSize not found"));
-      } else {
-        bool passed = (*val > 0);
-        checks.emplace_back(makeResult(
-            HealthCheckId::NHT_CACHE_NOT_EMPTY,
-            HealthCheckCategory::NEXTHOP_TRACKER,
-            passed ? HealthCheckStatus::PASS : HealthCheckStatus::WARN,
-            fmt::format("nexthopCacheSize = {}", *val),
-            static_cast<double>(*val)));
-      }
+      checks.emplace_back(makeResult(
+          HealthCheckId::NHT_CACHE_NOT_EMPTY,
+          HealthCheckCategory::NEXTHOP_TRACKER,
+          runtimeActive ? HealthCheckStatus::PASS : HealthCheckStatus::WARN,
+          fmt::format(
+              "nexthop_info.count = {}", nexthopInfoCount.value_or(0))));
     }
   }
 
@@ -1653,6 +1631,28 @@ TModuleHealthReport HealthValidator::checkThriftEndpoint() {
 
   report.overallStatus() = computeOverallStatus(checks);
   return report;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * Virtual check methods (overridden in platform subclasses)
+ * ──────────────────────────────────────────────────────────────── */
+THealthCheckResult HealthValidator::checkPlannedExit() {
+  auto val = getCounter("bgpd.plannedExit");
+  if (!val.has_value()) {
+    return makeResult(
+        HealthCheckId::GLOBAL_SYSTEM_PLANNED_EXIT,
+        HealthCheckCategory::GLOBAL_SYSTEM,
+        HealthCheckStatus::FAIL,
+        "Counter bgpd.plannedExit not found");
+  }
+  bool passed = (*val == 1);
+  return makeResult(
+      HealthCheckId::GLOBAL_SYSTEM_PLANNED_EXIT,
+      HealthCheckCategory::GLOBAL_SYSTEM,
+      passed ? HealthCheckStatus::PASS : HealthCheckStatus::WARN,
+      fmt::format("plannedExit = {}", *val),
+      static_cast<double>(*val),
+      1.0);
 }
 
 /* ────────────────────────────────────────────────────────────────

@@ -18,6 +18,7 @@
 #include <boost/filesystem.hpp>
 #include <gtest/gtest.h>
 #include <re2/re2.h>
+#include <algorithm>
 
 #include <folly/Overload.h>
 #include <folly/logging/test/TestLogHandler.h>
@@ -36,6 +37,7 @@
 #include "neteng/fboss/bgp/cpp/config/ConfigUtils.h"
 #include "neteng/fboss/bgp/cpp/lib/BgpUtil.h"
 #include "neteng/fboss/bgp/cpp/policy/PolicyAction.h"
+#include "neteng/fboss/bgp/cpp/policy/PolicyUtils.h"
 #include "neteng/fboss/bgp/cpp/policy/base/PolicyActionBase.h"
 #include "neteng/fboss/bgp/cpp/rib/RibEntry.h"
 #include "neteng/fboss/bgp/cpp/rib/RouteFilterConfig.h"

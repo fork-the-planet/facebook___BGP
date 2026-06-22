@@ -22,6 +22,7 @@
 #include "neteng/fboss/bgp/cpp/fsdb/FsdbSyncer.h"
 #include "neteng/fboss/bgp/if/gen-cpp2/bgp_thrift_types.h"
 
+#include <folly/ScopeGuard.h>
 #include <folly/coro/BlockingWait.h>
 #include <gtest/gtest.h>
 #include <thrift/lib/cpp2/protocol/Serializer.h>
@@ -307,4 +308,141 @@ TYPED_TEST(FsdbSyncerTests, testRibMapUpdateExistingEntry) {
   })
 
   this->fsdbSyncer_->stop();
+}
+
+TYPED_TEST(FsdbSyncerTests, testPartialDrainStatePublish) {
+  auto subscribedState = this->subscriber_->subscribe(
+      this->subscriber_->getRootStatePath().bgp().partialDrainState());
+
+  this->fsdbSyncer_->start();
+  /*
+   * partialDrainState is an `optional` field on BgpData; when the publisher
+   * sets it to nullptr, the subscriber observes !has_value(). If an
+   * assertion below escapes before stop() runs, FsdbSyncManager's destructor
+   * CHECKs that the syncer was stopped — the SCOPE_EXIT keeps TearDown safe
+   * regardless of which assertion path the test takes.
+   */
+  SCOPE_EXIT {
+    this->fsdbSyncer_->stop();
+  };
+
+  /*
+   * Publish a non-empty TPartialDrainState mirroring what
+   * Rib::prepareFibProgramming builds when a prefix enters partial drain:
+   * device-summary populated, one drained prefix entry attached.
+   */
+  bgp_thrift::TPartialDrainState state;
+  state.partial_drain_state()->is_partially_drained() = true;
+  state.partial_drain_state()->num_affected_prefixes() = 1;
+  state.partial_drain_state()->partial_drain_transition_count() = 1;
+
+  bgp_thrift::TPartiallyDrainedPrefix drainedPrefix;
+  drainedPrefix.prefix()->afi() = bgp_attr::TBgpAfi::AFI_IPV4;
+  drainedPrefix.prefix()->num_bits() = 24;
+  drainedPrefix.prefix()->prefix_bin() = std::string("\x0a\x00\x00\x00", 4);
+  drainedPrefix.min_capacity()->next_hop_count() = 3;
+  drainedPrefix.current_capacity()->next_hop_count() = 1;
+  state.drained_prefixes()->push_back(drainedPrefix);
+
+  this->fsdbSyncer_->setPartialDrainState(std::make_optional(state));
+
+  WITH_RETRIES({
+    auto stateLk = subscribedState.rlock();
+    ASSERT_EVENTUALLY_TRUE(stateLk->has_value());
+    EXPECT_EVENTUALLY_TRUE(
+        *(*stateLk)->partial_drain_state()->is_partially_drained());
+    EXPECT_EVENTUALLY_EQ(
+        *(*stateLk)->partial_drain_state()->num_affected_prefixes(), 1);
+    EXPECT_EVENTUALLY_EQ(
+        *(*stateLk)->partial_drain_state()->partial_drain_transition_count(),
+        1);
+    ASSERT_EVENTUALLY_EQ((*stateLk)->drained_prefixes()->size(), 1);
+    EXPECT_EVENTUALLY_EQ(
+        *(*stateLk)
+             ->drained_prefixes()
+             ->at(0)
+             .min_capacity()
+             ->next_hop_count_ref(),
+        3);
+    // current_capacity carries the same criterion as min_capacity — the
+    // next_hop_count arm (current nexthop count) for this MNH-triggered drain.
+    EXPECT_EVENTUALLY_EQ(
+        *(*stateLk)
+             ->drained_prefixes()
+             ->at(0)
+             .current_capacity()
+             ->next_hop_count_ref(),
+        1);
+  })
+
+  /*
+   * Now publish an updated state — prefix count goes to 2. Verifies
+   * subsequent publishes overwrite the prior value. The 2nd prefix uses
+   * the `agg_lbw_bps` variant of the TCapacity union (for both min_capacity
+   * and current_capacity) instead of the `next_hop_count` arm, so this single
+   * test exercises both union branches round-tripping through the FSDB
+   * serialization layer — matching the two production branches in
+   * RibDC::buildPartialDrainPrefixEntry (next_hop_count arm = threshold +
+   * current count on MNH violation, agg_lbw_bps arm = threshold + current agg
+   * LBW on LBW violation).
+   */
+  state.partial_drain_state()->num_affected_prefixes() = 2;
+  bgp_thrift::TPartiallyDrainedPrefix drainedPrefix2;
+  drainedPrefix2.prefix()->afi() = bgp_attr::TBgpAfi::AFI_IPV4;
+  drainedPrefix2.prefix()->num_bits() = 24;
+  drainedPrefix2.prefix()->prefix_bin() = std::string("\x14\x00\x00\x00", 4);
+  constexpr int64_t kAggLbwBpsThreshold = 100LL * 1'000'000'000LL; // 100 Gbps
+  // Current aggregate LBW sits below the threshold (that is why it drained).
+  constexpr int64_t kAggLbwBpsCurrent = 50LL * 1'000'000'000LL; // 50 Gbps
+  drainedPrefix2.min_capacity()->agg_lbw_bps() = kAggLbwBpsThreshold;
+  drainedPrefix2.current_capacity()->agg_lbw_bps() = kAggLbwBpsCurrent;
+  state.drained_prefixes()->push_back(drainedPrefix2);
+
+  this->fsdbSyncer_->setPartialDrainState(std::make_optional(state));
+
+  WITH_RETRIES({
+    auto stateLk = subscribedState.rlock();
+    ASSERT_EVENTUALLY_TRUE(stateLk->has_value());
+    EXPECT_EVENTUALLY_EQ(
+        *(*stateLk)->partial_drain_state()->num_affected_prefixes(), 2);
+    ASSERT_EVENTUALLY_EQ((*stateLk)->drained_prefixes()->size(), 2);
+    // 1st prefix kept the next_hop_count variant from the prior publish.
+    EXPECT_EVENTUALLY_EQ(
+        *(*stateLk)
+             ->drained_prefixes()
+             ->at(0)
+             .min_capacity()
+             ->next_hop_count_ref(),
+        3);
+    // 2nd prefix carries the LBW variant — proves the agg_lbw_bps union
+    // arm survives FSDB serialization just like the next_hop_count arm above.
+    EXPECT_EVENTUALLY_EQ(
+        *(*stateLk)
+             ->drained_prefixes()
+             ->at(1)
+             .min_capacity()
+             ->agg_lbw_bps_ref(),
+        kAggLbwBpsThreshold);
+    // current_capacity carries the current aggregate LBW on the matching
+    // agg_lbw_bps arm — round-trips through FSDB just like the threshold.
+    EXPECT_EVENTUALLY_EQ(
+        *(*stateLk)
+             ->drained_prefixes()
+             ->at(1)
+             .current_capacity()
+             ->agg_lbw_bps_ref(),
+        kAggLbwBpsCurrent);
+  })
+
+  /*
+   * Clear the state with std::nullopt — exercises the FsdbSyncer branch that
+   * sets the FSDB ref to nullptr (used by Rib when drainedPrefixCount_ goes
+   * back to 0). The subscriber observes the optional field becoming unset.
+   */
+  this->fsdbSyncer_->setPartialDrainState(std::nullopt);
+
+  WITH_RETRIES({
+    auto stateLk = subscribedState.rlock();
+    EXPECT_EVENTUALLY_FALSE(stateLk->has_value());
+  })
 }

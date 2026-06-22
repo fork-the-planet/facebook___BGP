@@ -91,7 +91,8 @@
       CollapseDecrementsStatsOnWithdrawalDiscrepancy);                         \
   FRIEND_TEST(                                                                 \
       UpdateGroupDetachLifecycleTest,                                          \
-      CollapseIncrementsStatsOnAnnouncementDiscrepancy);
+      CollapseIncrementsStatsOnAnnouncementDiscrepancy);                       \
+  FRIEND_TEST(UpdateGroupDetachLifecycleTest, DetachPeerSetsAllExpectedState);
 
 #define AdjRibOutGroup_TEST_FRIENDS                                            \
   friend class UpdateGroupDetachedPeerTest;                                    \
@@ -175,7 +176,8 @@
       CollapseDecrementsStatsOnWithdrawalDiscrepancy);                         \
   FRIEND_TEST(                                                                 \
       UpdateGroupDetachLifecycleTest,                                          \
-      CollapseIncrementsStatsOnAnnouncementDiscrepancy);
+      CollapseIncrementsStatsOnAnnouncementDiscrepancy);                       \
+  FRIEND_TEST(UpdateGroupDetachLifecycleTest, DetachPeerSetsAllExpectedState);
 
 #include <fmt/core.h>
 #include <folly/coro/BlockingWait.h>
@@ -1011,7 +1013,7 @@ TEST_F(UpdateGroupDetachedPeerTest, IsReadyToRejoinGroupReturnsTrue) {
   auto trackable =
       std::make_unique<TrackableObject<ShadowRibEntry>>(std::move(entry));
   changeTracker->publishChange(trackable.get());
-  groupConsumer->consumeChangesWithIterator();
+  groupConsumer->iterateChanges();
   ASSERT_TRUE(groupConsumer->isReady());
 
   // Register detached consumer — joins at group's ready position
@@ -1067,7 +1069,7 @@ TEST_F(UpdateGroupDetachedPeerTest, ActivateDSPTransitionsToReadyToJoin) {
   auto trackable =
       std::make_unique<TrackableObject<ShadowRibEntry>>(std::move(entry));
   changeTracker->publishChange(trackable.get());
-  groupConsumer->consumeChangesWithIterator();
+  groupConsumer->iterateChanges();
   EXPECT_TRUE(groupConsumer->isReady());
 
   // Register detached consumer — joins at group's ready position
@@ -1285,7 +1287,7 @@ TEST_F(
   auto trackable =
       std::make_unique<TrackableObject<ShadowRibEntry>>(std::move(entry));
   changeTracker->publishChange(trackable.get());
-  groupConsumer->consumeChangesWithIterator();
+  groupConsumer->iterateChanges();
 
   // Register detached consumer — joins at group's ready position
   adjRib->registerDetachedConsumer(
@@ -1386,6 +1388,9 @@ TEST_F(UpdateGroupDetachedPeerTest, ShouldCloneTrueWhenPeerWasSharingEntry) {
 
 TEST_F(UpdateGroupDetachedPeerTest, CopyEntryForPeerCopiesAllFields) {
   auto adjRib = createAndRegisterPeer(0);
+  // Register a second peer so the group has >1 member and copyEntryForPeer
+  // stores the cloned entry under the peer owner key (not the group key).
+  auto adjRib1 = createAndRegisterPeer(1);
   auto groupOwnerKey = group_->getGroupOwnerKey();
   auto peerOwnerKey = adjRib->getPeerOwnerKey();
 
@@ -1404,7 +1409,8 @@ TEST_F(UpdateGroupDetachedPeerTest, CopyEntryForPeerCopiesAllFields) {
   groupEntry->setStale(true);
 
   // Clone the entry to the peer
-  group_->copyEntryForPeer(kV4Prefix1, kPlaceholderPathID, adjRib, groupEntry);
+  group_->copyEntryForPeer(
+      kV4Prefix1, kPlaceholderPathID, adjRib, peerOwnerKey, groupEntry);
 
   // Verify peer entry was created with all fields copied
   auto peerEntry =
@@ -1417,6 +1423,29 @@ TEST_F(UpdateGroupDetachedPeerTest, CopyEntryForPeerCopiesAllFields) {
   EXPECT_EQ(peerEntry->getRibVersion(), 42);
   EXPECT_EQ(peerEntry->flags_, groupEntry->flags_);
   EXPECT_TRUE(peerEntry->isStale());
+}
+
+TEST_F(UpdateGroupDetachedPeerTest, CopyEntryForPeerUsesGroupKeyWhenOnlyPeer) {
+  auto adjRib = createAndRegisterPeer(0);
+  auto groupOwnerKey = group_->getGroupOwnerKey();
+  auto peerOwnerKey = adjRib->getPeerOwnerKey();
+
+  AdjRibEntry srcEntry(0);
+  srcEntry.setRibVersion(42);
+
+  // Caller passes the group owner key when the peer is the only member.
+  group_->copyEntryForPeer(
+      kV4Prefix1, kPlaceholderPathID, adjRib, groupOwnerKey, &srcEntry);
+
+  auto entry =
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix1, groupOwnerKey);
+  ASSERT_NE(entry, nullptr);
+  EXPECT_EQ(entry->getRibVersion(), 42);
+
+  // Should NOT exist under peer owner key
+  auto peerEntry =
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix1, peerOwnerKey);
+  EXPECT_EQ(peerEntry, nullptr);
 }
 
 /*
@@ -1700,6 +1729,8 @@ TEST_F(UpdateGroupDetachedPeerTest, WithdrawClonesEntryAddPathMode) {
   group_->groupKey_.afiIpv4Negotiated = true;
   group_->groupKey_.sendAddPath = true;
   auto adjRib0 = createAndRegisterPeer(0);
+  // Register a second peer so copyEntryForPeer uses peer owner key.
+  auto adjRib1 = createAndRegisterPeer(1);
   auto groupOwnerKey = group_->getGroupOwnerKey();
   auto peerOwnerKey = adjRib0->getPeerOwnerKey();
 
@@ -2047,6 +2078,8 @@ TEST_F(UpdateGroupDetachedPeerTest, AnnouncementClonesEntryAddPathMode) {
   group_->groupKey_.afiIpv4Negotiated = true;
   group_->groupKey_.sendAddPath = true;
   auto adjRib0 = createAndRegisterPeer(0);
+  // Register a second peer so copyEntryForPeer uses peer owner key.
+  auto adjRib1 = createAndRegisterPeer(1);
   auto groupOwnerKey = group_->getGroupOwnerKey();
   auto peerOwnerKey = adjRib0->getPeerOwnerKey();
 
@@ -2402,8 +2435,8 @@ TEST_F(UpdateGroupDetachLifecycleTest, AcceptPeerFailsWithMismatchingEntries) {
   EXPECT_TRUE(group_->getDetachedPeers().contains(adjRib0));
   EXPECT_FALSE(group_->isPeerInSync(0));
 
-  // Detached RIB version NOT reset
-  EXPECT_EQ(adjRib0->getDetachedRibVersion(), 42);
+  // Detached RIB version updated to group's lastSeenRibVersion
+  EXPECT_EQ(adjRib0->getDetachedRibVersion(), group_->getLastSeenRibVersion());
 
   // Peer entry collapsed (erased), discrepancy corrected via packing list
   EXPECT_EQ(
@@ -2701,8 +2734,8 @@ TEST_F(
   EXPECT_TRUE(group_->getDetachedPeers().contains(adjRib0));
   EXPECT_FALSE(group_->isPeerInSync(0));
 
-  // Detached RIB version NOT reset
-  EXPECT_EQ(adjRib0->getDetachedRibVersion(), 10);
+  // Detached RIB version updated to group's lastSeenRibVersion
+  EXPECT_EQ(adjRib0->getDetachedRibVersion(), group_->getLastSeenRibVersion());
 
   // Packing list contains announcement correction for the missing prefix
   EXPECT_TRUE(verifyInAdjRibPackingList(adjRib0, attrs, kV4Prefix2));
@@ -2762,7 +2795,7 @@ TEST_F(UpdateGroupDetachLifecycleTest, DFPDetachAndReadyToJoin) {
   // After consumption, group consumer is "ready" (at end of CL).
   // DFP scenario: group hasn't moved further on CL after this point.
   publishChangeItem(folly::CIDRNetwork{folly::IPAddress("10.0.0.0"), 24});
-  groupConsumer_->consumeChangesWithIterator();
+  groupConsumer_->iterateChanges();
   EXPECT_TRUE(groupConsumer_->isReady());
 
   // Add a prefix to the group packing list (group is mid-send)
@@ -2820,7 +2853,7 @@ TEST_F(UpdateGroupDetachLifecycleTest, TwoPeersDetachIndependently) {
 
   // Publish a CL item and consume it so group consumer is ready
   publishChangeItem(folly::CIDRNetwork{folly::IPAddress("10.0.0.0"), 24});
-  groupConsumer_->consumeChangesWithIterator();
+  groupConsumer_->iterateChanges();
 
   // Add prefix to group PL
   addPrefixToGroupPL(folly::CIDRNetwork{folly::IPAddress("10.0.0.0"), 24});
@@ -2888,7 +2921,7 @@ TEST_F(UpdateGroupDetachLifecycleTest, BlockCountResetOnRejoin) {
 
   // Publish a CL item and consume it so group consumer is ready
   publishChangeItem(folly::CIDRNetwork{folly::IPAddress("10.0.0.0"), 24});
-  groupConsumer_->consumeChangesWithIterator();
+  groupConsumer_->iterateChanges();
   EXPECT_TRUE(groupConsumer_->isReady());
 
   // Add a prefix to the group packing list (group is mid-send)
@@ -3010,97 +3043,80 @@ TEST_F(UpdateGroupDetachLifecycleTest, CheckAndAcceptDSPPeerConsumerNotReady) {
 }
 
 /**
- * Test: getRibOutEntry returns per-peer entry when it exists
+ * Test: getRibEntryWithUpdateGroup returns per-peer entry when it exists
  */
-TEST_F(UpdateGroupDetachedPeerTest, GetRibOutEntryReturnsPeerEntry) {
+TEST_F(
+    UpdateGroupDetachedPeerTest,
+    GetRibEntryWithUpdateGroupReturnsPeerEntry) {
   auto adjRib = createAndRegisterPeer(0);
 
   folly::CIDRNetwork prefix{folly::IPAddress("10.0.0.0"), 24};
   auto peerOwnerKey = adjRib->getPeerOwnerKey();
 
   // Add a per-peer entry directly to the group's tree
-  auto* added =
+  auto added =
       group_->addToLiteTree(group_->LiteTree_, prefix, peerOwnerKey, 0);
   ASSERT_NE(added, nullptr);
 
-  auto [entry, isPerPeerEntry] = adjRib->getRibOutEntry(prefix, 0);
+  auto* entry = adjRib->getRibEntryWithUpdateGroup(prefix, 0);
   EXPECT_EQ(entry, added);
-  EXPECT_TRUE(isPerPeerEntry);
 }
 
 /**
- * Test: getRibOutEntry returns shared group entry without cloning
- * when copyOnWriteIfShared is false
+ * Test: getRibEntryWithUpdateGroup clones shared group entry to per-peer entry
  */
-TEST_F(UpdateGroupDetachedPeerTest, GetRibOutEntryReturnsSharedEntryNoCopy) {
+TEST_F(
+    UpdateGroupDetachedPeerTest,
+    GetRibEntryWithUpdateGroupCopiesSharedEntry) {
   auto adjRib = createAndRegisterPeer(0);
+  // Register a second peer so copyEntryForPeer uses peer owner key.
+  auto adjRib1 = createAndRegisterPeer(1);
   adjRib->setDetachedRibVersion(10);
 
   folly::CIDRNetwork prefix{folly::IPAddress("10.0.0.0"), 24};
   auto groupOwnerKey = AdjRibOutOwnerKey::forGroup(1);
 
   // Add a group entry with ribVersion=5 (< detachedRibVersion=10)
-  auto* groupEntry =
+  auto groupEntry =
       group_->addToLiteTree(group_->LiteTree_, prefix, groupOwnerKey, 0);
   ASSERT_NE(groupEntry, nullptr);
   groupEntry->setRibVersion(5);
 
-  auto [entry, isPerPeerEntry] =
-      adjRib->getRibOutEntry(prefix, 0, false /* copyOnWriteIfShared */);
-  EXPECT_EQ(entry, groupEntry);
-  EXPECT_FALSE(isPerPeerEntry);
-}
+  auto entry = adjRib->getRibEntryWithUpdateGroup(prefix, 0);
 
-/**
- * Test: getRibOutEntry clones shared group entry to per-peer entry
- * when copyOnWriteIfShared is true
- */
-TEST_F(UpdateGroupDetachedPeerTest, GetRibOutEntryCopiesSharedEntry) {
-  auto adjRib = createAndRegisterPeer(0);
-  adjRib->setDetachedRibVersion(10);
-
-  folly::CIDRNetwork prefix{folly::IPAddress("10.0.0.0"), 24};
-  auto groupOwnerKey = AdjRibOutOwnerKey::forGroup(1);
-
-  // Add a group entry with ribVersion=5 (< detachedRibVersion=10)
-  auto* groupEntry =
-      group_->addToLiteTree(group_->LiteTree_, prefix, groupOwnerKey, 0);
-  ASSERT_NE(groupEntry, nullptr);
-  groupEntry->setRibVersion(5);
-
-  auto [entry, isPerPeerEntry] =
-      adjRib->getRibOutEntry(prefix, 0, true /* copyOnWriteIfShared */);
   // Should return a cloned per-peer entry, not the group entry
   EXPECT_NE(entry, nullptr);
   EXPECT_NE(entry, groupEntry);
-  EXPECT_TRUE(isPerPeerEntry);
   // Cloned entry should have the same ribVersion
   EXPECT_EQ(entry->getRibVersion(), groupEntry->getRibVersion());
 
   // Verify group entry is still in the tree untouched
-  auto* groupEntryAfter =
+  auto groupEntryAfter =
       group_->getFromLiteTree(group_->LiteTree_, prefix, groupOwnerKey);
   EXPECT_EQ(groupEntryAfter, groupEntry);
 }
 
 /**
- * Test: getRibOutEntry returns nullptr when no entry exists
+ * Test: getRibEntryWithUpdateGroup returns nullptr when no entry exists
  */
-TEST_F(UpdateGroupDetachedPeerTest, GetRibOutEntryReturnsNullWhenNoEntry) {
+TEST_F(
+    UpdateGroupDetachedPeerTest,
+    GetRibEntryWithUpdateGroupReturnsNullWhenNoEntry) {
   auto adjRib = createAndRegisterPeer(0);
 
   folly::CIDRNetwork prefix{folly::IPAddress("10.0.0.0"), 24};
 
-  auto [entry, isPerPeerEntry] = adjRib->getRibOutEntry(prefix, 0);
+  auto* entry = adjRib->getRibEntryWithUpdateGroup(prefix, 0);
   EXPECT_EQ(entry, nullptr);
-  EXPECT_FALSE(isPerPeerEntry);
 }
 
 /**
- * Test: getRibOutEntry skips group entry when peer never saw it
+ * Test: getRibEntryWithUpdateGroup skips group entry when peer never saw it
  * (detachedRibVersion < groupEntry ribVersion)
  */
-TEST_F(UpdateGroupDetachedPeerTest, GetRibOutEntrySkipsUnseenGroupEntry) {
+TEST_F(
+    UpdateGroupDetachedPeerTest,
+    GetRibEntryWithUpdateGroupSkipsUnseenGroupEntry) {
   auto adjRib = createAndRegisterPeer(0);
   adjRib->setDetachedRibVersion(5);
 
@@ -3108,17 +3124,16 @@ TEST_F(UpdateGroupDetachedPeerTest, GetRibOutEntrySkipsUnseenGroupEntry) {
   auto groupOwnerKey = AdjRibOutOwnerKey::forGroup(1);
 
   // Add a group entry with ribVersion=10 (> detachedRibVersion=5)
-  auto* groupEntry =
+  auto groupEntry =
       group_->addToLiteTree(group_->LiteTree_, prefix, groupOwnerKey, 0);
   ASSERT_NE(groupEntry, nullptr);
   groupEntry->setRibVersion(10);
 
-  auto [entry, isPerPeerEntry] = adjRib->getRibOutEntry(prefix, 0);
+  auto* entry = adjRib->getRibEntryWithUpdateGroup(prefix, 0);
   EXPECT_EQ(entry, nullptr);
-  EXPECT_FALSE(isPerPeerEntry);
 
   // Verify group entry is still in the tree untouched
-  auto* groupEntryAfter =
+  auto groupEntryAfter =
       group_->getFromLiteTree(group_->LiteTree_, prefix, groupOwnerKey);
   EXPECT_EQ(groupEntryAfter, groupEntry);
 }
@@ -3888,6 +3903,87 @@ TEST_F(
       group_->getStats().getPreOutPrefixCount());
   /* 5 + 1 (collapse announcement for 1 peer) = 6 */
   EXPECT_EQ(totalSentPrefixCount, totalSentBefore + 6);
+}
+
+/*
+ * Verify detachPeer sets all expected state:
+ * 1. Egress prefix counts copied from group
+ * 2. Packing list cloned
+ * 3. Peer marked as detached (in detachedPeers_, sync bit cleared)
+ * 4. Version fields inherited from group
+ * 5. Blocked bitmap cleared
+ * 6. Slow peer duration timer cancelled
+ * 7. Detached consumer registered
+ * 8. EoR state propagated if group has pending EoR
+ */
+TEST_F(UpdateGroupDetachLifecycleTest, DetachPeerSetsAllExpectedState) {
+  auto adjRib0 = createAndRegisterPeer(0);
+  auto adjRib1 = createAndRegisterPeer(1);
+  setUpJoinedRunningPeer(adjRib0, 0);
+  setUpJoinedRunningPeer(adjRib1, 1);
+
+  group_->setLastSeenRibVersion(42);
+
+  // Set up some group prefix counts
+  group_->stats_.incrementPostOutPrefixCount(true);
+  group_->stats_.incrementPostOutPrefixCount(true);
+  group_->stats_.incrementPreOutPrefixCount(true);
+  group_->stats_.incrementPreOutPrefixCount(true);
+
+  // Mark peer as blocked in the group bitmap
+  BitmapUtils::setBit(group_->adjRibBlockedBitmap_, 0);
+
+  // Set group EoR pending
+  group_->egressEoRsPending_ = true;
+
+  // Add prefix to group PL so clonePackingList has something to clone
+  auto attrs = std::make_shared<BgpPath>(*buildBgpPathFields(1, 1, 0, 0));
+  addPrefixToGroupPL(folly::CIDRNetwork{folly::IPAddress("10.0.0.0"), 24});
+
+  // Preconditions
+  ASSERT_TRUE(group_->isPeerInSync(0));
+  ASSERT_FALSE(group_->getDetachedPeers().contains(adjRib0));
+  ASSERT_TRUE(BitmapUtils::isBitSet(group_->adjRibBlockedBitmap_, 0));
+  ASSERT_EQ(adjRib0->getStats().getPostOutPrefixCount(), 0);
+
+  group_->detachPeer(adjRib0);
+
+  // 1. Egress prefix counts copied from group
+  EXPECT_EQ(
+      adjRib0->getStats().getPostOutPrefixCount(),
+      group_->getStats().getPostOutPrefixCount());
+  EXPECT_EQ(
+      adjRib0->getStats().getPreOutPrefixCount(),
+      group_->getStats().getPreOutPrefixCount());
+
+  // 2. Packing list cloned (peer has non-empty PL)
+  EXPECT_FALSE(adjRib0->attrToPrefixMap_.empty());
+
+  // 3. Peer marked as detached
+  EXPECT_TRUE(group_->getDetachedPeers().contains(adjRib0));
+  EXPECT_FALSE(group_->isPeerInSync(0));
+
+  // 4. Version fields inherited
+  EXPECT_EQ(adjRib0->getLastSeenRibVersion(), 42);
+  EXPECT_EQ(adjRib0->getDetachedRibVersion(), 42);
+
+  // 5. Blocked bitmap cleared
+  EXPECT_FALSE(BitmapUtils::isBitSet(group_->adjRibBlockedBitmap_, 0));
+
+  // 6. Slow peer duration timer cancelled
+  EXPECT_FALSE(
+      adjRib0->slowPeerDurationTimer_ &&
+      adjRib0->slowPeerDurationTimer_->isScheduled());
+
+  // 7. Detached consumer registered
+  EXPECT_NE(adjRib0->getDetachedConsumer(), nullptr);
+
+  // 8. EoR state propagated (group had egressEoRsPending_ = true)
+  EXPECT_TRUE(adjRib0->egressEoRsPending_);
+
+  // Peer 1 unaffected
+  EXPECT_TRUE(group_->isPeerInSync(1));
+  EXPECT_FALSE(group_->getDetachedPeers().contains(adjRib1));
 }
 
 } // namespace facebook::bgp

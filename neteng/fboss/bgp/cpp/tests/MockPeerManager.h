@@ -83,7 +83,9 @@ class MockPeerManager : public PeerManagerVipManager {
        const std::optional<std::unique_ptr<std::string>>&),
       (noexcept, override));
 
-  void setRouteFilterPolicy(std::unique_ptr<RouteFilterPolicy> policy) noexcept;
+  void setRouteFilterPolicy(
+      std::unique_ptr<RouteFilterPolicy> policy,
+      bool forceUpdate = false) noexcept;
 
   void run() noexcept override {
     // start bgp manager coroutine

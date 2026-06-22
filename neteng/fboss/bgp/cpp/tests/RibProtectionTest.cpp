@@ -424,7 +424,7 @@ TEST_F(AdjRibInboundFixture, ProcessAdjRibReEvaluationForSafeModeTest) {
     EXPECT_EQ(
         3,
         fb303::ThreadCachedServiceData::get()->getCounter(
-            PeerStats::kTotalDroppedPrefixes));
+            PeerStats::kTotalPrefixesDroppedByLimit));
 
     // End session to complete test
     terminateAdjRib();
@@ -501,7 +501,7 @@ TEST_F(
     EXPECT_EQ(
         2,
         fb303::ThreadCachedServiceData::get()->getCounter(
-            PeerStats::kTotalDroppedPrefixes));
+            PeerStats::kTotalPrefixesDroppedByLimit));
     EXPECT_EQ(
         1,
         fb303::ThreadCachedServiceData::get()->getCounter(
@@ -734,7 +734,7 @@ TEST_F(AdjRibInboundFixture, SafeModeSubnetLimitAppliesToNewPrefixUpdates) {
     EXPECT_EQ(
         1,
         fb303::ThreadCachedServiceData::get()->getCounter(
-            PeerStats::kTotalDroppedPrefixes));
+            PeerStats::kTotalPrefixesDroppedByLimit));
 
     // Expect adjRibEntry to be kept for 1 golden prefix
     EXPECT_NE(nullptr, adjRib_->getRibEntry(/*ingress=*/true, goldenV4Prefix1));
@@ -767,7 +767,7 @@ TEST_F(AdjRibInboundFixture, SafeModeSubnetLimitAppliesToNewPrefixUpdates) {
     EXPECT_EQ(
         1,
         fb303::ThreadCachedServiceData::get()->getCounter(
-            PeerStats::kTotalDroppedPrefixes));
+            PeerStats::kTotalPrefixesDroppedByLimit));
 
     // End session to complete test
     terminateAdjRib();
@@ -1562,6 +1562,14 @@ TEST_F(AdjRibInboundFixture, CheckLimitAndAlarmNoWarningOnlyTest) {
     EXPECT_EQ(3, adjRib_->getStats().getPreInPrefixCount());
     // accepted 3
     EXPECT_EQ(3, adjRib_->getStats().getPostInPrefixCount());
+
+    // The 4th prefix is dropped by the per-peer route cap. No switch-limit /
+    // overload-protection config is set here, so this verifies droppedPrefixes
+    // is populated even when NOT in overload protection mode. See S676351.
+    EXPECT_EQ(
+        1,
+        fb303::ThreadCachedServiceData::get()->getCounter(
+            PeerStats::kTotalPrefixesDroppedByLimit));
 
     // verify ShutDownPeer message is sent
     EXPECT_EQ(1, fromAdjRibQ_.size());

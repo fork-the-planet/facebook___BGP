@@ -107,6 +107,58 @@ auto getValue(
   }
   return {};
 }
+
+/*
+ * Resolve a peer's two-representation AS field (e.g. remote_as / local_as) with
+ * the peer > peer-group cascade where the per-peer value wins as a unit: the
+ * peer-group is consulted only when the peer sets neither representation.
+ * Within one level the 4-byte field (RFC 6793) overrides the deprecated i32
+ * field.
+ *
+ * Both representations set at the SAME level is an ambiguous config and is
+ * rejected with a BgpError. fieldName names the i32 field (the 4-byte field is
+ * assumed to be "<fieldName>_4_byte") and is used only in the diagnostic.
+ * Returns nullopt when the field is unset at every level.
+ *
+ * Note: a per-peer value wins outright, so a peer-group that sets both
+ * representations is only rejected for peers that do not override it.
+ */
+template <typename FourByteGetter, typename LegacyGetter>
+std::optional<uint32_t> resolveCascadedAsn(
+    const facebook::bgp::thrift::BgpPeer& peer,
+    const std::optional<facebook::bgp::thrift::PeerGroup>& peerGroup,
+    FourByteGetter fourByteGetter,
+    LegacyGetter legacyGetter,
+    std::string_view fieldName) {
+  auto resolveLevel = [&](auto&& cfg,
+                          std::string_view level) -> std::optional<uint32_t> {
+    const auto legacyAs = legacyGetter(cfg).to_optional();
+    const auto fourByteAs = fourByteGetter(cfg).to_optional();
+    if (legacyAs.has_value() && fourByteAs.has_value()) {
+      throw facebook::bgp::BgpError(
+          fmt::format(
+              "Both {0}_4_byte and {0} are set at {1} level for peer {2}. Use {0}_4_byte only",
+              fieldName,
+              level,
+              *peer.peer_addr()));
+    }
+    if (fourByteAs.has_value()) {
+      return static_cast<uint32_t>(*fourByteAs);
+    }
+    if (legacyAs.has_value()) {
+      return static_cast<uint32_t>(*legacyAs);
+    }
+    return std::nullopt;
+  };
+
+  if (auto peerLevel = resolveLevel(peer, "peer")) {
+    return peerLevel;
+  }
+  if (peerGroup.has_value()) {
+    return resolveLevel(*peerGroup, "peer-group");
+  }
+  return std::nullopt;
+}
 } // namespace
 
 namespace facebook::bgp {
@@ -604,43 +656,41 @@ BgpCommonPeerGroupConfig Config::createCommonPeerGroupConfig(
       [](auto&& peer) { return peer.ttl_security_hops(); }, peerGroup, peer);
 
   // TODO: deprecate i32 asns fields T113736668
-  auto peerLocalAsOld =
-      getValue([](auto&& peer) { return peer.local_as(); }, peerGroup, peer);
-  auto peerLocalAs4Byte = getValue(
-      [](auto&& peer) { return peer.local_as_4_byte(); }, peerGroup, peer);
-  std::optional<uint32_t> peerLocalAs = std::nullopt;
-
-  if (peerLocalAsOld && peerLocalAs4Byte) {
-    XLOGF(
-        ERR,
-        "Both local_as_4_byte and local_as are set for peer {}. Use local_as_4_byte only",
-        *peer.peer_addr());
-  }
-
-  if (peerLocalAs4Byte) {
-    peerLocalAs = *peerLocalAs4Byte;
-  } else if (peerLocalAsOld) {
-    peerLocalAs = static_cast<uint32_t>(*peerLocalAsOld);
-  }
-  uint32_t remote_as = peer.remote_as_4_byte().has_value()
-      ? static_cast<uint32_t>(*peer.remote_as_4_byte())
-      : static_cast<uint32_t>(peer.remote_as().value_or(0));
-
-  if (peer.remote_as_4_byte().has_value() && peer.remote_as().has_value()) {
-    throw BgpError(
-        fmt::format(
-            "Both remote_as_4_byte and remote_as are set for peer {}. Use remote_as_4_byte only",
-            *peer.peer_addr()));
-  }
+  /*
+   * Resolve the peer's Local-AS (RFC 7705) with the same peer > peer-group
+   * cascade as remote AS, including rejecting both representations set at one
+   * level. The config compiler emits a single representation, so this throw is
+   * a backstop (and closes the gap where the compiler guards remote_as but not
+   * local_as).
+   */
+  std::optional<uint32_t> peerLocalAs = resolveCascadedAsn(
+      peer,
+      peerGroup,
+      [](auto&& cfg) { return cfg.local_as_4_byte(); },
+      [](auto&& cfg) { return cfg.local_as(); },
+      "local_as");
+  /*
+   * Resolve the peer's remote AS with the peer > peer-group cascade
+   * (4-byte preferred per RFC 6793). Both representations set at one level
+   * throws. Stays nullopt when unset at every level.
+   */
+  std::optional<uint32_t> remoteAs = resolveCascadedAsn(
+      peer,
+      peerGroup,
+      [](auto&& cfg) { return cfg.remote_as_4_byte(); },
+      [](auto&& cfg) { return cfg.remote_as(); },
+      "remote_as");
 
   if (peerLocalAs) {
     if (*peerLocalAs == globalConfig_->localAsn) {
       XLOG(ERR, "Peer-Local-AS is configured with same value as global-AS.");
-    } else if (*peerLocalAs == remote_as) {
-      throw BgpError(
-          "Peer-Local-AS is configured with same value as remote-AS.");
-    } else if (remote_as == globalConfig_->localAsn) {
-      throw BgpError("Peer-Local-AS configured for non-EBGP peer.");
+    } else if (remoteAs) {
+      if (*peerLocalAs == *remoteAs) {
+        throw BgpError(
+            "Peer-Local-AS is configured with same value as remote-AS.");
+      } else if (*remoteAs == globalConfig_->localAsn) {
+        throw BgpError("Peer-Local-AS configured for non-EBGP peer.");
+      }
     }
   }
 
@@ -684,7 +734,7 @@ BgpCommonPeerGroupConfig Config::createCommonPeerGroupConfig(
 
   // common config
   BgpCommonPeerGroupConfig commonPeerGroupConfig(
-      remote_as, // peerAsn
+      remoteAs.value_or(0), // peerAsn (required uint32_t; 0 when unset)
       std::nullopt, // peerPort, not supported in FBOSS config currently
       peerLocalAs,
       (!peer.local_addr()->empty()

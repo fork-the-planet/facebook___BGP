@@ -50,13 +50,13 @@ std::string getResetReasonName(ResetReason reason);
 struct BgpPeerDisplayInfo {
   bgp::PeeringParams peeringParams;
   uint32_t remoteBgpId;
-  folly::Optional<uint16_t> remoteGrRestartTime;
+  std::optional<uint16_t> remoteGrRestartTime;
   BgpSessionState state;
   folly::SocketAddress localAddr;
   std::chrono::steady_clock::time_point startTime;
   std::chrono::steady_clock::time_point establishedTime;
   BgpCapabilities negotiatedCapabilities;
-  folly::Optional<std::chrono::seconds> negotiatedHoldTime;
+  std::optional<std::chrono::seconds> negotiatedHoldTime;
   uint32_t numOfConnectionAttempts;
   int64_t lastResetHoldTimer;
   int64_t lastResetKeepAliveTimer{0};
@@ -67,7 +67,7 @@ struct BgpPeerDisplayInfo {
   uint64_t sendQueueTotalBlockDurationMs{0};
   uint64_t lastSendQueueBlockTimeMs{0};
   uint64_t lastSocketEgressBufferedTimeMs{0};
-  folly::Optional<ResetReason> lastResetReason;
+  std::optional<ResetReason> lastResetReason;
   std::chrono::steady_clock::time_point lastResetTime;
   int64_t numResets;
 };

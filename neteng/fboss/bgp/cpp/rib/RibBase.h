@@ -16,8 +16,12 @@
 
 #pragma once
 
+#include <functional>
+#include <vector>
+
 #include <folly/IPAddress.h>
 #include <folly/IntrusiveList.h>
+#include <folly/container/F14Set.h>
 #include <folly/coro/AsyncScope.h>
 #include <folly/coro/Task.h>
 #include <folly/io/async/AsyncTimeout.h>
@@ -120,12 +124,6 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
   struct RouteAttributePolicyClearMsg {};
   struct RouteAttributePolicyTimerMsg {};
 
-  /**
-   * [Path Selection Policy]
-   *
-   * Define message structure used for path selection policy, which can
-   * override BGP path selection before installing to FIB.
-   */
   struct PathSelectionPolicySetMsg {
     const rib_policy::TPathSelectionPolicy policy;
 
@@ -140,9 +138,12 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
    */
   struct RouteFilterPolicySetMsg {
     const rib_policy::TRouteFilterPolicy policy;
+    const bool forceUpdate;
 
-    explicit RouteFilterPolicySetMsg(rib_policy::TRouteFilterPolicy policy)
-        : policy(std::move(policy)) {}
+    explicit RouteFilterPolicySetMsg(
+        rib_policy::TRouteFilterPolicy policy,
+        bool forceUpdate = false)
+        : policy(std::move(policy)), forceUpdate(forceUpdate) {}
   };
 
   struct RouteFilterPolicyClearMsg {};
@@ -192,6 +193,17 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
    */
   inline folly::coro::CancellableAsyncScope& getRibAsyncScope() {
     return asyncScope_;
+  }
+
+  /**
+   * Set the callback invoked (on the RIB thread) with nexthops newly learned
+   * from RIB-IN, so they can be registered for FSDB tracking. Wired in Main.cpp
+   * to NeighborWatcher::requestNexthopSubscribe when nexthop tracking is
+   * enabled. When unset (default), no RIB-IN-driven tracking is performed.
+   */
+  void setNexthopSubscribeRequester(
+      std::function<void(std::vector<folly::IPAddress>)> requester) {
+    nexthopSubscribeRequester_ = std::move(requester);
   }
 
   //
@@ -293,11 +305,32 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
   std::vector<neteng::fboss::bgp::thrift::TOriginatedRoute>
   getOriginatedRoutes();
 
-  rib_policy::TRibPolicy getRibPolicy();
+  virtual rib_policy::TRibPolicy getRibPolicy();
 
   // update entry stats
   void updateEntryStats(
       neteng::fboss::bgp::thrift::TEntryStats& stats) noexcept;
+
+  /**
+   * [Partial Drain]
+   *
+   * Partial drain is a DC-only feature. RibBase keeps empty virtual
+   * defaults so BgpService can dispatch through `RibBase&` without a
+   * dynamic_cast; RibDC overrides with real bodies and BB inherits the
+   * no-op default (returns an empty status).
+   */
+  virtual neteng::fboss::bgp::thrift::TPartialDrainStatus
+  getPartialDrainStatus() const {
+    return {};
+  }
+  virtual neteng::fboss::bgp::thrift::TPartialDrainState getPartialDrainState()
+      const {
+    return {};
+  }
+  virtual std::vector<neteng::fboss::bgp::thrift::TPartiallyDrainedPrefix>
+  getPartiallyDrainedPrefixes() const {
+    return {};
+  }
 
   /**
    * Get the current RIB version. This is a monotonically increasing counter
@@ -336,25 +369,15 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
   virtual void clearRouteAttributePolicy();
 
   /**
-   * [Path Selection Policy]
-   */
-  virtual neteng::fboss::bgp::thrift::TResult setPathSelectionPolicy(
-      std::unique_ptr<rib_policy::TPathSelectionPolicy> policy);
-
-  rib_policy::TPathSelectionPolicy getPathSelectionPolicy();
-  // get path selection policy version. Return -1 if policy is not set.
-  int64_t getPathSelectionPolicyVersion() const;
-
-  virtual void clearPathSelectionPolicy();
-
-  std::vector<rib_policy::TPathSelector> getActivePathSelectionCriteria(
-      std::unique_ptr<std::vector<std::string>> prefixes);
-
-  /**
    * [Route Filter Policy]
+   *
+   * Filters the routes that are accepted from peers and announced to
+   * peers. Each replace triggers a persist-to-disk and (when not in
+   * read-only mode) a fib re-program.
    */
   virtual void setRouteFilterPolicy(
-      std::unique_ptr<rib_policy::TRouteFilterPolicy> policy);
+      std::unique_ptr<rib_policy::TRouteFilterPolicy> policy,
+      bool forceUpdate = false);
 
   rib_policy::TRouteFilterPolicy getRouteFilterPolicy();
   // get route filter policy version. Return -1 if policy is not set.
@@ -383,7 +406,23 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
       uint64_t ribVersion);
 
   virtual void enqueueRibUpdateToFsdb() {}
+  /*
+   * Generic hook invoked once at the end of each prepareFibProgramming pass
+   * (after path selection and route-attribute overwrite, before the
+   * fibBatchList_ early-exit). No-op default; subclasses override to run
+   * platform-specific end-of-pass work. RibBase performs no such work itself,
+   * keeping the base class free of platform-domain logic.
+   */
+  virtual void onPrepareFibProgrammingComplete() noexcept {}
   virtual void postRouteFilterPolicyReplaced() {}
+
+  /*
+   * Persistence logic for rib policy during restart. Save rib policy
+   * state upon receipt of any rib policy updates. Virtual so platform
+   * subclasses can extend the set of sub-policies persisted. Public so
+   * tests and intra-rib callers can invoke it directly.
+   */
+  virtual void saveRibPolicyState() noexcept;
 
  protected:
   virtual void createFib();
@@ -391,6 +430,90 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
   void handleFullAddPathWithdrawal(
       const RibEntry& ribEntry,
       RibOutWithdrawal& withdrawalAddPath);
+
+  /*
+   * Captured prior state used as the baseline for change detection at the
+   * end of selectBestPath. Produced by snapshotAndResetForPathSelection()
+   * (Phase 1 of the path-selection pipeline) which also clears the
+   * mutable aggregates and topo map so the subsequent phases write into a
+   * clean slate.
+   */
+  struct PathSelectionInput {
+    std::shared_ptr<RouteInfo> oldBestpath;
+    float oldAggregateReceivedUcmpWeight{0};
+    float oldAggregateLocalUcmpWeight{0};
+    std::shared_ptr<const WeightedNexthopMap> oldMultipathWeightedNexthops;
+    std::shared_ptr<const NexthopTopoInfoMap> oldNexthopAndTopoInfo;
+  };
+
+  /*
+   * Shared result struct that accumulates across the middle phases of
+   * selectBestPath. Phase 3 (multiPathSelection) fills in selectedPaths;
+   * Phase 4 (accumulateAggregateWeightsAndTopoInfo) extends it with
+   * lbwMultiplier (used by Phase 6 when normalizing UCMP weights) and
+   * topoInfoChanged (used by Phase 7 change detection).
+   */
+  struct MultiPathSelectionResult {
+    std::vector<std::shared_ptr<RouteInfo>> selectedPaths;
+    float lbwMultiplier{1.0};
+    bool topoInfoChanged{false};
+  };
+
+ public:
+  /*
+   * Static orchestrator. Drives the 7 phase helpers in order.
+   */
+  static std::pair<bool, bool> selectBestPath(
+      RibEntry& entry,
+      const std::unique_ptr<RouteInfoSelector>& multipathSelector,
+      const std::unique_ptr<RouteInfoSelector>& bestpathSelector,
+      bool computeUcmp,
+      uint32_t ucmpWidth,
+      const std::optional<BgpUcmpQuantizer>& quantizer = std::nullopt,
+      bool enableRibAllocatedPathId = false) noexcept;
+
+  /*
+   * Instance entry point used by prepareFibProgramming. Reads
+   * selectors and UCMP knobs from member state and runs the static
+   * selectBestPath orchestrator.
+   */
+  virtual std::pair<bool, bool> runBestPathSelection(RibEntry& entry) noexcept;
+
+ protected:
+  static PathSelectionInput snapshotAndResetForPathSelection(
+      RibEntry& entry) noexcept;
+
+  static std::vector<std::shared_ptr<RouteInfo>> prePathSelectionFiltering(
+      const RibEntry& entry) noexcept;
+
+  static MultiPathSelectionResult multiPathSelection(
+      RibEntry& entry,
+      const std::vector<std::shared_ptr<RouteInfo>>& routes,
+      const std::unique_ptr<RouteInfoSelector>& multipathSelector) noexcept;
+
+  static void accumulateAggregateWeightsAndTopoInfo(
+      RibEntry& entry,
+      MultiPathSelectionResult& mp,
+      const std::shared_ptr<const NexthopTopoInfoMap>& oldNexthopAndTopoInfo,
+      const std::optional<BgpUcmpQuantizer>& quantizer) noexcept;
+
+  static void bestPathSelection(
+      RibEntry& entry,
+      const std::vector<std::shared_ptr<RouteInfo>>& selectedPaths,
+      const std::unique_ptr<RouteInfoSelector>& bestpathSelector) noexcept;
+
+  static WeightedNexthopMap buildAndNormalizeWeightedNexthops(
+      RibEntry& entry,
+      std::vector<std::shared_ptr<RouteInfo>>& selectedPaths,
+      bool computeUcmp,
+      uint32_t ucmpWidth,
+      float lbwMultiplier) noexcept;
+
+  static std::pair<bool, bool> computeChangePair(
+      RibEntry& entry,
+      const PathSelectionInput& input,
+      bool topoInfoChanged,
+      WeightedNexthopMap&& newNhWtMap) noexcept;
 
   std::chrono::milliseconds ribPauseTime_{kRibPauseTimeout};
 
@@ -450,12 +573,14 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
    */
   bgp::coro::MPMCQueue<RibPolicyMessage> ribPolicyMsgQ_;
 
-  /* TODO: Move to RibDC once overwriteRouteAttributes,
+  /* TODO: Move out of RibBase once overwriteRouteAttributes,
      createTRibEntry, and thrift getters no longer access it from RibBase */
   std::unique_ptr<RouteAttributePolicy> routeAttributePolicy_{nullptr};
-  /* TODO: Move to RibDC once getPathSelectionPolicyForBestPath
-     and thrift getters no longer access it from RibBase */
-  std::unique_ptr<PathSelectionPolicy> pathSelectionPolicy_{nullptr};
+  /*
+   * Route filter policy — controls which routes are accepted from
+   * peers and which are advertised. Owned by RibBase since both
+   * platform subclasses use it.
+   */
   std::unique_ptr<RouteFilterPolicy> routeFilterPolicy_{nullptr};
 
   // The list to store all RibEntry that have been updated and needs to
@@ -501,7 +626,7 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
    * entry: prefix and associated ribEntry
    * pathFilter: unary predicate to check if a path should be in o/p list.
    */
-  std::optional<neteng::fboss::bgp::thrift::TRibEntry>
+  virtual std::optional<neteng::fboss::bgp::thrift::TRibEntry>
   createTRibEntryWithFilter(
       const std::pair<const folly::CIDRNetwork, facebook::bgp::RibEntry>& entry,
       const std::function<bool(const RouteInfo&)>& pathFilter);
@@ -554,10 +679,10 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
   /**
    * @brief Process nexthop resolution updates from NeighborWatcher
    * @details Virtual hook called from the RibInMessage dispatch loop when a
-   * NexthopResolutionUpdate arrives. Default is a no-op for subclasses (e.g.
-   * RibBB) that don't originate conditional routes. RibDC overrides to
-   * advertise/withdraw prefixes from conditionalLocalRoutes_ and emit the
-   * one-shot RibOutNexthopResolutionReceived signal to PeerManager.
+   * NexthopResolutionUpdate arrives. Default is a no-op; subclasses that
+   * originate conditional routes override to advertise/withdraw prefixes
+   * from conditionalLocalRoutes_ and emit the one-shot
+   * RibOutNexthopResolutionReceived signal to PeerManager.
    * @param nexthopResolutionUpdate The update message containing both resolved
    * and unresolved nexthop ips
    */
@@ -627,11 +752,12 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
    */
   virtual folly::coro::Task<void> processRibPolicyMsgLoop() noexcept = 0;
 
-  /* Shared CRF handlers used by both RibDC and RibBB dispatch loops. */
+  /*
+   * Shared rib-policy message handlers used by every platform
+   * subclass's processRibPolicyMsgLoop. Platform-specific message
+   * handlers live on the respective subclass.
+   */
   void handleRibPolicyClearMsg() noexcept;
-  virtual void handlePathSelectionPolicySetMsg(
-      const PathSelectionPolicySetMsg& msg) noexcept;
-  virtual void handlePathSelectionPolicyClearMsg() noexcept;
   void handleRouteFilterPolicySetMsg(
       const RouteFilterPolicySetMsg& msg) noexcept;
   void handleRouteFilterPolicyClearMsg() noexcept;
@@ -644,8 +770,8 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
    * Replace RibPolicy: save to disk, then trigger fib programming when there
    * is delta and not in read-only mode.
    *
-   * Pure virtual — each subclass (RibDC, RibBB) provides its own dispatch
-   * to the relevant replace*Policy methods for its platform.
+   * Pure virtual — each platform subclass provides its own dispatch to the
+   * relevant replace*Policy methods for its platform.
    *
    * @param newRibPolicy the new RibPolicy to apply, or nullptr to clear.
    * @param isBootstrap if true, skip appending to change history file
@@ -661,30 +787,25 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
   // @return: hasUpdate: whether the newPolicy contains update
   virtual bool replaceRouteFilterPolicy(
       std::unique_ptr<RouteFilterPolicy> newPolicy,
-      bool isBootstrap = false);
+      bool isBootstrap = false,
+      bool forceUpdate = false);
+
+ protected:
+  std::unique_ptr<RibPolicy> readRibPolicyState() noexcept;
 
  private:
-  // helper functions to read/write rp_state_file
-  // check if rp_state_file exists on disk
-  bool ribPolicyStoreExists() noexcept;
-  // return a pair of
-  //   readSuccess: if we could successfully read from the file
-  //   TRibPolicyStore: the TRibPolicyStore
-  std::pair<bool, neteng::fboss::bgp::thrift::TRibPolicyStore>
-  readTRibPolicyStore() noexcept;
-  // remove existing rp_state_file on disk
+  /*
+   * Remove existing rp_state_file on disk. Protected so subclass
+   * saveRibPolicyState overrides can reuse the file-management helpers.
+   */
   void removeExistingRibPolicyStore() noexcept;
-  // serialize and save tRibPolicyStore to rp_state_file
+  /*
+   * Serialize and save tRibPolicyStore to rp_state_file. Protected
+   * for the same reason as removeExistingRibPolicyStore.
+   */
   void saveTRibPolicyStore(
       const neteng::fboss::bgp::thrift::TRibPolicyStore&
           tRibPolicyStore) noexcept;
-
-  // Validate and return the saved rib policy state
-  std::unique_ptr<RibPolicy> readRibPolicyState() noexcept;
-
-  // persistence logic for rib policy during restart
-  // Save rib policy state upon receipt of any rib policy updates
-  void saveRibPolicyState() noexcept;
 
   /**
    * @brief Periodically monitor the number of prefixes learnt and detect if
@@ -820,7 +941,7 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
   std::chrono::milliseconds fibBatchTime_{kFibBatchTimeDefault};
   std::unique_ptr<folly::AsyncTimeout> fibBatchTimer_;
 
-  /* TODO: Move to RibDC once timer init moves to RibDC */
+  /* TODO: Move out of RibBase once timer init moves to a subclass */
   std::unique_ptr<folly::AsyncTimeout> routeAttributePolicyTimer_;
 
   /*
@@ -884,6 +1005,23 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
    */
   folly::F14NodeMap<folly::IPAddress, facebook::bgp::NexthopInfo>
       nexthopInfoMap_;
+
+  /**
+   * RIB-IN-driven nexthop tracking (all RIB-thread only).
+   *
+   * As routes are processed, getNexthopInfo() discovers nexthops; the ones not
+   * already requested are accumulated per RIB-IN batch and handed to
+   * nexthopSubscribeRequester_ at the end of the batch, which asks the watcher
+   * to subscribe them in FSDB. requestedNexthops_ de-dupes so each nexthop is
+   * requested at most once.
+   */
+  std::function<void(std::vector<folly::IPAddress>)> nexthopSubscribeRequester_{
+      nullptr};
+  folly::F14FastSet<folly::IPAddress> requestedNexthops_;
+  std::vector<folly::IPAddress> pendingNexthopSubscriptions_;
+
+  // Flush accumulated newly-learned nexthops to nexthopSubscribeRequester_.
+  void maybeFlushNexthopSubscriptions() noexcept;
 
  protected:
   // Fib Agent Related Information

@@ -37,6 +37,7 @@
 #include "neteng/fboss/bgp/cpp/policy/PolicyStructs.h"
 #include "neteng/fboss/bgp/cpp/rib/FibDev.h"
 #include "neteng/fboss/bgp/cpp/rib/RibBase.h"
+#include "neteng/fboss/bgp/cpp/rib/RibFileUtils.h"
 #include "neteng/fboss/bgp/cpp/rib/RibPolicy.h"
 #include "neteng/fboss/bgp/cpp/rib/RouteFilterConfig.h"
 #include "neteng/fboss/bgp/cpp/rib/Utils.h"
@@ -470,14 +471,12 @@ void RibBase::handleRibPolicyClearMsg() noexcept {
   replaceRibPolicy(nullptr);
 }
 
-void RibBase::handlePathSelectionPolicySetMsg(
-    const PathSelectionPolicySetMsg& /* msg */) noexcept {}
-
-void RibBase::handlePathSelectionPolicyClearMsg() noexcept {}
-
 void RibBase::handleRouteFilterPolicySetMsg(
     const RouteFilterPolicySetMsg& msg) noexcept {
-  replaceRouteFilterPolicy(std::make_unique<RouteFilterPolicy>(msg.policy));
+  replaceRouteFilterPolicy(
+      std::make_unique<RouteFilterPolicy>(msg.policy),
+      /*isBootstrap=*/false,
+      msg.forceUpdate);
 }
 
 void RibBase::handleRouteFilterPolicyClearMsg() noexcept {
@@ -577,6 +576,8 @@ void RibBase::processRibInAnnouncement(
       processSingleRibInUpdate(kV4LocalPeerInfo, bgpAttrs, aggPfxPid);
     }
   }
+  // Subscribe any nexthops newly learned while processing this batch.
+  maybeFlushNexthopSubscriptions();
   if (ribEoRReceived_) {
     // Monitor prefix count to detect route churn
     incrementPrefixCountForRouteChurn(pfxPathIds.size());
@@ -584,6 +585,17 @@ void RibBase::processRibInAnnouncement(
     // Schedule incremental fib programming timer
     schedulePrepareFibProgrammingTimer();
   }
+}
+
+void RibBase::maybeFlushNexthopSubscriptions() noexcept {
+  if (pendingNexthopSubscriptions_.empty()) {
+    return;
+  }
+  if (nexthopSubscribeRequester_) {
+    nexthopSubscribeRequester_(std::move(pendingNexthopSubscriptions_));
+  }
+  // Ensure the buffer is empty even if it was moved-from or requester unset.
+  pendingNexthopSubscriptions_.clear();
 }
 
 void RibBase::checkWithdrawalBeforeRouteProgrammed(
@@ -629,6 +641,8 @@ void RibBase::processRibInWithdrawal(
       processSingleRibInUpdate(kV4LocalPeerInfo, bgpAttrs, aggPfxPid);
     }
   }
+  // Aggregate/local routes injected above may introduce new nexthops.
+  maybeFlushNexthopSubscriptions();
   if (ribEoRReceived_) {
     // Monitor prefix count to detect route churn
     incrementPrefixCountForRouteChurn(pfxPathIds.size());
@@ -1254,6 +1268,243 @@ RibBase::aggregateRoute(
  * Fib before we announce to neighbors so that our Fib is "warm" before the
  * neighbor sends us traffic to that destination.
  */
+RibBase::PathSelectionInput RibBase::snapshotAndResetForPathSelection(
+    RibEntry& entry) noexcept {
+  PathSelectionInput input{
+      .oldBestpath = entry.bestpath_,
+      .oldAggregateReceivedUcmpWeight = entry.aggregateReceivedUcmpWeight_,
+      .oldAggregateLocalUcmpWeight = entry.aggregateLocalUcmpWeight_,
+      .oldMultipathWeightedNexthops = entry.weightedNexthops_,
+      .oldNexthopAndTopoInfo = entry.nexthopsAndTopoInfo_,
+  };
+  entry.needPathSelection_ = false;
+  entry.aggregateReceivedUcmpWeight_ = 0;
+  entry.aggregateLocalUcmpWeight_ = 0;
+  entry.nexthopsAndTopoInfo_ = nullptr;
+  return input;
+}
+
+std::vector<std::shared_ptr<RouteInfo>> RibBase::prePathSelectionFiltering(
+    const RibEntry& entry) noexcept {
+  const FeatureFlags::BgpBestpathFeatures& bgpBestpathFeatures =
+      FeatureFlags::getBgpBestpathFeatures();
+  std::vector<std::shared_ptr<RouteInfo>> routes;
+  for (const auto& peerIdAndPaths : entry.routeInfos_) {
+    for (const auto& pathIdAndRoute : peerIdAndPaths.second) {
+      if (bgpBestpathFeatures.enableNextHopTracking &&
+          (!pathIdAndRoute.second->isResolvedForSelection())) {
+        continue;
+      }
+      routes.emplace_back(pathIdAndRoute.second);
+    }
+  }
+  return routes;
+}
+
+RibBase::MultiPathSelectionResult RibBase::multiPathSelection(
+    RibEntry& /*entry*/,
+    const std::vector<std::shared_ptr<RouteInfo>>& routes,
+    const std::unique_ptr<RouteInfoSelector>& multipathSelector) noexcept {
+  /*
+   * Run the configured multipath selector over the candidate routes.
+   * Required to produce at least one path when called with a non-empty
+   * candidate set; an empty result would indicate a bug in the
+   * multipath selector itself.
+   */
+  MultiPathSelectionResult result;
+  result.selectedPaths = multipathSelector->selectRoutes(routes);
+  XCHECK(!result.selectedPaths.empty());
+  return result;
+}
+
+void RibBase::accumulateAggregateWeightsAndTopoInfo(
+    RibEntry& entry,
+    MultiPathSelectionResult& mp,
+    const std::shared_ptr<const NexthopTopoInfoMap>& oldNexthopAndTopoInfo,
+    const std::optional<BgpUcmpQuantizer>& quantizer) noexcept {
+  mp.lbwMultiplier = BpsPerGBps;
+  NexthopTopoInfoMap nexthopsAndTopoInfo;
+  bool missingReceivedUcmpWeight{false};
+  bool missingLocalUcmpWeight{false};
+
+  for (const auto& path : mp.selectedPaths) {
+    if (!path->pathIdToSend.has_value()) {
+      path->pathIdToSend = entry.getPathIdToSend();
+    }
+    if (auto topoInfo = path->attrs->getTopologyInfo()) {
+      nexthopsAndTopoInfo.emplace(path->attrs->getNexthop(), *topoInfo);
+    }
+
+    auto receivedUcmpWeight = path->getUcmpWeight();
+    missingReceivedUcmpWeight |= (receivedUcmpWeight == 0);
+    entry.aggregateReceivedUcmpWeight_ += receivedUcmpWeight;
+
+    auto localUcmpWeight = path->peer.ucmpWeight;
+    missingLocalUcmpWeight |= (!localUcmpWeight.has_value());
+    entry.aggregateLocalUcmpWeight_ += localUcmpWeight.value_or(0.0);
+
+    auto receivedLbwBps = receivedUcmpWeight * 8.0f;
+    if (receivedLbwBps > BpsPerGBps) {
+      mp.lbwMultiplier = std::min(mp.lbwMultiplier, BpsPerGBps);
+    } else if (receivedLbwBps > BpsPerMBps) {
+      mp.lbwMultiplier = std::min(mp.lbwMultiplier, BpsPerMBps);
+    } else {
+      mp.lbwMultiplier = 1.0;
+    }
+  }
+
+  if (nexthopsAndTopoInfo.size() == mp.selectedPaths.size()) {
+    entry.nexthopsAndTopoInfo_ =
+        std::make_shared<NexthopTopoInfoMap>(std::move(nexthopsAndTopoInfo));
+    mp.topoInfoChanged =
+        (oldNexthopAndTopoInfo == nullptr ||
+         *oldNexthopAndTopoInfo != *entry.nexthopsAndTopoInfo_);
+  }
+
+  if (missingReceivedUcmpWeight) {
+    entry.aggregateReceivedUcmpWeight_ = 0;
+  }
+  if (missingLocalUcmpWeight) {
+    entry.aggregateLocalUcmpWeight_ = 0;
+  } else if (quantizer.has_value()) {
+    entry.aggregateLocalUcmpWeight_ =
+        quantizer->quantize(entry.aggregateLocalUcmpWeight_);
+  }
+}
+
+void RibBase::bestPathSelection(
+    RibEntry& entry,
+    const std::vector<std::shared_ptr<RouteInfo>>& selectedPaths,
+    const std::unique_ptr<RouteInfoSelector>& bestpathSelector) noexcept {
+  auto bestpath = bestpathSelector->selectRoutes(selectedPaths);
+  CHECK(!bestpath.empty());
+  entry.bestpath_ = bestpath[0];
+  entry.installToFib_ = bestpath[0]->installToFib;
+}
+
+WeightedNexthopMap RibBase::buildAndNormalizeWeightedNexthops(
+    RibEntry& entry,
+    std::vector<std::shared_ptr<RouteInfo>>& selectedPaths,
+    bool computeUcmp,
+    uint32_t ucmpWidth,
+    float lbwMultiplier) noexcept {
+  WeightedNexthopMap newNhWtMap;
+  uint32_t weightMultiplier{0};
+  uint64_t totalUcmpWeight{0};
+  const bool setUcmpWeights =
+      computeUcmp && entry.aggregateReceivedUcmpWeight_ > 0;
+  std::unordered_set<uint32_t> uniqueNexthopWeights;
+  entry.multipaths_ = {};
+  for (auto& path : selectedPaths) {
+    auto pathId = path->pathIdToSend.value();
+    entry.multipaths_.emplace(pathId, std::move(path));
+    path = entry.multipaths_.at(pathId);
+
+    if (setUcmpWeights) {
+      auto ucmpWeight = static_cast<uint32_t>(
+          round(path->getUcmpWeight() * 8 / lbwMultiplier));
+      totalUcmpWeight += ucmpWeight;
+      weightMultiplier = std::gcd(weightMultiplier, ucmpWeight);
+      newNhWtMap.emplace(path->attrs->getNexthop(), ucmpWeight);
+    } else {
+      newNhWtMap.emplace(path->attrs->getNexthop(), 0u);
+    }
+  }
+  if (setUcmpWeights) {
+    totalUcmpWeight = totalUcmpWeight / std::max(weightMultiplier, 1u);
+    for (auto it = newNhWtMap.begin(); it != newNhWtMap.end();) {
+      auto& [nh, ucmpWeight] = *it;
+      ucmpWeight = ucmpWeight / std::max(weightMultiplier, 1u);
+      if (totalUcmpWeight > ucmpWidth) {
+        ucmpWeight = round(ucmpWeight * ucmpWidth * 1.0 / totalUcmpWeight);
+      }
+      if (ucmpWeight == 0) {
+        it = newNhWtMap.erase(it);
+      } else {
+        uniqueNexthopWeights.emplace(ucmpWeight);
+        ++it;
+      }
+    }
+  }
+  entry.isUcmpActive_ = uniqueNexthopWeights.size() > 1;
+  return newNhWtMap;
+}
+
+std::pair<bool, bool> RibBase::computeChangePair(
+    RibEntry& entry,
+    const PathSelectionInput& input,
+    bool topoInfoChanged,
+    WeightedNexthopMap&& newNhWtMap) noexcept {
+  bool multipathChanged = false;
+  if ((input.oldMultipathWeightedNexthops == nullptr) ||
+      (newNhWtMap != *input.oldMultipathWeightedNexthops)) {
+    entry.weightedNexthops_ =
+        std::make_shared<WeightedNexthopMap>(std::move(newNhWtMap));
+    multipathChanged = true;
+  }
+  multipathChanged |= topoInfoChanged;
+
+  if (!input.oldBestpath && !entry.bestpath_) {
+    return std::make_pair(false, multipathChanged);
+  }
+
+  const bool bestpathChanged = (input.oldBestpath != entry.bestpath_) ||
+      (entry.aggregateReceivedUcmpWeight_ !=
+       input.oldAggregateReceivedUcmpWeight) ||
+      (entry.aggregateLocalUcmpWeight_ != input.oldAggregateLocalUcmpWeight);
+
+  return std::make_pair(bestpathChanged, multipathChanged);
+}
+
+std::pair<bool, bool> RibBase::selectBestPath(
+    RibEntry& entry,
+    const std::unique_ptr<RouteInfoSelector>& multipathSelector,
+    const std::unique_ptr<RouteInfoSelector>& bestpathSelector,
+    bool computeUcmp,
+    uint32_t ucmpWidth,
+    const std::optional<BgpUcmpQuantizer>& quantizer,
+    bool enableRibAllocatedPathId) noexcept {
+  const auto input = snapshotAndResetForPathSelection(entry);
+  auto routes = prePathSelectionFiltering(entry);
+
+  if (routes.empty()) {
+    entry.bestpath_ = nullptr;
+    if (enableRibAllocatedPathId) {
+      entry.multipaths_ = {};
+    }
+    entry.installToFib_ = true;
+    entry.weightedNexthops_ = nullptr;
+    return std::make_pair(
+        entry.bestpath_ != input.oldBestpath,
+        entry.weightedNexthops_ != input.oldMultipathWeightedNexthops);
+  }
+
+  auto mp = multiPathSelection(entry, routes, multipathSelector);
+  auto& selectedPaths = mp.selectedPaths;
+
+  accumulateAggregateWeightsAndTopoInfo(
+      entry, mp, input.oldNexthopAndTopoInfo, quantizer);
+
+  bestPathSelection(entry, selectedPaths, bestpathSelector);
+
+  auto newNhWtMap = buildAndNormalizeWeightedNexthops(
+      entry, selectedPaths, computeUcmp, ucmpWidth, mp.lbwMultiplier);
+
+  return computeChangePair(
+      entry, input, mp.topoInfoChanged, std::move(newNhWtMap));
+}
+
+std::pair<bool, bool> RibBase::runBestPathSelection(RibEntry& entry) noexcept {
+  return selectBestPath(
+      entry,
+      multipathSelector_,
+      bestpathSelector_,
+      globalConfig_.computeUcmpFromLbwComm,
+      globalConfig_.ucmpWidth,
+      std::optional<BgpUcmpQuantizer>(globalConfig_.ucmpQuantizer),
+      enableRibAllocatedPathId_);
+}
+
 void RibBase::prepareFibProgramming(bool fullSync) noexcept {
   ScopedProfile profile("RibBase::prepareFibProgramming");
   BgpStats::incrDecisionProcessRunsCount();
@@ -1262,8 +1513,7 @@ void RibBase::prepareFibProgramming(bool fullSync) noexcept {
   // track if at least one rib entry got active ucmp
   bool isUcmpActive{false};
   // track if we are performing path selection / route attribute overwrite on
-  // all rib entries, we could do this in non-full-sync as well when we update
-  // CPS / CTE policies
+  // all rib entries
   bool fullRibWalk = true;
 
   RibOutWithdrawal withdrawal;
@@ -1296,14 +1546,7 @@ void RibBase::prepareFibProgramming(bool fullSync) noexcept {
     prefixesToOverwriteRouteAttributes.insert(prefix);
 
     auto pathSelectionStartTime = std::chrono::steady_clock::now();
-    auto [bestpathChanged, nexthopChanged] = ribEntry.selectBestPath(
-        multipathSelector_,
-        bestpathSelector_,
-        globalConfig_.computeUcmpFromLbwComm,
-        globalConfig_.ucmpWidth,
-        std::optional<BgpUcmpQuantizer>(globalConfig_.ucmpQuantizer),
-        pathSelectionPolicy_,
-        enableRibAllocatedPathId_);
+    auto [bestpathChanged, nexthopChanged] = runBestPathSelection(ribEntry);
     RibStats::STATS_ribPathSelectionTimeMs.addValue(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - pathSelectionStartTime)
@@ -1414,6 +1657,15 @@ void RibBase::prepareFibProgramming(bool fullSync) noexcept {
   /* Virtual hook: subclasses override to apply CTE route attribute overwrites.
      Timing and full-sync stats are handled inside the override. */
   overwriteRouteAttributes(prefixesToOverwriteRouteAttributes, fullRibWalk);
+
+  /*
+   * Generic post-path-selection hook, invoked once per pass after path
+   * selection and route-attribute overwrite, before the fibBatchList_
+   * early-exit. No-op default on RibBase; subclasses override to run
+   * platform-specific end-of-pass work. RibBase neither knows nor performs
+   * any such work itself.
+   */
+  onPrepareFibProgrammingComplete();
 
   // If no entry in fib update list and not full sync, skip fib programming
   if (fibBatchList_.empty() && !fullSync) {
@@ -1681,7 +1933,8 @@ void RibBase::handleFibProgrammedMessage(
               entry.getRibPolicyUcmpWeight(),
               newlyInstalledInLocalRib,
               entry.installTimeStamp_,
-              entry.getRibVersion());
+              entry.getRibVersion(),
+              entry.getIsPartialDrain());
         }
 
         // if we are withdrawing certain paths, we need to notify AdjRib
@@ -1743,7 +1996,8 @@ void RibBase::handleFibProgrammedMessage(
           entry.getRibPolicyUcmpWeight(),
           newlyInstalledInLocalRib,
           entry.installTimeStamp_,
-          entry.getRibVersion());
+          entry.getRibVersion(),
+          entry.getIsPartialDrain());
     }
   }
 
@@ -1844,7 +2098,8 @@ void RibBase::announceAddPath(
       entry.getRibPolicyUcmpWeight(),
       newlyInstalledInLocalRib,
       entry.installTimeStamp_,
-      entry.getRibVersion());
+      entry.getRibVersion(),
+      entry.getIsPartialDrain());
 }
 
 void RibBase::withdrawAddPath(
@@ -2216,36 +2471,6 @@ RibBase::createTRibEntryWithFilter(
   const auto& ribEntry = entry.second;
 
   /*
-   * Check if the path selection of the route is overridden by CPS.
-   * If so, set the corresponding active criteria to active_cps_criteria
-   * We need to do this early in case we exit pre-maturely below
-   */
-  std::vector<std::string> prefixVector = {
-      folly::IPAddress::networkToString(ribEntry.getPrefix())};
-  bool failedCpsNativeCriteria = false;
-  if (pathSelectionPolicy_) {
-    auto activeCriteriaVector =
-        pathSelectionPolicy_->getActivePathSelectionCriteria(prefixVector);
-
-    XCHECK_EQ(activeCriteriaVector.size(), 1);
-
-    const auto& activeCriteria = activeCriteriaVector.at(0);
-    if (activeCriteria != rib_policy::TPathSelector()) {
-      // matched an active criteria
-      tRibEntry.active_cps_criteria() = activeCriteria;
-    }
-
-    auto psPolicyRes = pathSelectionPolicy_->getPathSelectionPolicyResult(
-        ribEntry.getPrefix());
-    // If failedCpsNativeCriteria is true, no path is "best path"
-    failedCpsNativeCriteria = psPolicyRes &&
-        (psPolicyRes->outcome ==
-             PathSelectionPolicyResult::Outcome::BGP_FAILED_CPS_MIN_NEXTHOP ||
-         psPolicyRes->outcome ==
-             PathSelectionPolicyResult::Outcome::BGP_FAILED_CPS_MIN_AGG_LBW);
-  }
-
-  /*
    * Check if the route's weights are overridden by CTE (route attribute
    * policy). If so, set the corresponding active UCMP action to
    * active_cte_ucmp_action.
@@ -2298,8 +2523,7 @@ RibBase::createTRibEntryWithFilter(
       tPath.path_id_to_send() = routeinfo->pathIdToSend.value();
     }
     if (routeinfo->pathIdToSend.has_value() &&
-        multipath_routeinfos.contains(routeinfo->pathIdToSend.value()) &&
-        !failedCpsNativeCriteria) {
+        multipath_routeinfos.contains(routeinfo->pathIdToSend.value())) {
       if (bestpath && routeinfo == bestpath) {
         tPath.is_best_path() = true;
         /*
@@ -2312,7 +2536,6 @@ RibBase::createTRibEntryWithFilter(
       }
       tBestPaths.emplace_back(tPath);
     } else {
-      // if cps native criteria is violated, then there's actually no bestpaths
       tDefaultPaths.emplace_back(tPath);
     }
   }
@@ -2395,14 +2618,12 @@ rib_policy::TRibPolicy RibBase::getRibPolicy() {
    * on Rib's evb (e.g., called via folly::via from co_runOnEvbWithTimeout),
    * otherwise dispatches and waits. Avoids deadlock in both contexts. */
   evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
-    // We have moved the route attribute policy out to routeAttributePolicy_
-    // and the path selection policy out to pathSelectionPolicy_
-    // Therefore we need to handle the toThrift differently
+    /*
+     * RibBase fills the sub-policies it owns; platform subclasses can
+     * extend by overriding getRibPolicy.
+     */
     if (routeAttributePolicy_) {
       result.route_attribute_policy() = routeAttributePolicy_->toThrift();
-    }
-    if (pathSelectionPolicy_) {
-      result.path_selection_policy() = pathSelectionPolicy_->toThrift();
     }
     if (routeFilterPolicy_) {
       result.route_filter_policy() = routeFilterPolicy_->toThrift();
@@ -2469,73 +2690,20 @@ void RibBase::clearRouteAttributePolicy() {
       [&]() { ribPolicyMsgQ_.push(RouteAttributePolicyClearMsg{}); });
 }
 
-/**
- * [Path Selection Policy]
- */
-neteng::fboss::bgp::thrift::TResult RibBase::setPathSelectionPolicy(
-    std::unique_ptr<rib_policy::TPathSelectionPolicy> policy) {
-  neteng::fboss::bgp::thrift::TResult result;
-  try {
-    PathSelectionPolicy psPolicy{*policy};
-  } catch (const BgpError& ex) {
-    auto errorMsg = folly::exceptionStr(ex);
-    XLOGF(ERR, "{}", errorMsg);
-    result.success() = false;
-    result.err() = errorMsg;
-    return result;
-  }
-
-  // push rib policy set message to policy queue
-  evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
-    ribPolicyMsgQ_.push(PathSelectionPolicySetMsg{std::move(*policy)});
-  });
-  result.success() = true;
-  return result;
-}
-
-rib_policy::TPathSelectionPolicy RibBase::getPathSelectionPolicy() {
-  rib_policy::TPathSelectionPolicy result;
-  evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
-    if (pathSelectionPolicy_ != nullptr) {
-      result = pathSelectionPolicy_->toThrift();
-    }
-  });
-  return result;
-}
-
-int64_t RibBase::getPathSelectionPolicyVersion() const {
-  return pathSelectionPolicy_ ? pathSelectionPolicy_->getVersion() : -1;
-}
-
 int64_t RibBase::getRouteFilterPolicyVersion() const {
   return routeFilterPolicy_ ? routeFilterPolicy_->getVersion() : -1;
-}
-
-void RibBase::clearPathSelectionPolicy() {
-  // push clear message to policy queue
-  evb_.runImmediatelyOrRunInEventBaseThreadAndWait(
-      [&]() { ribPolicyMsgQ_.push(PathSelectionPolicyClearMsg{}); });
-}
-
-std::vector<rib_policy::TPathSelector> RibBase::getActivePathSelectionCriteria(
-    std::unique_ptr<std::vector<std::string>> prefixes) {
-  std::vector<rib_policy::TPathSelector> result;
-  evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
-    if (pathSelectionPolicy_) {
-      result = pathSelectionPolicy_->getActivePathSelectionCriteria(*prefixes);
-    }
-  });
-  return result;
 }
 
 /**
  * [Route Filter Policy]
  */
 void RibBase::setRouteFilterPolicy(
-    std::unique_ptr<rib_policy::TRouteFilterPolicy> policy) {
+    std::unique_ptr<rib_policy::TRouteFilterPolicy> policy,
+    bool forceUpdate) {
   // push rib policy set message to policy queue
   evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
-    ribPolicyMsgQ_.push(RouteFilterPolicySetMsg{std::move(*policy)});
+    ribPolicyMsgQ_.push(
+        RouteFilterPolicySetMsg{std::move(*policy), forceUpdate});
   });
 }
 
@@ -2557,7 +2725,8 @@ void RibBase::clearRouteFilterPolicy() {
 
 bool RibBase::replaceRouteFilterPolicy(
     std::unique_ptr<RouteFilterPolicy> newPolicy,
-    bool isBootstrap) {
+    bool isBootstrap,
+    bool forceUpdate) {
   RibStats::STATS_rfPolicyRcvd.add(1);
   // hasUpdate is true when newPolicy is different from routeFilterPolicy_
   bool hasUpdate;
@@ -2566,9 +2735,15 @@ bool RibBase::replaceRouteFilterPolicy(
     // When routeFilterPolicy_ has cached one policy, hasUpdate if
     // 1. newPolicy == nullptr
     // 2. cached policy has delta with new one
+    // forceUpdate bypasses the version check (used by FILE_MODE)
     hasUpdate = (newPolicy == nullptr) ||
         ((*routeFilterPolicy_ != *newPolicy) &&
-         routeFilterPolicy_->getVersion() <= newPolicy->getVersion());
+         (forceUpdate ||
+          routeFilterPolicy_->getVersion() <= newPolicy->getVersion()));
+    if (forceUpdate && newPolicy && *routeFilterPolicy_ != *newPolicy &&
+        routeFilterPolicy_->getVersion() > newPolicy->getVersion()) {
+      BgpStats::incrCrfForceUpdateBypass();
+    }
   } else {
     // routeFilterPolicy_ does not cache anything, hasUpdate if newPolicy is
     // not nullptr
@@ -2601,18 +2776,23 @@ bool RibBase::replaceRouteFilterPolicy(
 }
 
 std::unique_ptr<RibPolicy> RibBase::readRibPolicyState() noexcept {
-  if (!ribPolicyStoreExists()) {
+  auto tRibPolicyStore =
+      readThriftArtifactFromFile<TRibPolicyStore>(FLAGS_rp_state_file);
+  if (!tRibPolicyStore) {
     return nullptr;
   }
 
-  auto [readSuccess, tRibPolicyStore] = readTRibPolicyStore();
-  if (!readSuccess) {
+  if (*tRibPolicyStore->fileTermination() != kRibPolicyFileTermination) {
+    XLOGF(
+        ERR,
+        "Invalid HA store file termination: {}",
+        *tRibPolicyStore->fileTermination());
     return nullptr;
   }
 
   std::unique_ptr<RibPolicy> res;
   try {
-    res = std::make_unique<RibPolicy>(*tRibPolicyStore.policy());
+    res = std::make_unique<RibPolicy>(*tRibPolicyStore->policy());
   } catch (const std::exception& ex) {
     XLOGF(
         ERR,
@@ -2626,56 +2806,12 @@ std::unique_ptr<RibPolicy> RibBase::readRibPolicyState() noexcept {
   return res;
 }
 
-bool RibBase::ribPolicyStoreExists(void) noexcept {
-  if (!boost::filesystem::exists(FLAGS_rp_state_file)) {
-    XLOGF(
-        INFO,
-        "Could not find rib policy file {}. Bypass reading rib poilcy state.",
-        FLAGS_rp_state_file);
-    return false;
-  }
-  return true;
-}
-
-std::pair<bool, TRibPolicyStore> RibBase::readTRibPolicyStore(void) noexcept {
-  std::string ribPolicyStoreStr;
-  TRibPolicyStore tRibPolicyStore;
-
-  if (!folly::readFile(FLAGS_rp_state_file.c_str(), ribPolicyStoreStr)) {
-    XLOGF(
-        ERR,
-        "Failed to read file contents from '{}'. Error ({}): {}",
-        FLAGS_rp_state_file,
-        errno,
-        folly::errnoStr(errno));
-    return {false, tRibPolicyStore};
-  }
-
-  try {
-    tRibPolicyStore =
-        apache::thrift::SimpleJSONSerializer::deserialize<TRibPolicyStore>(
-            ribPolicyStoreStr);
-  } catch (const std::exception& ex) {
-    XLOGF(
-        ERR,
-        "Could not de-serialize RibPolicyStore. Exception: {}",
-        folly::exceptionStr(ex));
-    return {false, tRibPolicyStore};
-  }
-
-  if (*tRibPolicyStore.fileTermination() != kRibPolicyFileTermination) {
-    XLOGF(
-        ERR,
-        "Invalid HA store file termination: {}",
-        *tRibPolicyStore.fileTermination());
-    return {false, tRibPolicyStore};
-  }
-
-  return {true, tRibPolicyStore};
-}
-
 void RibBase::saveRibPolicyState() noexcept {
-  if (!pathSelectionPolicy_ && !routeAttributePolicy_ && !routeFilterPolicy_) {
+  /*
+   * Persists the sub-policies RibBase owns; platform subclasses can
+   * extend by overriding saveRibPolicyState.
+   */
+  if (!routeAttributePolicy_ && !routeFilterPolicy_) {
     XLOG(INFO, "rib policy empty, remove previously saved rib policy if any");
     removeExistingRibPolicyStore();
     return;
@@ -2691,10 +2827,6 @@ void RibBase::saveRibPolicyState() noexcept {
   tRibPolicyStore.fileTermination() = kRibPolicyFileTermination;
 
   // add policy thrift format
-  if (pathSelectionPolicy_) {
-    tRibPolicyStore.policy()->path_selection_policy() =
-        pathSelectionPolicy_->toThrift();
-  }
   if (routeAttributePolicy_) {
     tRibPolicyStore.policy()->route_attribute_policy() =
         routeAttributePolicy_->toThrift();
@@ -2881,10 +3013,14 @@ NexthopInfo* FOLLY_NULLABLE RibBase::getNexthopInfo(
         isConnected.has_value() ? std::to_string(isConnected.value())
                                 : "unset");
 
-    // Create new NexthopInfo with the status
-    auto [newIt, inserted] = nexthopInfoMap_.emplace(
-        nexthop,
-        NexthopInfo(NexthopStatus(nexthop, isReachable, igpCost, isConnected)));
+    /*
+     * Create new NexthopInfo with the status. Use the cached status directly
+     * rather than reconstructing from individual fields, so the
+     * excludeNexthopWithoutCost policy carried on the NexthopStatus is
+     * preserved (the FBOSS source hardcodes it false).
+     */
+    auto [newIt, inserted] =
+        nexthopInfoMap_.emplace(nexthop, NexthopInfo(nextHopStatus));
     if (inserted) {
       RibStats::incrNexthopInfoCount();
     }
@@ -2900,6 +3036,26 @@ NexthopInfo* FOLLY_NULLABLE RibBase::getNexthopInfo(
         igpCost.has_value() ? std::to_string(igpCost.value()) : "unset",
         isConnected.has_value() ? std::to_string(isConnected.value())
                                 : "unset");
+
+    /*
+     * First time this nexthop is seen in RIB-IN: queue it for FSDB tracking
+     * (de-duped via requestedNexthops_). Flushed per RIB-IN batch.
+     *
+     * Skip the unspecified nexthop (::/0.0.0.0): locally-originated and
+     * aggregate routes (processed via kV4LocalPeerInfo) carry a null nexthop,
+     * which is not a resolvable FSDB FIB entry and must not be subscribed.
+     * Note: conditional local routes carry a real (non-zero) nexthop and are
+     * intentionally still tracked.
+     */
+    if (nexthopSubscribeRequester_) {
+      /*
+       * Only when RIB-IN-driven tracking is enabled (DC). On EBB the requester
+       * is unset, so the checks below are skipped entirely.
+       */
+      if (!nexthop.isZero() && requestedNexthops_.insert(nexthop).second) {
+        pendingNexthopSubscriptions_.push_back(nexthop);
+      }
+    }
 
     return &newIt->second;
   }

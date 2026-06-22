@@ -25,6 +25,7 @@
 #include "neteng/fboss/bgp/cpp/tests/PeerManagerTestUtils.h"
 
 #include "neteng/fboss/bgp/cpp/config/facebook/ConfigDC.h"
+#include "neteng/fboss/bgp/cpp/tests/BoundedWaitUtils.h"
 
 DEFINE_bool(
     enable_egress_backpressure_in_peer_mgr_tests,
@@ -937,11 +938,20 @@ void PeerManagerTestFixture::runEoRTest(
 
   // task to read ribInQ for verification
   {
+    /*
+     * The boundedBlockingPop below throws BoundedWaitTimeout on a hung
+     * queue. Because this task runs inside FiberManager::addTaskFuture, a
+     * throw here crashes the process rather than yielding a clean gtest
+     * assertion — still a land-blocking CRITICAL outcome (not a suppressed
+     * tpx TIMEOUT), and the BoundedWaitTimeout `what()` message is in the
+     * crash log, so the root cause stays visible.
+     */
     auto task = fm
                     .addTaskFuture(
                         [&] {
                           while (true) {
-                            auto msg = folly::coro::blockingWait(ribInQ_.pop());
+                            auto msg = facebook::bgp::test::boundedBlockingPop(
+                                ribInQ_, "ribInQ_");
                             folly::variant_match(
             msg,
             [&](RibInAnnouncement announcement) {
@@ -1011,7 +1021,10 @@ void PeerManagerTestFixture::runEoRTest(
     auto task = fm.addTaskFuture([&] {
       // Wait for sessions to be established and updates sent before
       // terminating the sessions.
-      peerStoppedBaton.wait();
+      facebook::bgp::test::boundedBatonWait(
+          peerStoppedBaton,
+          "peerStoppedBaton",
+          facebook::bgp::test::kDefaultPopTimeout);
 
       auto sessionDownFuture1 =
           sessionMgr1_->getSessionsGoDownFuture({kLocalPeerId1});
@@ -1050,16 +1063,20 @@ void PeerManagerTestFixture::runEoRTest(
   /*
    * Step1: wait for session establishment with advertisement + EoR sending
    */
-  stopPeerBaton.wait();
+  facebook::bgp::test::boundedBatonWait(
+      stopPeerBaton, "stopPeerBaton", facebook::bgp::test::kDefaultPopTimeout);
 
   /*
-   * Step2: stop sessions by shutting down PeerManager to save GR state
+   * Step2: stop sessions by shutting down PeerManager to save GR state.
+   * Mirrors Main.cpp shutdown: markDaemonShutdown → saveGrState → stop.
    */
-  peerMgr->stop();
+  peerMgr->markDaemonShutdown();
+  peerMgr->saveGrState();
   localSessionMgr->stop();
+  peerMgr->stop();
 
   /*
-   * Step3: post peerStoppedBaton to trigger GR state saving
+   * Step3: signal waiting tasks that PeerManager teardown is complete.
    */
   peerStoppedBaton.post();
 
@@ -1098,13 +1115,13 @@ PeerManagerTestFixture::getMockPeerInfo(
   auto peerInfo = std::make_shared<nettools::bgplib::BgpPeerDisplayInfo>();
   peerInfo->peeringParams = peeringParams;
   peerInfo->remoteBgpId = routerId;
-  peerInfo->remoteGrRestartTime = folly::none;
+  peerInfo->remoteGrRestartTime = std::nullopt;
   peerInfo->state = nettools::bgplib::BgpSessionState::ESTABLISHED;
   peerInfo->localAddr = folly::SocketAddress("127.0.0.1", 1234);
   peerInfo->startTime = std::chrono::steady_clock::now();
   peerInfo->establishedTime = std::chrono::steady_clock::now();
   peerInfo->negotiatedCapabilities = nettools::bgplib::BgpCapabilities();
-  peerInfo->negotiatedHoldTime = folly::none;
+  peerInfo->negotiatedHoldTime = std::nullopt;
   peerInfo->numOfConnectionAttempts = 0;
   peerInfo->lastResetHoldTimer = 0;
   peerInfo->lastResetKeepAliveTimer = 0;
@@ -1116,7 +1133,7 @@ PeerManagerTestFixture::getMockPeerInfo(
         peerInfo->startTime - std::chrono::hours(lastWentDown);
     peerInfo->lastResetReason = lastResetReason;
   } else {
-    peerInfo->lastResetReason = folly::none;
+    peerInfo->lastResetReason = std::nullopt;
     peerInfo->lastResetTime = std::chrono::steady_clock::now();
   }
 
@@ -1137,19 +1154,19 @@ PeerManagerTestFixture::getMockPeerInfo(
   auto peerInfo = std::make_shared<nettools::bgplib::BgpPeerDisplayInfo>();
   peerInfo->peeringParams = param1;
   peerInfo->remoteBgpId = routerId;
-  peerInfo->remoteGrRestartTime = folly::none;
+  peerInfo->remoteGrRestartTime = std::nullopt;
   peerInfo->state = nettools::bgplib::BgpSessionState::ESTABLISHED;
   peerInfo->localAddr = folly::SocketAddress("127.0.0.1", 1234);
   peerInfo->startTime = std::chrono::steady_clock::now();
   peerInfo->establishedTime = std::chrono::steady_clock::now();
   peerInfo->negotiatedCapabilities = nettools::bgplib::BgpCapabilities();
-  peerInfo->negotiatedHoldTime = folly::none;
+  peerInfo->negotiatedHoldTime = std::nullopt;
   peerInfo->numOfConnectionAttempts = 0;
   peerInfo->lastResetHoldTimer = 0;
   peerInfo->lastResetKeepAliveTimer = 0;
   peerInfo->lastReceivedKeepAlive = 0;
   peerInfo->lastSentKeepAlive = 0;
-  peerInfo->lastResetReason = folly::none;
+  peerInfo->lastResetReason = std::nullopt;
   return peerInfo;
 }
 
@@ -1160,7 +1177,7 @@ folly::coro::Task<void> PeerManagerTestFixture::waitForAdjRibsToProcessUpdates(
     evb.loopOnce();
     for (auto& q : queues) {
       while (!q->empty()) {
-        co_await q->pop();
+        co_await facebook::bgp::test::boundedPop(*q, "q");
       }
     }
   }
@@ -1225,8 +1242,9 @@ void StreamSubscriberFixture::SetUp(
  */
 void StreamSubscriberFixture::TearDown() {
   PeerManagerTestFixture::TearDown();
-  peerMgr->stop();
+  peerMgr->markDaemonShutdown();
   sessionMgr->stop();
+  peerMgr->stop();
   peerMgrThread->join();
   sessionMgrThread->join();
   SUCCEED();
@@ -1273,7 +1291,7 @@ void PeerManagerDynamicPolicyEvaluationFixture::verifyStateWithRetries(
             state.adjRib->isPendingIngressPolicyUpdate());
         EXPECT_EVENTUALLY_EQ(
             state.expectedEgressPendingPolicyUpdate,
-            state.adjRib->isPendingEgressPolicyUpdate());
+            state.adjRib->isEgressPolicyUpdateRequired());
       }
     });
   });
@@ -1289,7 +1307,7 @@ void PeerManagerDynamicPolicyEvaluationFixture::verifyState(
           state.adjRib->isPendingIngressPolicyUpdate());
       EXPECT_EQ(
           state.expectedEgressPendingPolicyUpdate,
-          state.adjRib->isPendingEgressPolicyUpdate());
+          state.adjRib->isEgressPolicyUpdateRequired());
     }
   });
 }

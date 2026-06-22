@@ -66,6 +66,10 @@ void LoadFromThriftConfig(const thrift::BgpConfig& bgpThriftConfig) {
     bgpBestpathFeatures.enableNextHopTracking =
         bgpSettingConfig->enable_next_hop_tracking().value();
   }
+  if (bgpSettingConfig->next_hop_tracking_use_openr_igp_cost().has_value()) {
+    bgpBestpathFeatures.nextHopTrackingUseOpenrIgpCost =
+        bgpSettingConfig->next_hop_tracking_use_openr_igp_cost().value();
+  }
   if (bgpSettingConfig->enable_eibgp_multipath().has_value()) {
     bgpBestpathFeatures.enableEiBgpMultipath =
         bgpSettingConfig->enable_eibgp_multipath().value();

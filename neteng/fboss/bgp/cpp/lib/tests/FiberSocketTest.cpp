@@ -509,8 +509,7 @@ TEST_F(FiberSocketFixture, ConnectFail) {
 //
 TEST_F(FiberSocketFixture, CloseWithReset) {
   manager->addTask([]() mutable {
-    FiberServerSocket serverSocket(
-        folly::Optional<folly::SocketAddress>(), 256);
+    FiberServerSocket serverSocket(std::optional<folly::SocketAddress>(), 256);
 
     auto serverAddress = serverSocket.getListenAddress();
     XLOGF(
@@ -563,8 +562,7 @@ TEST_F(FiberSocketFixture, CloseWithReset) {
 //
 TEST_F(FiberSocketFixture, ShutdownWrite) {
   manager->addTask([]() mutable {
-    FiberServerSocket serverSocket(
-        folly::Optional<folly::SocketAddress>(), 256);
+    FiberServerSocket serverSocket(std::optional<folly::SocketAddress>(), 256);
 
     auto serverAddress = serverSocket.getListenAddress();
     XLOGF(
@@ -625,8 +623,7 @@ TEST_F(FiberSocketFixture, ClientServerSingleThread) {
   manager->addTask([]() mutable {
     // hold this in the scope, so we won't close accepting socket
     // too soon, hence the shared ptr
-    FiberServerSocket serverSocket(
-        folly::Optional<folly::SocketAddress>(), 256);
+    FiberServerSocket serverSocket(std::optional<folly::SocketAddress>(), 256);
 
     auto serverAddress = serverSocket.getListenAddress();
     XLOGF(
@@ -715,8 +712,7 @@ TEST_F(FiberSocketFixture, ClientServerSingleThread2) {
   manager->addTask([]() mutable {
     // hold this in the scope, so we won't close accepting socket
     // too soon, hence the shared ptr
-    FiberServerSocket serverSocket(
-        folly::Optional<folly::SocketAddress>(), 256);
+    FiberServerSocket serverSocket(std::optional<folly::SocketAddress>(), 256);
 
     auto serverAddress = serverSocket.getListenAddress();
     XLOGF(
@@ -844,7 +840,7 @@ TEST_F(FiberSocketFixture, RemoteTaskExecution) {
 TEST_F(FiberSocketFixture, AcceptInOrder) {
   manager->addTask([]() mutable {
     FiberServerSocket serverSocket(
-        folly::Optional<folly::SocketAddress>(), kNumClients);
+        std::optional<folly::SocketAddress>(), kNumClients);
 
     auto serverAddress = serverSocket.getListenAddress();
     XLOGF(
@@ -955,7 +951,7 @@ TEST_F(FiberSocketFixture, KillAcceptorFiber) {
   manager->addTask([]() mutable {
     std::shared_ptr<FiberServerSocket> serverSocket =
         std::make_shared<FiberServerSocket>(
-            folly::Optional<folly::SocketAddress>(), 256);
+            std::optional<folly::SocketAddress>(), 256);
 
     // acceptor fiber
     addTask([serverSocket]() mutable {
@@ -1141,8 +1137,7 @@ TEST_F(FiberSocketFixture, KillConnectorFiber2) {
   manager->addTask([]() mutable {
     // hold this in the scope, so we won't close accepting socket
     // too soon, hence the shared ptr
-    FiberServerSocket serverSocket(
-        folly::Optional<folly::SocketAddress>(), 256);
+    FiberServerSocket serverSocket(std::optional<folly::SocketAddress>(), 256);
 
     auto serverAddress = serverSocket.getListenAddress();
     XLOGF(
@@ -1183,8 +1178,7 @@ TEST_F(FiberSocketFixture, DoubleConnect) {
   manager->addTask([]() mutable {
     // hold this in the scope, so we won't close accepting socket
     // too soon, hence the shared ptr
-    FiberServerSocket serverSocket(
-        folly::Optional<folly::SocketAddress>(), 256);
+    FiberServerSocket serverSocket(std::optional<folly::SocketAddress>(), 256);
 
     auto serverAddress = serverSocket.getListenAddress();
     XLOGF(

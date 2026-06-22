@@ -46,6 +46,12 @@
   FRIEND_TEST(RibFixture, RibAnnouncementFromSamePeerWithoutBestPathChange);   \
   FRIEND_TEST(RibFixture, NoBestPathNexthopChangeAddPath);                     \
   FRIEND_TEST(RibFixture, NoBestPathNexthopChangeAddPathWithRibPolicyMNHTest); \
+  FRIEND_TEST(RibFixture, PartialDrainAnnouncesWhenBestpathPointerUnchanged);  \
+  FRIEND_TEST(RibFixture, PartialDrainStatusReflectsRibState);                 \
+  FRIEND_TEST(RibFixture, PartialDrainTransitionCountOnlyOnDeviceFlip);        \
+  FRIEND_TEST(RibFixture, PartialDrainTransitionCountMultiPrefix);             \
+  FRIEND_TEST(RibFixture, PartialDrainMnhThresholdUpdatedAcrossDrainCycle);    \
+  FRIEND_TEST(RibFixture, PartialDrainUnderflowGuard);                         \
   FRIEND_TEST(RibFixture, BestPathWithAddPathEnabled_OnlyPathIdChange);        \
   FRIEND_TEST(                                                                 \
       RibFixture, IncrementalWithdrawnChunkTestAfterReadOnlyForAddPath);       \
@@ -68,6 +74,9 @@
       RibFixture, RouteChurnDetectionTestWithAnnouncementsAndWithdraws);       \
   FRIEND_TEST(                                                                 \
       RibNexthopTrackingFixture, RibInAnnouncementWithNexthopTracking);        \
+  FRIEND_TEST(                                                                 \
+      RibNexthopTrackingFixture,                                               \
+      RibInAnnouncementRequestsNexthopSubscription);                           \
   FRIEND_TEST(RibNexthopTrackingFixture, RibInNexthopUpdate);                  \
   FRIEND_TEST(RibNexthopTrackingFixture, RouteInfoStoresRibEntryPointer);      \
   FRIEND_TEST(RibNexthopTrackingFixture, RouteFlappingWithUniqueNexthop);      \
@@ -92,10 +101,13 @@
   FRIEND_TEST(                                                                 \
       RibWithLocalRouteFixture, ConditionalLocalRoute_UnknownNexthopNoOp);     \
   FRIEND_TEST(RibFixture, RibVersionIncrementsOnBestpathChange);               \
-  FRIEND_TEST(RibFixture, RibVersionNoChangeOnDuplicateRoute);
+  FRIEND_TEST(RibFixture, RibVersionNoChangeOnDuplicateRoute);                 \
+  FRIEND_TEST(RibFixture, CreateBestPathOnlyTRibEntry);
 
 #define RibEntry_TEST_FRIENDS \
   FRIEND_TEST(RibFixture, AnnounceAndWithdrawAddPathsBasedOnDeltaTest);
+
+#define RibDC_TEST_FRIENDS FRIEND_TEST(RibFixture, CreateBestPathOnlyTRibEntry);
 
 #include <boost/algorithm/string.hpp>
 #include <algorithm>
@@ -120,6 +132,7 @@
 #include "neteng/fboss/bgp/cpp/rib/RibBase.h"
 #include "neteng/fboss/bgp/cpp/rib/RibDC.h"
 #include "neteng/fboss/bgp/cpp/rib/RibPolicyLogger.h"
+#include "neteng/fboss/bgp/cpp/tests/BoundedWaitUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/MockScubaData.h"
 #include "neteng/fboss/bgp/cpp/tests/PolicyUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/RibPolicyUtils.h"
@@ -507,8 +520,12 @@ TEST_F(RibFixture, NoBestPathNexthopChangeAddPath) {
     newAttr->publish();
     rib_->ribEntries_.find(kV4Prefix1)
         ->second.updatePath(eBgpPeer2_, newAttr, false);
-    rib_->ribEntries_.find(kV4Prefix1)
-        ->second.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+    RibBase::selectBestPath(
+        rib_->ribEntries_.find(kV4Prefix1)->second,
+        multipathSelector,
+        bestpathSelector,
+        false,
+        0);
   });
   // Now simulate recepit of announcement from eBgpPeer2_ for same prefix,
   // kV4Prefix1, same nexthop, kV4Nexthop2, but different communities
@@ -533,10 +550,12 @@ TEST_F(RibFixture, NoBestPathNexthopChangeAddPath) {
 }
 
 /*
- * If addpath is enabled. Then there is a path update which doesn't trigger path
- * programing (no best path change and not nexthop change), but the nexthop path
- * attributes change. But we have RibPolicy with MNH set. In such case, we don't
- * announce this change to AdjRib.
+ * If addpath is enabled and we have RibPolicy with MNH set plus
+ * drain_on_min_nexthop_violation=true, partial drain retains the bestpath
+ * under MNH violation. A subsequent path-attribute change on a non-bestpath
+ * peer leaves the bestpath unchanged but updates the multipath set, so we
+ * announce add-path entries to AdjRib without a standard bestpath
+ * re-announcement.
  */
 TEST_F(RibFixture, NoBestPathNexthopChangeAddPathWithRibPolicyMNHTest) {
   auto fibFuture = fib_->getFibProgramFuture();
@@ -567,8 +586,12 @@ TEST_F(RibFixture, NoBestPathNexthopChangeAddPathWithRibPolicyMNHTest) {
     newAttr->publish();
     rib_->ribEntries_.find(kV4Prefix1)
         ->second.updatePath(eBgpPeer2_, newAttr, false);
-    rib_->ribEntries_.find(kV4Prefix1)
-        ->second.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+    RibBase::selectBestPath(
+        rib_->ribEntries_.find(kV4Prefix1)->second,
+        multipathSelector,
+        bestpathSelector,
+        false,
+        0);
   });
 
   //
@@ -589,17 +612,20 @@ TEST_F(RibFixture, NoBestPathNexthopChangeAddPathWithRibPolicyMNHTest) {
   rib_->waitForPathSelectionPolicyUpdate();
   ribFuture.wait();
 
-  // expect a withdrawal of the existing prefix
+  // With partial drain, bestpath is retained — re-announcement, not withdrawal
   {
     auto msg = folly::coro::blockingWait(ribOutQ_.pop());
-    ASSERT_TRUE(std::holds_alternative<RibOutWithdrawal>(msg));
-    auto withdrawal = std::get<RibOutWithdrawal>(msg);
-    ASSERT_EQ(1, withdrawal.entries.size());
-    EXPECT_EQ(kDefaultPathID, withdrawal.entries[0].pathIdToSend);
+    ASSERT_TRUE(std::holds_alternative<RibOutAnnouncement>(msg));
+    auto announcement = std::get<RibOutAnnouncement>(msg);
+    ASSERT_EQ(1, announcement.entries.size());
+    EXPECT_EQ(kDefaultPathID, announcement.entries[0].pathIdToSend);
   }
 
   // Now simulate recepit of announcement from eBgpPeer2_ for same prefix,
-  // kV4Prefix1, same nexthop, kV4Nexthop2, but different communities
+  // kV4Prefix1, same nexthop, kV4Nexthop2, but different communities.
+  // Under partial drain, the bestpath is retained but unchanged (eBgpPeer2_ is
+  // not the bestpath). The multipath set changes (updated attrs), generating
+  // add-path entries but no standard bestpath re-announcement.
   auto prefixBatch2 = PrefixPathIds{{kV4Prefix1, kDefaultPathID}};
 
   fibFuture = fib_->getFibProgramFuture();
@@ -608,9 +634,436 @@ TEST_F(RibFixture, NoBestPathNexthopChangeAddPathWithRibPolicyMNHTest) {
   attr->setNexthop(kV4Nexthop2);
   attr->publish();
   sendAnnouncement(prefixBatch2, eBgpPeer2_, attr);
+  fibFuture.wait();
 
-  // expect no message
-  REPEAT_N(5, { EXPECT_EQ(0, ribOutQ_.size()); });
+  WITH_RETRIES({ ASSERT_EVENTUALLY_GE(ribOutQ_.size(), 1); });
+  {
+    auto msg = folly::coro::blockingWait(ribOutQ_.pop());
+    ASSERT_TRUE(std::holds_alternative<RibOutAnnouncement>(msg));
+    auto announcement = std::get<RibOutAnnouncement>(msg);
+    EXPECT_EQ(0, announcement.entries.size());
+    EXPECT_GE(announcement.addPathEntries.size(), 1);
+  }
+}
+
+/*
+ * Regression guard for partial-drain bestpathChanged signaling in
+ * RibDC::selectBestPath (the DC-only CPS-aware path-selection orchestrator).
+ *
+ * Scenario: a single path is installed (bestpath = X). Then a CPS policy
+ * with mnh=3 + drain_on_min_nexthop_violation=true is injected. With only 1
+ * path, MNH is violated but partial drain retains X — so bestpath_ remains
+ * the SAME shared_ptr across the policy injection. The bestpath pointer
+ * comparison alone (oldBestpath == bestpath_) would yield bestpathChanged=
+ * false.
+ *
+ * RibDC::selectBestPath() folds the drain transition into the returned
+ * bestpathChanged via `(isPartialDrain_ != oldIsPartialDrain)` at the
+ * full-return path (after computeChangePair) and at every early-return.
+ * Without that fold, the entry would not enter the announce-withdraw block,
+ * would not be pushed onto fibBatchList_, and the post-FIB announcement loop
+ * would never visit it — silently skipping the re-advertisement that
+ * downstream MNH diffs use to attach the drain community.
+ */
+TEST_F(RibFixture, PartialDrainAnnouncesWhenBestpathPointerUnchanged) {
+  auto fibFuture = fib_->getFibProgramFuture();
+  sendInitialPathComputation();
+  fibFuture.wait();
+  rib_->setFibBatchTime(milliseconds(2));
+
+  // Drain the initial-dump messages (RibInitialAnnouncementStart +
+  // RibOutAnnouncement with initialDump=true).
+  WITH_RETRIES({ ASSERT_EVENTUALLY_EQ(ribOutQ_.size(), 2); });
+  REPEAT_N(2, folly::coro::blockingWait(ribOutQ_.pop()));
+
+  // Install a single path so there's exactly 1 multipath — guaranteed to
+  // violate any mnh > 1 policy. attr_ uses kV4Nexthop1.
+  auto prefixBatch = PrefixPathIds{{kV4Prefix1, kDefaultPathID}};
+  fibFuture = fib_->getFibProgramFuture();
+  sendAnnouncement(prefixBatch, eBgpPeer1_, attr_);
+  fibFuture.wait();
+
+  // Drain the announcement for the initial single-path install.
+  WITH_RETRIES({ ASSERT_EVENTUALLY_GE(ribOutQ_.size(), 1); });
+  {
+    auto msg = folly::coro::blockingWait(ribOutQ_.pop());
+    ASSERT_TRUE(std::holds_alternative<RibOutAnnouncement>(msg));
+  }
+
+  // Capture the bestpath shared_ptr so we can prove it stays the same
+  // across the partial-drain transition.
+  std::shared_ptr<RouteInfo> bestpathBefore;
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto& entry = rib_->ribEntries_.find(kV4Prefix1)->second;
+    bestpathBefore = entry.getBestPath();
+    EXPECT_FALSE(entry.getIsPartialDrain());
+  });
+  ASSERT_NE(bestpathBefore, nullptr);
+
+  // Inject CPS policy: mnh=3 (1 path < 3 → violation) +
+  // drain_on_min_nexthop_violation.
+  TPathSelector tPathSelector;
+  tPathSelector.bgp_native_path_selection_min_nexthop() = 3;
+  tPathSelector.drain_on_min_nexthop_violation() = true;
+
+  auto ribFuture = rib_->getRibPrepareFibProgrammingFuture();
+  sendPathSelectionPolicySet(
+      createTPathSelectionPolicyWithPathSelector({kV4Prefix1}, tPathSelector));
+  rib_->waitForPathSelectionPolicyUpdate();
+  ribFuture.wait();
+
+  // The transition is partial-drain false → true, but the bestpath pointer
+  // stays the same (still the one path we installed). The drain-transition
+  // fold in selectBestPath() must produce a re-announcement (NOT a
+  // withdrawal) so the entry stays on the announce path.
+  WITH_RETRIES({ ASSERT_EVENTUALLY_GE(ribOutQ_.size(), 1); });
+  {
+    auto msg = folly::coro::blockingWait(ribOutQ_.pop());
+    ASSERT_TRUE(std::holds_alternative<RibOutAnnouncement>(msg));
+    auto announcement = std::get<RibOutAnnouncement>(msg);
+    ASSERT_EQ(1, announcement.entries.size());
+    EXPECT_EQ(kDefaultPathID, announcement.entries[0].pathIdToSend);
+  }
+
+  // Verify the invariant the test exists to guard: drain transitioned, but
+  // the bestpath shared_ptr is unchanged.
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto& entry = rib_->ribEntries_.find(kV4Prefix1)->second;
+    EXPECT_TRUE(entry.getIsPartialDrain());
+    EXPECT_TRUE(entry.getInstallToFib());
+    EXPECT_EQ(entry.getBestPath(), bestpathBefore);
+  });
+}
+
+/*
+ * Positive-path coverage for the partial-drain accessors:
+ *   - drainedPrefixCount_ increments when a prefix enters partial drain
+ *   - getPartialDrainStatus() reports the live counters
+ *   - getPartiallyDrainedPrefixes() returns the prefix with correct
+ *     min_capacity / current_capacity
+ *   - getPartialDrainState() bundles both
+ * Mirrors the partial-drain setup from
+ * PartialDrainAnnouncesWhenBestpathPointerUnchanged.
+ */
+TEST_F(RibFixture, PartialDrainStatusReflectsRibState) {
+  auto fibFuture = fib_->getFibProgramFuture();
+  sendInitialPathComputation();
+  fibFuture.wait();
+  rib_->setFibBatchTime(milliseconds(2));
+
+  WITH_RETRIES({ ASSERT_EVENTUALLY_EQ(ribOutQ_.size(), 2); });
+  REPEAT_N(2, folly::coro::blockingWait(ribOutQ_.pop()));
+
+  auto prefixBatch = PrefixPathIds{{kV4Prefix1, kDefaultPathID}};
+  fibFuture = fib_->getFibProgramFuture();
+  sendAnnouncement(prefixBatch, eBgpPeer1_, attr_);
+  fibFuture.wait();
+
+  WITH_RETRIES({ ASSERT_EVENTUALLY_GE(ribOutQ_.size(), 1); });
+  folly::coro::blockingWait(ribOutQ_.pop());
+
+  // Trigger partial drain: mnh=3 with 1 path → violation, drain retains
+  // bestpath.
+  TPathSelector tPathSelector;
+  tPathSelector.bgp_native_path_selection_min_nexthop() = 3;
+  tPathSelector.drain_on_min_nexthop_violation() = true;
+
+  auto ribFuture = rib_->getRibPrepareFibProgrammingFuture();
+  sendPathSelectionPolicySet(
+      createTPathSelectionPolicyWithPathSelector({kV4Prefix1}, tPathSelector));
+  rib_->waitForPathSelectionPolicyUpdate();
+  ribFuture.wait();
+
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto status = rib_->getPartialDrainStatus();
+    EXPECT_TRUE(*status.is_partially_drained());
+    EXPECT_EQ(1, *status.num_affected_prefixes());
+    // Device flipped 0 → 1 exactly once.
+    EXPECT_EQ(1, *status.partial_drain_transition_count());
+
+    auto prefixes = rib_->getPartiallyDrainedPrefixes();
+    ASSERT_EQ(1, prefixes.size());
+    EXPECT_EQ(kV4Prefix1.second, *prefixes[0].prefix()->num_bits());
+    // Trigger was MNH: the TCapacity union holds the next_hop_count arm,
+    // captured during selectBestPath() and surfaced via the Thrift accessor
+    // without a per-prefix policy lookup at RPC time. min_capacity carries the
+    // violated threshold (3); current_capacity the live nexthop count (1).
+    ASSERT_TRUE(prefixes[0].min_capacity()->next_hop_count().has_value());
+    EXPECT_EQ(3, *prefixes[0].min_capacity()->next_hop_count());
+    ASSERT_TRUE(prefixes[0].current_capacity()->next_hop_count().has_value());
+    EXPECT_EQ(1, *prefixes[0].current_capacity()->next_hop_count());
+
+    auto state = rib_->getPartialDrainState();
+    EXPECT_TRUE(*state.partial_drain_state()->is_partially_drained());
+    EXPECT_EQ(1, *state.partial_drain_state()->num_affected_prefixes());
+    ASSERT_EQ(1, state.drained_prefixes()->size());
+    ASSERT_TRUE(state.drained_prefixes()
+                    ->at(0)
+                    .min_capacity()
+                    ->next_hop_count()
+                    .has_value());
+    EXPECT_EQ(
+        3, *state.drained_prefixes()->at(0).min_capacity()->next_hop_count());
+  });
+}
+
+/*
+ * Regression guard for M1 transition-counter semantics: per the IDL doc on
+ * partial_drain_transition_count, the counter must bump only when the
+ * device-level is_partially_drained flips (count crosses zero), not on every
+ * per-prefix transition.
+ *
+ * We exercise: 0 → 1 (bump), then withdraw the path → 1 → 0 (bump). Two
+ * device-level flips ⇒ transition_count must equal 2, while
+ * num_affected_prefixes returns to 0.
+ */
+TEST_F(RibFixture, PartialDrainTransitionCountOnlyOnDeviceFlip) {
+  auto fibFuture = fib_->getFibProgramFuture();
+  sendInitialPathComputation();
+  fibFuture.wait();
+  rib_->setFibBatchTime(milliseconds(2));
+
+  WITH_RETRIES({ ASSERT_EVENTUALLY_EQ(ribOutQ_.size(), 2); });
+  REPEAT_N(2, folly::coro::blockingWait(ribOutQ_.pop()));
+
+  auto prefixBatch = PrefixPathIds{{kV4Prefix1, kDefaultPathID}};
+  fibFuture = fib_->getFibProgramFuture();
+  sendAnnouncement(prefixBatch, eBgpPeer1_, attr_);
+  fibFuture.wait();
+
+  WITH_RETRIES({ ASSERT_EVENTUALLY_GE(ribOutQ_.size(), 1); });
+  folly::coro::blockingWait(ribOutQ_.pop());
+
+  TPathSelector tPathSelector;
+  tPathSelector.bgp_native_path_selection_min_nexthop() = 3;
+  tPathSelector.drain_on_min_nexthop_violation() = true;
+
+  auto ribFuture = rib_->getRibPrepareFibProgrammingFuture();
+  sendPathSelectionPolicySet(
+      createTPathSelectionPolicyWithPathSelector({kV4Prefix1}, tPathSelector));
+  rib_->waitForPathSelectionPolicyUpdate();
+  ribFuture.wait();
+
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto status = rib_->getPartialDrainStatus();
+    EXPECT_EQ(1, *status.num_affected_prefixes());
+    EXPECT_EQ(1, *status.partial_drain_transition_count());
+  });
+
+  // Withdraw the only path → entry has no routes → selectBestPath resets
+  // isPartialDrain_ → device flips back from drained to not-drained.
+  fibFuture = fib_->getFibProgramFuture();
+  sendWithdrawal(prefixBatch, eBgpPeer1_);
+  fibFuture.wait();
+
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto status = rib_->getPartialDrainStatus();
+    EXPECT_FALSE(*status.is_partially_drained());
+    EXPECT_EQ(0, *status.num_affected_prefixes());
+    // 0→1 then 1→0: exactly two device flips.
+    EXPECT_EQ(2, *status.partial_drain_transition_count());
+    EXPECT_TRUE(rib_->getPartiallyDrainedPrefixes().empty());
+  });
+}
+
+/*
+ * Multi-prefix coverage for the device-flip semantics of
+ * partial_drain_transition_count. With three prefixes draining and
+ * recovering at different times, the counter must increment only on the
+ * device-level 0->1 (first prefix drained) and 1->0 (last prefix
+ * recovered) transitions — NOT on the intermediate per-prefix flips
+ * while the device is already drained. Guards the `drainedPrefixCount_
+ * == 0` predicates in RibDC::recordPartialDrainTransition.
+ */
+TEST_F(RibFixture, PartialDrainTransitionCountMultiPrefix) {
+  auto fibFuture = fib_->getFibProgramFuture();
+  sendInitialPathComputation();
+  fibFuture.wait();
+  rib_->setFibBatchTime(milliseconds(2));
+
+  WITH_RETRIES({ ASSERT_EVENTUALLY_EQ(ribOutQ_.size(), 2); });
+  REPEAT_N(2, folly::coro::blockingWait(ribOutQ_.pop()));
+
+  // Announce three prefixes each with one path
+  for (const auto& prefix : {kV4Prefix1, kV4Prefix2, kV6Prefix1}) {
+    auto prefixBatch = PrefixPathIds{{prefix, kDefaultPathID}};
+    fibFuture = fib_->getFibProgramFuture();
+    sendAnnouncement(prefixBatch, eBgpPeer1_, attr_);
+    fibFuture.wait();
+  }
+  WITH_RETRIES({ ASSERT_EVENTUALLY_GE(ribOutQ_.size(), 3); });
+  REPEAT_N(3, folly::coro::blockingWait(ribOutQ_.pop()));
+
+  // mnh=3 with 1 path per prefix => all three violate => all three drain.
+  TPathSelector tPathSelector;
+  tPathSelector.bgp_native_path_selection_min_nexthop() = 3;
+  tPathSelector.drain_on_min_nexthop_violation() = true;
+
+  auto ribFuture = rib_->getRibPrepareFibProgrammingFuture();
+  sendPathSelectionPolicySet(createTPathSelectionPolicyWithPathSelector(
+      {kV4Prefix1, kV4Prefix2, kV6Prefix1}, tPathSelector));
+  rib_->waitForPathSelectionPolicyUpdate();
+  ribFuture.wait();
+
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto status = rib_->getPartialDrainStatus();
+    EXPECT_TRUE(*status.is_partially_drained());
+    EXPECT_EQ(3, *status.num_affected_prefixes());
+    // All three prefixes drained, but the device crossed 0->non-zero only ONCE.
+    EXPECT_EQ(1, *status.partial_drain_transition_count());
+  });
+
+  // Withdraw two of three prefixes — device stays drained, counter must NOT
+  // bump.
+  for (const auto& prefix : {kV4Prefix1, kV4Prefix2}) {
+    auto prefixBatch = PrefixPathIds{{prefix, kDefaultPathID}};
+    fibFuture = fib_->getFibProgramFuture();
+    sendWithdrawal(prefixBatch, eBgpPeer1_);
+    fibFuture.wait();
+  }
+
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto status = rib_->getPartialDrainStatus();
+    EXPECT_TRUE(*status.is_partially_drained());
+    EXPECT_EQ(1, *status.num_affected_prefixes());
+    // Per-prefix transitions while still drained do NOT bump the counter.
+    EXPECT_EQ(1, *status.partial_drain_transition_count());
+  });
+
+  // Withdraw the last drained prefix — device flips back, counter bumps once
+  // more.
+  {
+    auto prefixBatch = PrefixPathIds{{kV6Prefix1, kDefaultPathID}};
+    fibFuture = fib_->getFibProgramFuture();
+    sendWithdrawal(prefixBatch, eBgpPeer1_);
+    fibFuture.wait();
+  }
+
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto status = rib_->getPartialDrainStatus();
+    EXPECT_FALSE(*status.is_partially_drained());
+    EXPECT_EQ(0, *status.num_affected_prefixes());
+    // 0->1 (first prefix drained) + 1->0 (last prefix recovered) = 2.
+    EXPECT_EQ(2, *status.partial_drain_transition_count());
+  });
+}
+
+/*
+ * Regression guard for capacity-threshold staleness: when a prefix drains
+ * at mnh=3, then recovers, then re-drains under a NEW policy with mnh=5,
+ * the surfaced threshold must reflect the NEW value (5), not the stale
+ * cached value (3). RibEntry::selectBestPath resets mnhThreshold_ and
+ * aggLbwBpsThreshold_ to 0 at the top of the function before recomputing
+ * from the active policy; this test exercises that reset across a
+ * drain->recover->re-drain cycle.
+ */
+TEST_F(RibFixture, PartialDrainMnhThresholdUpdatedAcrossDrainCycle) {
+  auto fibFuture = fib_->getFibProgramFuture();
+  sendInitialPathComputation();
+  fibFuture.wait();
+  rib_->setFibBatchTime(milliseconds(2));
+
+  WITH_RETRIES({ ASSERT_EVENTUALLY_EQ(ribOutQ_.size(), 2); });
+  REPEAT_N(2, folly::coro::blockingWait(ribOutQ_.pop()));
+
+  auto prefixBatch = PrefixPathIds{{kV4Prefix1, kDefaultPathID}};
+  fibFuture = fib_->getFibProgramFuture();
+  sendAnnouncement(prefixBatch, eBgpPeer1_, attr_);
+  fibFuture.wait();
+
+  WITH_RETRIES({ ASSERT_EVENTUALLY_GE(ribOutQ_.size(), 1); });
+  folly::coro::blockingWait(ribOutQ_.pop());
+
+  // Phase 1: drain at mnh=3.
+  TPathSelector tPathSelector;
+  tPathSelector.bgp_native_path_selection_min_nexthop() = 3;
+  tPathSelector.drain_on_min_nexthop_violation() = true;
+
+  auto ribFuture = rib_->getRibPrepareFibProgrammingFuture();
+  sendPathSelectionPolicySet(
+      createTPathSelectionPolicyWithPathSelector({kV4Prefix1}, tPathSelector));
+  rib_->waitForPathSelectionPolicyUpdate();
+  ribFuture.wait();
+
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto prefixes = rib_->getPartiallyDrainedPrefixes();
+    ASSERT_EQ(1, prefixes.size());
+    ASSERT_TRUE(prefixes[0].min_capacity()->next_hop_count().has_value());
+    EXPECT_EQ(3, *prefixes[0].min_capacity()->next_hop_count());
+  });
+
+  // Phase 2: recover by lowering mnh to 1 (1 path satisfies). The prefix
+  // is no longer drained, and the cached threshold on RibEntry must reset
+  // (verified indirectly via empty drained-prefix list).
+  TPathSelector noDrainSelector;
+  noDrainSelector.bgp_native_path_selection_min_nexthop() = 1;
+  noDrainSelector.drain_on_min_nexthop_violation() = true;
+
+  ribFuture = rib_->getRibPrepareFibProgrammingFuture();
+  sendPathSelectionPolicySet(createTPathSelectionPolicyWithPathSelector(
+      {kV4Prefix1}, noDrainSelector));
+  rib_->waitForPathSelectionPolicyUpdate();
+  ribFuture.wait();
+
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto status = rib_->getPartialDrainStatus();
+    EXPECT_FALSE(*status.is_partially_drained());
+    EXPECT_EQ(0, *status.num_affected_prefixes());
+    EXPECT_TRUE(rib_->getPartiallyDrainedPrefixes().empty());
+  });
+
+  // Phase 3: re-drain with mnh=5. The surfaced threshold must reflect 5,
+  // not the stale 3 from phase 1.
+  TPathSelector reDrainSelector;
+  reDrainSelector.bgp_native_path_selection_min_nexthop() = 5;
+  reDrainSelector.drain_on_min_nexthop_violation() = true;
+
+  ribFuture = rib_->getRibPrepareFibProgrammingFuture();
+  sendPathSelectionPolicySet(createTPathSelectionPolicyWithPathSelector(
+      {kV4Prefix1}, reDrainSelector));
+  rib_->waitForPathSelectionPolicyUpdate();
+  ribFuture.wait();
+
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto prefixes = rib_->getPartiallyDrainedPrefixes();
+    ASSERT_EQ(1, prefixes.size());
+    ASSERT_TRUE(prefixes[0].min_capacity()->next_hop_count().has_value());
+    // Threshold updated to 5 — proves the reset+recompute in
+    // RibEntry::selectBestPath refreshes the cached value across cycles.
+    EXPECT_EQ(5, *prefixes[0].min_capacity()->next_hop_count());
+  });
+}
+
+/*
+ * Defense-in-depth: RibDC::recordPartialDrainTransition has an underflow
+ * guard that triggers when a caller passes a stale oldIsPartialDrain=true
+ * while drainedPrefixCount_ is already 0 (e.g., at startup before any
+ * announcement has driven a transition). The guard logs an XLOGF(ERR),
+ * returns false without decrementing, and leaves the counters unchanged.
+ * Production code should never reach this branch under correct
+ * bookkeeping, but it exists to keep drainedPrefixCount_ non-negative —
+ * a negative int64_t would silently convert to a huge size_t at the
+ * std::vector::reserve() call in getPartiallyDrainedPrefixes() (clamped
+ * there as a backstop). This test pins the guard in place so a future
+ * refactor that drops the predicate without justification will fail CI.
+ */
+TEST_F(RibFixture, PartialDrainUnderflowGuard) {
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    // Fresh state: no partial-drain entries, count == 0.
+    auto status = rib_->getPartialDrainStatus();
+    ASSERT_EQ(0, *status.num_affected_prefixes());
+    ASSERT_EQ(0, *status.partial_drain_transition_count());
+
+    // Simulate the stale-oldIsPartialDrain scenario. Guard must return
+    // false (no transition recorded) and leave the counters at 0.
+    bool transitioned = rib_->recordPartialDrainTransition(
+        /*oldIsPartialDrain=*/true, /*newIsPartialDrain=*/false);
+    EXPECT_FALSE(transitioned);
+
+    auto statusAfter = rib_->getPartialDrainStatus();
+    EXPECT_EQ(0, *statusAfter.num_affected_prefixes());
+    EXPECT_EQ(0, *statusAfter.partial_drain_transition_count());
+  });
 }
 
 /*
@@ -652,8 +1105,12 @@ TEST_F(RibFixture, BestPathWithAddPathEnabled_OnlyPathIdChange) {
   rib_->evb_.runInEventBaseThreadAndWait([&]() {
     rib_->ribEntries_.clear();
     rib_->ribEntries_.emplace(kV4Prefix1, std::move(entry));
-    rib_->ribEntries_.find(kV4Prefix1)
-        ->second.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+    RibBase::selectBestPath(
+        rib_->ribEntries_.find(kV4Prefix1)->second,
+        multipathSelector,
+        bestpathSelector,
+        false,
+        0);
   });
 
   // Now simulate receipt of announcement from eBgpPeer1_ for the same route
@@ -1513,7 +1970,8 @@ TEST_F(RibFixture, InitialDumpChunkTest) {
         folly::CIDRNetwork(IPAddress::fromLongHBO(startAddress + i), 32);
     RibEntry entry(prefix);
     entry.updatePath(eBgpPeer1_, attr_, false);
-    entry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+    RibBase::selectBestPath(
+        entry, multipathSelector, bestpathSelector, false, 0);
     // initialise a FibProgrammedMessage with same routes in ribEntries
     prefixToNexthops.emplace(
         make_pair(prefix, entry.getMultipathWeightedNexthops()));
@@ -3356,7 +3814,8 @@ TEST_F(RibFixture, GetRibEntries) {
   RibEntry entry1(kV4Prefix1);
   EXPECT_EQ(entry1.getMultipathNexthopsStr(), "[]");
   entry1.updatePath(eBgpPeer1_, attrs1, false); // p1 has nexthop kV4Nexthop1
-  entry1.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      entry1, multipathSelector, bestpathSelector, false, 0);
   EXPECT_EQ(entry1.getMultipathNexthopsStr(), "[(11.0.0.1:0)]");
 
   RibEntry entry2(kV4Prefix2);
@@ -3364,14 +3823,16 @@ TEST_F(RibFixture, GetRibEntries) {
       eBgpPeer1_, attrs1, false); // p1 in this entry has nexthop kV4Nexthop1
   entry2.updatePath(
       eBgpPeer2_, attrs2, false); // p2 in this entry has nexthop kV4Nexthop2
-  entry2.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      entry2, multipathSelector, bestpathSelector, false, 0);
 
   RibEntry entry3(kV6Prefix1);
   entry3.updatePath(
       eBgpPeer1_, attrs1, false); // p1 in this entry has nexthop kV4Nexthop1
   entry3.updatePath(
       eBgpPeer2_, attrs2, false); // p2 in this entry has nexthop kV4Nexthop2
-  entry3.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      entry3, multipathSelector, bestpathSelector, false, 0);
 
   // not putting v6 entry in entries for now
   rib_->ribEntries_.emplace(make_pair(kV4Prefix1, std::move(entry1)));
@@ -3503,6 +3964,52 @@ TEST_F(RibFixture, GetRibEntries) {
   }
 }
 
+/*
+ * createBestPathOnlyTRibEntry (the FSDB publish builder) returns an entry with
+ * only prefix + best_path -- the same best_path the full builder selects, with
+ * the heavy paths map / best_group dropped -- or nullopt when there is no
+ * publishable best path (so the caller withdraws the prefix).
+ */
+TEST_F(RibFixture, CreateBestPathOnlyTRibEntry) {
+  auto attrs1 =
+      std::make_shared<facebook::bgp::BgpPath>(*buildBgpPathFields(4, 4, 4, 4));
+  attrs1->publish();
+  RibEntry entry1(kV4Prefix1);
+  entry1.updatePath(eBgpPeer1_, attrs1, false);
+  RibBase::selectBestPath(
+      entry1, multipathSelector, bestpathSelector, false, 0);
+  rib_->ribEntries_.emplace(make_pair(kV4Prefix1, std::move(entry1)));
+
+  auto entryIt = rib_->ribEntries_.find(kV4Prefix1);
+  ASSERT_NE(rib_->ribEntries_.end(), entryIt);
+
+  auto full = rib_->createTRibEntry(*entryIt);
+  auto minimal = rib_->createBestPathOnlyTRibEntry(*entryIt);
+
+  /*
+   * A publishable best path -> an entry whose best_path matches the full
+   * builder's selection exactly...
+   */
+  ASSERT_TRUE(minimal.has_value());
+  ASSERT_TRUE(full.best_path().has_value());
+  ASSERT_TRUE(minimal->best_path().has_value());
+  EXPECT_EQ(*full.best_path(), *minimal->best_path());
+  EXPECT_TRUE(minimal->best_path()->is_best_path().value_or(false));
+  // ...the prefix is preserved...
+  EXPECT_EQ(*full.prefix(), *minimal->prefix());
+  // ...and the heavy paths map / best_group are dropped.
+  EXPECT_TRUE(minimal->paths()->empty());
+  EXPECT_TRUE(minimal->best_group()->empty());
+  EXPECT_FALSE(minimal->rib_version().has_value());
+
+  // An entry with no best path is not published (nullopt -> withdraw).
+  RibEntry emptyEntry(kV4Prefix2);
+  rib_->ribEntries_.emplace(make_pair(kV4Prefix2, std::move(emptyEntry)));
+  EXPECT_FALSE(
+      rib_->createBestPathOnlyTRibEntry(*rib_->ribEntries_.find(kV4Prefix2))
+          .has_value());
+}
+
 TEST_F(RibFixture, UpdateEntryStatsTest) {
   RibEntry entry1(kV4Prefix1);
   RibEntry entry2(kV4Prefix2);
@@ -3549,21 +4056,24 @@ TEST_F(RibFixture, GetRibEntriesWithCommunityFilter) {
   // entry3 has 2 peers, p1 & p2
   RibEntry entry1(kV4Prefix1);
   entry1.updatePath(eBgpPeer1_, attrs2, false); // p1 has nexthop kV4Nexthop1
-  entry1.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      entry1, multipathSelector, bestpathSelector, false, 0);
 
   RibEntry entry2(kV4Prefix2);
   entry2.updatePath(
       eBgpPeer1_, attrs1, false); // p1 in this entry has nexthop kV4Nexthop1
   entry2.updatePath(
       eBgpPeer2_, attrs2, false); // p2 in this entry has nexthop kV4Nexthop2
-  entry2.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      entry2, multipathSelector, bestpathSelector, false, 0);
 
   RibEntry entry3(kV6Prefix1);
   entry3.updatePath(
       eBgpPeer1_, attrs1, false); // p1 in this entry has nexthop kV4Nexthop1
   entry3.updatePath(
       eBgpPeer2_, attrs2, false); // p2 in this entry has nexthop kV4Nexthop2
-  entry3.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      entry3, multipathSelector, bestpathSelector, false, 0);
 
   // not putting v6 entry (entry3) in entries for now
   rib_->ribEntries_.emplace(make_pair(kV4Prefix1, std::move(entry1)));
@@ -3853,7 +4363,8 @@ TEST_F(RibFixture, GetRibEntriesForSubprefixes) {
   RibEntry entry1(kV4Prefix1);
   EXPECT_EQ(entry1.getMultipathNexthopsStr(), "[]");
   entry1.updatePath(eBgpPeer1_, attrs1, false); // p1 has nexthop kV4Nexthop1
-  entry1.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      entry1, multipathSelector, bestpathSelector, false, 0);
   EXPECT_EQ(entry1.getMultipathNexthopsStr(), "[(11.0.0.1:0)]");
 
   RibEntry entry2(kV4Prefix2);
@@ -3861,22 +4372,26 @@ TEST_F(RibFixture, GetRibEntriesForSubprefixes) {
       eBgpPeer1_, attrs1, false); // p1 in this entry has nexthop kV4Nexthop1
   entry2.updatePath(
       eBgpPeer2_, attrs2, false); // p2 in this entry has nexthop kV4Nexthop2
-  entry2.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      entry2, multipathSelector, bestpathSelector, false, 0);
 
   RibEntry entry3(kV6Prefix1);
   entry3.updatePath(
       eBgpPeer1_, attrs1, false); // p1 in this entry has nexthop kV4Nexthop1
   entry3.updatePath(
       eBgpPeer2_, attrs2, false); // p2 in this entry has nexthop kV4Nexthop2
-  entry3.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      entry3, multipathSelector, bestpathSelector, false, 0);
 
   RibEntry entry4(kV4Prefix1Slash23);
   entry4.updatePath(eBgpPeer1_, attrs1, false); // p1 has nexthop kV4Nexthop1
-  entry4.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      entry4, multipathSelector, bestpathSelector, false, 0);
 
   RibEntry entry5(kV4Prefix1Slash25);
   entry5.updatePath(eBgpPeer2_, attrs2, false); // p2 has nexthop kV4Nexthop2
-  entry5.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      entry5, multipathSelector, bestpathSelector, false, 0);
 
   // put all entries into the rib
   rib_->ribEntries_.emplace(make_pair(kV4Prefix1, std::move(entry1)));
@@ -3990,21 +4505,24 @@ TEST_F(RibFixture, GetRibEntryForPrefix) {
   // entry3 has 2 peers, p1 & p2
   RibEntry entry1(kV4Prefix1);
   entry1.updatePath(eBgpPeer1_, attrs1, false); // p1 has nexthop kV4Nexthop1
-  entry1.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      entry1, multipathSelector, bestpathSelector, false, 0);
 
   RibEntry entry2(kV4Prefix2);
   entry2.updatePath(
       eBgpPeer1_, attrs1, false); // p1 in this entry has nexthop kV4Nexthop1
   entry2.updatePath(
       eBgpPeer2_, attrs2, false); // p2 in this entry has nexthop kV4Nexthop2
-  entry2.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      entry2, multipathSelector, bestpathSelector, false, 0);
 
   RibEntry entry3(kV6Prefix1);
   entry3.updatePath(
       eBgpPeer1_, attrs1, false); // p1 in this entry has nexthop kV4Nexthop1
   entry3.updatePath(
       eBgpPeer2_, attrs2, false); // p2 in this entry has nexthop kV4Nexthop2
-  entry3.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      entry3, multipathSelector, bestpathSelector, false, 0);
 
   rib_->ribEntries_.emplace(make_pair(kV4Prefix1, std::move(entry1)));
   rib_->ribEntries_.emplace(make_pair(kV4Prefix2, std::move(entry2)));
@@ -4091,8 +4609,12 @@ TEST_F(RibFixture, GetRibEntryWeightedNexthopsTest) {
     attrs2->publish();
     EXPECT_TRUE(ribEntry.updatePath(peer2, attrs2, false));
 
-    ribEntry.selectBestPath(
-        multipathSelector, bestpathSelector, true, 1024 /* ucmp-width */);
+    RibBase::selectBestPath(
+        ribEntry,
+        multipathSelector,
+        bestpathSelector,
+        true,
+        1024 /* ucmp-width */);
     WeightedNexthopMap nhWts = {{kPeerAddr1, 511}, {kPeerAddr2, 513}};
     EXPECT_EQ(nhWts, *ribEntry.getMultipathWeightedNexthops());
     rib_->ribEntries_.emplace(kV4Prefix1, std::move(ribEntry));
@@ -4556,7 +5078,7 @@ TEST_F(RibFixture, LbwCommunityForward) {
         kPeerAddr2, kPeerAsn2, kPeerRouterId2, BgpSessionType::EBGP, false);
     entry.updatePath(peer2, attrs, false, installToFib);
   }
-  entry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(entry, multipathSelector, bestpathSelector, false, 0);
   // EXPECT_EQ(entry.getHonorUcmpWeights(), true);
   EXPECT_EQ(
       entry.getAggregateReceivedUcmpWeight().value(), (kLbw10G + kLbw10G));
@@ -4643,7 +5165,7 @@ TEST_F(RibFixture, LbwCommunitySuppression1) {
   // For this test, we assert that peer1 < peer2, so as to ensure that
   // the route advertised by peer1 is the best path
   ASSERT_LT(kPeerAddr1, kPeerAddr2);
-  entry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(entry, multipathSelector, bestpathSelector, false, 0);
   EXPECT_EQ(entry.getBestPath()->attrs->getExtCommunities()->size(), 5);
   // Best Path should have LBW, but honorUCMPWeights should be false
   EXPECT_TRUE(entry.getBestPath()->attrs->hasNonTransitiveLbwExtCommunity());
@@ -4731,7 +5253,7 @@ TEST_F(RibFixture, LbwCommunitySuppression2) {
   // For this test, we assert that peer1 < peer2, so as to ensure that
   // the route advertised by peer1 is the best path
   ASSERT_LT(kPeerAddr1, kPeerAddr2);
-  entry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(entry, multipathSelector, bestpathSelector, false, 0);
   EXPECT_EQ(entry.getBestPath()->attrs->getExtCommunities()->size(), 4);
   // Best Path should not have LBW, and honorUcmpWeights should also be false
   EXPECT_FALSE(entry.getBestPath()->attrs->hasNonTransitiveLbwExtCommunity());
@@ -4920,8 +5442,8 @@ TEST_P(RibFixtureAddPathTestSuite, PathRemovedAndRibDumpReqTest) {
         nullptr, kV4Prefix1Entry.getAdvertisedMultipathWeightedNexthops());
     // Remove a path from kV4Prefix1 route
     EXPECT_EQ(true, kV4Prefix1Entry.updatePath(eBgpPeer1_, nullptr, false));
-    kV4Prefix1Entry.selectBestPath(
-        multipathSelector, bestpathSelector, false, 0);
+    RibBase::selectBestPath(
+        kV4Prefix1Entry, multipathSelector, bestpathSelector, false, 0);
     // Verify that the path has been removed by RIB's computation
     ASSERT_NE(nullptr, kV4Prefix1Entry.getMultipathWeightedNexthops());
     // Verify that FIB has not been programmed with new next hop set yet
@@ -5041,8 +5563,8 @@ TEST_P(RibFixtureAddPathTestSuite, RouteWithdrawnAndRibDumpReqTest) {
     ASSERT_NE(
         nullptr, kV4Prefix1Entry.getAdvertisedMultipathWeightedNexthops());
     kV4Prefix1Entry.updatePath(eBgpPeer1_, nullptr, false);
-    kV4Prefix1Entry.selectBestPath(
-        multipathSelector, bestpathSelector, false, 0);
+    RibBase::selectBestPath(
+        kV4Prefix1Entry, multipathSelector, bestpathSelector, false, 0);
     ASSERT_NE(
         nullptr, kV4Prefix1Entry.getAdvertisedMultipathWeightedNexthops());
     // Verify that a route has been withdrawn. The RIB's computed
@@ -5079,7 +5601,7 @@ TEST_F(
   entry.updatePath(eBgpPeer1_, attr1, true, 0);
   entry.updatePath(eBgpPeer1_, attr2, true, 1);
   entry.updatePath(eBgpPeer1_, attr3, true, 2);
-  entry.selectBestPath(multipathSelector, bestpathSelector, true, 0);
+  RibBase::selectBestPath(entry, multipathSelector, bestpathSelector, true, 0);
   ASSERT_EQ(entry.getMultipaths().size(), 3);
   // commit multipaths to set advMultipaths to multipaths_
   // and same with weighted nexthops
@@ -5162,7 +5684,8 @@ TEST_F(RibFixture, GetSelectionFilterCriteriaTest) {
   // Case:1 add rib entry entry0  :: single path atttr (attrs5).
   RibEntry entry0(kV4Prefix1);
   entry0.updatePath(eBgpPeer1_, attrs5, false);
-  entry0.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      entry0, multipathSelector, bestpathSelector, false, 0);
   rib_->ribEntries_.emplace(make_pair(kV4Prefix1, std::move(entry0)));
   auto prefix0 = std::make_unique<std::string>(
       folly::IPAddress::networkToString(kV4Prefix1));
@@ -5181,7 +5704,8 @@ TEST_F(RibFixture, GetSelectionFilterCriteriaTest) {
   RibEntry entry1(kV4Prefix2);
   entry1.updatePath(eBgpPeer1_, attrs1, false);
   entry1.updatePath(eBgpPeer2_, attrs2, false);
-  entry1.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      entry1, multipathSelector, bestpathSelector, false, 0);
   rib_->ribEntries_.emplace(make_pair(kV4Prefix2, std::move(entry1)));
   auto prefix1 = std::make_unique<std::string>(
       folly::IPAddress::networkToString(kV4Prefix2));
@@ -5226,7 +5750,8 @@ TEST_F(RibFixture, GetSelectionFilterCriteriaTest) {
   entry2.updatePath(eBgpPeer4_, attrs3, false);
   entry2.updatePath(eBgpPeer5_, attrs2, false);
 
-  entry2.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      entry2, multipathSelector, bestpathSelector, false, 0);
   rib_->ribEntries_.emplace(make_pair(kV4Prefix3, std::move(entry2)));
   auto prefix2 = std::make_unique<std::string>(
       folly::IPAddress::networkToString(kV4Prefix3));
@@ -5303,7 +5828,8 @@ TEST_F(RibFixture, GetSelectionFilterCriteriaTest) {
   entry3.updatePath(eBgpPeer1_, attrs1, false);
   entry3.updatePath(eBgpPeer6_, attrs1, false);
 
-  entry3.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      entry3, multipathSelector, bestpathSelector, false, 0);
   rib_->ribEntries_.emplace(make_pair(kV4Prefix4, std::move(entry3)));
   auto prefix3 = std::make_unique<std::string>(
       folly::IPAddress::networkToString(kV4Prefix4));
@@ -5586,7 +6112,8 @@ TEST_F(RibFixture, GetOriginatedRoutes) {
 
   folly::fibers::Baton syncBaton;
   // create a dummy task to make event loop not exit.
-  fm.addTask([&]() { syncBaton.wait(); });
+  fm.addTask(
+      [&]() { facebook::bgp::test::boundedBatonWait(syncBaton, "syncBaton"); });
 
   std::thread thd([&]() { rib.evb_.loop(); });
   auto routes = rib.getOriginatedRoutes();
@@ -6072,6 +6599,77 @@ TEST_F(RibNexthopTrackingFixture, RibInAnnouncementWithNexthopTracking) {
   // Reachable nexthop should not increment the unresolvable counter
   tcData->publishStats();
   EXPECT_EQ(0, tcData->getCounter(RibStats::kRibUnresolvableNexthopsCount));
+}
+
+/**
+ * Verify that nexthops learned from RIB-IN announcements are handed to the
+ * nexthop-subscribe requester exactly once each (de-duped), at the RIB-IN
+ * batch boundary. This is the RIB-side of the RIB-IN-driven FSDB tracking.
+ */
+TEST_F(
+    RibNexthopTrackingFixture,
+    RibInAnnouncementRequestsNexthopSubscription) {
+  /*
+   * All access to `requested` happens on the rib evb thread (the requester is
+   * invoked there, and we read it there too), so no lock is needed.
+   */
+  std::vector<folly::IPAddress> requested;
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    rib_->setNexthopSubscribeRequester(
+        [&requested](std::vector<folly::IPAddress> nexthops) {
+          requested.insert(requested.end(), nexthops.begin(), nexthops.end());
+        });
+  });
+
+  auto announce = [&](const std::string& cidr, const folly::IPAddress& nh) {
+    auto batch =
+        PrefixPathIds{{folly::IPAddress::createNetwork(cidr), kDefaultPathID}};
+    auto attrs = std::make_shared<facebook::bgp::BgpPath>(
+        *buildBgpPathFields(4, 4, 4, 4));
+    attrs->setNexthop(nh);
+    attrs->publish();
+    sendAnnouncement(batch, iBgpPeer_, attrs);
+    /*
+     * Draining the rib evb ensures processRibInAnnouncement (and its flush)
+     * has run before we inspect `requested`.
+     */
+    rib_->evb_.runInEventBaseThreadAndWait([]() {});
+  };
+  auto requestedCount = [&]() {
+    size_t n = 0;
+    rib_->evb_.runInEventBaseThreadAndWait([&]() { n = requested.size(); });
+    return n;
+  };
+  auto requestedAt = [&](size_t i) {
+    folly::IPAddress ip;
+    rib_->evb_.runInEventBaseThreadAndWait([&]() { ip = requested.at(i); });
+    return ip;
+  };
+
+  // First announcement: kPeerAddr1 is requested once.
+  announce("1::/64", kPeerAddr1);
+  ASSERT_EQ(requestedCount(), 1);
+  EXPECT_EQ(requestedAt(0), kPeerAddr1);
+
+  // Different prefix, same nexthop: de-duped, no new request.
+  announce("2::/64", kPeerAddr1);
+  EXPECT_EQ(requestedCount(), 1);
+
+  // New nexthop: requested.
+  announce("3::/64", kPeerAddr2);
+  ASSERT_EQ(requestedCount(), 2);
+  EXPECT_EQ(requestedAt(1), kPeerAddr2);
+
+  // Unspecified nexthop (e.g. locally-originated/aggregate routes) is skipped.
+  announce("4::/64", folly::IPAddress("::"));
+  EXPECT_EQ(requestedCount(), 2);
+
+  /*
+   * Drop the requester on the rib evb so the captured `requested` reference is
+   * not used after this stack frame returns.
+   */
+  rib_->evb_.runInEventBaseThreadAndWait(
+      [&]() { rib_->setNexthopSubscribeRequester(nullptr); });
 }
 
 /**

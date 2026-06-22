@@ -360,7 +360,7 @@ void MockRib::clearRouteAttributePolicy() {
 
 TResult MockRib::setPathSelectionPolicy(
     std::unique_ptr<TPathSelectionPolicy> policy) {
-  auto res = RibBase::setPathSelectionPolicy(std::move(policy));
+  auto res = RibDC::setPathSelectionPolicy(std::move(policy));
 
   std::map<std::string, int64_t> counters;
   fb303::ThreadCachedServiceData::get()->getCounters(counters);
@@ -375,7 +375,7 @@ TResult MockRib::setPathSelectionPolicy(
 }
 
 void MockRib::clearPathSelectionPolicy() {
-  RibBase::clearPathSelectionPolicy();
+  RibDC::clearPathSelectionPolicy();
 
   std::map<std::string, int64_t> counters;
   fb303::ThreadCachedServiceData::get()->getCounters(counters);
@@ -388,13 +388,15 @@ void MockRib::clearPathSelectionPolicy() {
   EXPECT_GE(counters.at(updateCounter), 0);
 }
 
-void MockRib::setRouteFilterPolicy(std::unique_ptr<TRouteFilterPolicy> policy) {
+void MockRib::setRouteFilterPolicy(
+    std::unique_ptr<TRouteFilterPolicy> policy,
+    bool forceUpdate) {
   if (policy->statements().value().find("failThriftProtection") !=
       policy->statements().value().end()) {
     XLOG(INFO, "failThriftProtection statement found, throwing");
     throw BgpError("failThriftProtection");
   }
-  RibBase::setRouteFilterPolicy(std::move(policy));
+  RibBase::setRouteFilterPolicy(std::move(policy), forceUpdate);
 
   std::map<std::string, int64_t> counters;
   fb303::ThreadCachedServiceData::get()->getCounters(counters);
@@ -441,7 +443,7 @@ bool MockRib::waitForPredicate(const std::function<bool(void)>& pred) {
 TPathSelectionPolicy MockRib::waitForPathSelectionPolicyUpdate() {
   EXPECT_TRUE(
       waitForPredicate([this]() { return pathSelectionPolicy_ != nullptr; }));
-  return RibBase::getPathSelectionPolicy();
+  return RibDC::getPathSelectionPolicy();
 }
 
 TRouteAttributePolicy MockRib::waitForRouteAttributePolicyUpdate() {
@@ -459,7 +461,7 @@ TRouteFilterPolicy MockRib::waitForRouteFilterPolicyUpdate() {
 TPathSelectionPolicy MockRib::waitForPathSelectionPolicyClear() {
   EXPECT_TRUE(
       waitForPredicate([this]() { return pathSelectionPolicy_ == nullptr; }));
-  return RibBase::getPathSelectionPolicy();
+  return RibDC::getPathSelectionPolicy();
 }
 
 TRouteAttributePolicy MockRib::waitForRouteAttributePolicyClear() {
@@ -521,9 +523,10 @@ bool MockRib::replacePathSelectionPolicy(
 }
 bool MockRib::replaceRouteFilterPolicy(
     std::unique_ptr<RouteFilterPolicy> newPolicy,
-    bool isBootstrap) {
-  auto ret =
-      RibBase::replaceRouteFilterPolicy(std::move(newPolicy), isBootstrap);
+    bool isBootstrap,
+    bool forceUpdate) {
+  auto ret = RibBase::replaceRouteFilterPolicy(
+      std::move(newPolicy), isBootstrap, forceUpdate);
   fulfillRibPolicyReplacePromise();
   return ret;
 }

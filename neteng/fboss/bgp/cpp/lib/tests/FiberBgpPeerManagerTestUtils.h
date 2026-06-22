@@ -222,7 +222,7 @@ class MockFiberBgpPeerManager : public TestFiberBgpPeerManager {
   MOCK_METHOD(
       std::unique_ptr<FiberServerSocket>,
       makeServerSocket,
-      (const folly::Optional<folly::SocketAddress>&),
+      (const std::optional<folly::SocketAddress>&),
       (override, const, noexcept));
 };
 

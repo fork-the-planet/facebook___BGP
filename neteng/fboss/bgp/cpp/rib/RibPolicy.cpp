@@ -122,7 +122,8 @@ bool PathSelector::operator==(const PathSelector& other) const {
   }
 
   return bgpNativeMinNexthop_ == other.bgpNativeMinNexthop_ &&
-      drainOnMinNexthopViolation_ == other.drainOnMinNexthopViolation_ &&
+      drainOnMinCapacityThresholdViolation_ ==
+      other.drainOnMinCapacityThresholdViolation_ &&
       bgpNativeMinAggLbwbps_ == other.bgpNativeMinAggLbwbps_ &&
       relaxBgpNativeMinAggLbwbps_ == other.relaxBgpNativeMinAggLbwbps_;
 }
@@ -139,9 +140,9 @@ TPathSelector PathSelector::toThrift() const {
         *bgpNativeMinNexthop_;
   }
 
-  if (drainOnMinNexthopViolation_) {
+  if (drainOnMinCapacityThresholdViolation_) {
     tPathSelector.drain_on_min_nexthop_violation() =
-        *drainOnMinNexthopViolation_;
+        *drainOnMinCapacityThresholdViolation_;
   }
 
   if (bgpNativeMinAggLbwbps_) {
@@ -171,6 +172,16 @@ PathSelector::overrideMultipathSelection(
     const std::vector<std::shared_ptr<RouteInfo>>& paths,
     const std::unique_ptr<RouteInfoSelector>& multipathSelector,
     PathSelectionPolicyResult& result) const {
+  /*
+   * `result` may be a cached struct reused across calls
+   * (PathSelectionPolicy::pathSelectionResults_). Reset the drain-transition
+   * flag up front so a previous-call value cannot leak into a code path that
+   * returns early without overwriting it.
+   */
+  result.drainOnMinCapacityThresholdViolation = false;
+  result.mnhThreshold = 0;
+  result.aggLbwBpsThreshold = 0;
+
   std::vector<std::shared_ptr<RouteInfo>> multipaths;
   for (const auto& criteria : centralizedCriteriaList_) {
     multipaths = criteria->tryOverrideMultipathSelection(paths);
@@ -207,12 +218,16 @@ PathSelector::overrideMultipathSelection(
           *bgpNativeMinNexthop_);
       result.outcome =
           PathSelectionPolicyResult::Outcome::BGP_FAILED_CPS_MIN_NEXTHOP;
-      if (drainOnMinNexthopViolation_.value_or(false)) {
-        XLOG(
+      if (drainOnMinCapacityThresholdViolation_.has_value() &&
+          *drainOnMinCapacityThresholdViolation_) {
+        result.drainOnMinCapacityThresholdViolation = true;
+        result.mnhThreshold = *bgpNativeMinNexthop_;
+        XLOGF(
             DBG2,
-            "drainOnMinNexthopViolation is set to true, "
-            "partial drain mode: bestpath retained, "
-            "drain community will be attached");
+            "Partial drain triggered on MNH violation (multipaths={}, mnh={}): "
+            "bestpath retained, drain community will be attached",
+            multipaths.size(),
+            *bgpNativeMinNexthop_);
         return multipaths;
       }
       return {};
@@ -241,6 +256,20 @@ PathSelector::overrideMultipathSelection(
           *bgpNativeMinAggLbwbps_);
       result.outcome =
           PathSelectionPolicyResult::Outcome::BGP_FAILED_CPS_MIN_AGG_LBW;
+      if (drainOnMinCapacityThresholdViolation_.has_value() &&
+          *drainOnMinCapacityThresholdViolation_) {
+        result.drainOnMinCapacityThresholdViolation = true;
+        result.aggLbwBpsThreshold = *bgpNativeMinAggLbwbps_;
+        XLOGF(
+            DBG2,
+            "Partial drain triggered on LBW violation "
+            "(multipaths={}, aggLbwbps={}, minAggLbwbps={}): "
+            "bestpath retained, drain community will be attached",
+            multipaths.size(),
+            aggLbwbps,
+            *bgpNativeMinAggLbwbps_);
+        return multipaths;
+      }
       if (relaxBgpNativeMinAggLbwbps_.value_or(false)) {
         XLOG(
             DBG2,
@@ -812,8 +841,16 @@ std::vector<TPathSelector> PathSelectionPolicy::getActivePathSelectionCriteria(
       if (stmt.getBgpNativeMinNexthop().has_value()) {
         tPathSelector.bgp_native_path_selection_min_nexthop() =
             *stmt.getBgpNativeMinNexthop();
-        tPathSelector.drain_on_min_nexthop_violation() =
-            stmt.getDrainOnMinNexthopViolation().value_or(false);
+      }
+      /*
+       * The drain flag now covers both the MNH and aggregate-LBW thresholds,
+       * so it must be emitted independently of which threshold is configured.
+       * Otherwise a statement with only bgp_min_aggregate_lbw_bps would lose
+       * the flag on round-trip. Mirrors PathSelector::toThrift().
+       */
+      const auto& drain = stmt.getDrainOnMinCapacityThresholdViolation();
+      if (drain.has_value()) {
+        tPathSelector.drain_on_min_nexthop_violation() = *drain;
       }
       if (stmt.getBgpNativeMinAggLbwbps().has_value()) {
         tPathSelector.bgp_min_aggregate_lbw_bps() =

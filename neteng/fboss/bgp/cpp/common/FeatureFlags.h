@@ -58,6 +58,34 @@ struct BgpBestpathFeatures {
    */
   bool enableNextHopTracking = false;
   /*
+   * When next-hop tracking is enabled, derive the IGP cost from the Open/R
+   * client's nexthops (ClientID::OPENR) instead of from the resolved fwd
+   * nexthops. The cost is the minimum over that client's nexthops; the
+   * resolved fwd nexthops are not consulted (no intersection between the
+   * Open/R and fwd nexthops). If unset, the legacy behavior (min cost over
+   * the resolved fwd nexthops) is used. In either case, if no relevant
+   * nexthop carries a cost, the IGP cost is taken as unset (the nexthop stays
+   * reachable/eligible, just without an IGP-cost preference).
+   *
+   * LIMITED-USE-CASE FLAG -- READ BEFORE EXTENDING.
+   * This flag is intentionally narrow. It exists only to satisfy the single,
+   * concrete use-case understood today: FBOSS deployments that run exactly
+   * one IGP (Open/R) and want BGP++ nexthop-tracking IGP cost to come from
+   * that IGP's routes rather than from the resolved fwd nexthops. It is a
+   * single hard-coded protocol (Open/R) toggle, NOT a general mechanism for
+   * selecting an IGP cost source.
+   *
+   * It deliberately does NOT model multiple IGPs/protocols, a protocol
+   * selection policy, or awareness of which protocol contributed the
+   * best-path. If/when there is a real need to scale this properly --
+   * multiple protocols, an explicit selection policy, and the best-path
+   * selected protocol in context -- a proper, well-specified solution should
+   * be designed at that point with clear use-cases, and THIS limited flag
+   * should be deprecated and removed in favor of it. Do not grow this boolean
+   * into that general mechanism.
+   */
+  bool nextHopTrackingUseOpenrIgpCost = false;
+  /*
    * Enable eiBGP feature in best path selection -- skip EXTERNAL_ROUTE
    * preference filter
    */

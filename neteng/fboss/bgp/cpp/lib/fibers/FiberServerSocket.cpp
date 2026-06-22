@@ -51,7 +51,7 @@ class AcceptCallback : public folly::AsyncServerSocket::AcceptCallback {
   const std::shared_ptr<folly::AsyncServerSocket> socket_;
 
   // the promise to pass data from the callback
-  folly::Optional<Promise<AcceptResult>> promise_;
+  std::optional<Promise<AcceptResult>> promise_;
 
   // Indicate connectionAcceped() or acceptError() has not completed yet.
   // Used by acceptStopped() to determine to throw an exception or not.
@@ -120,7 +120,7 @@ namespace nettools {
 namespace bgplib {
 
 FiberServerSocket::FiberServerSocket(
-    folly::Optional<folly::SocketAddress> addr,
+    std::optional<folly::SocketAddress> addr,
     uint32_t listenQueueDepth) {
   CHECK(folly::fibers::onFiber())
       << "Attempt to create FiberServerSocket not on fiber!";

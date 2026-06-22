@@ -16,8 +16,8 @@
 
 #pragma once
 
+#include <optional>
 #include <unordered_set>
-
 #include "BgpAttributesWrapper.h"
 
 namespace facebook {
@@ -50,9 +50,9 @@ class BgpAttributesSmartSet {
 
   /**
    * Given a BgpAttributes, get the corresponding BgpAttributesWrapper in the
-   * set, returns folly::none if no such entry.
+   * set, returns std::nullopt if no such entry.
    */
-  folly::Optional<BgpAttributesWrapper> getEntry(
+  std::optional<BgpAttributesWrapper> getEntry(
       const bgplib::BgpAttributes& attrRef);
 
   /**

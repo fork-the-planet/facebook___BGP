@@ -35,7 +35,8 @@
       UpdateGroupPeerJoinTest, CollapseLiteFailsWhenPostDetachEntryNotCloned); \
   FRIEND_TEST(UpdateGroupPeerJoinTest, CollapsePathMixedSharedAndCloned);      \
   FRIEND_TEST(                                                                 \
-      UpdateGroupPeerJoinTest, CollapsePathFailsWhenPostDetachEntryNotCloned);
+      UpdateGroupPeerJoinTest, CollapsePathFailsWhenPostDetachEntryNotCloned); \
+  FRIEND_TEST(UpdateGroupPeerJoinTest, DiscrepancyUpdatesDetachedRibVersion);
 
 #define AdjRibOutGroup_TEST_FRIENDS                                            \
   friend class UpdateGroupPeerJoinTest;                                        \
@@ -55,7 +56,8 @@
       UpdateGroupPeerJoinTest, CollapseLiteFailsWhenPostDetachEntryNotCloned); \
   FRIEND_TEST(UpdateGroupPeerJoinTest, CollapsePathMixedSharedAndCloned);      \
   FRIEND_TEST(                                                                 \
-      UpdateGroupPeerJoinTest, CollapsePathFailsWhenPostDetachEntryNotCloned);
+      UpdateGroupPeerJoinTest, CollapsePathFailsWhenPostDetachEntryNotCloned); \
+  FRIEND_TEST(UpdateGroupPeerJoinTest, DiscrepancyUpdatesDetachedRibVersion);
 
 #include <folly/io/async/EventBase.h>
 
@@ -866,6 +868,37 @@ TEST_F(UpdateGroupPeerJoinTest, CollapsePathFailsWhenPostDetachEntryNotCloned) {
   // PL has 1 announcement for the post-detach prefix
   EXPECT_EQ(countPlPrefixes(adjRib), 1);
   EXPECT_TRUE(plContains(adjRib, kV4Prefix2, pathId, attrs));
+}
+
+/*
+ * When tryAcceptPeersToGroup finds discrepancies, the peer is sent back to
+ * DETACHED_RUNNING. Its detachedRibVersion must be updated to the group's
+ * lastSeenRibVersion so the next collapse only flags entries newer than
+ * this point — preventing an infinite discrepancy-resolution loop.
+ */
+TEST_F(UpdateGroupPeerJoinTest, DiscrepancyUpdatesDetachedRibVersion) {
+  auto adjRib = createAndRegisterPeer(0);
+  auto groupOwnerKey = group_->getGroupOwnerKey();
+  auto attrs = makeAttrs(1, 1);
+
+  group_->setLastSeenRibVersion(50);
+
+  auto* entry = group_->addToLiteTree(
+      group_->LiteTree_, kV4Prefix1, groupOwnerKey, kPlaceholderPathID);
+  entry->setPostAttr(attrs);
+  entry->setRibVersion(30);
+
+  adjRib->setDetachedRibVersion(10);
+  adjRib->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+  group_->markPeerDetached(adjRib);
+
+  ASSERT_EQ(adjRib->getDetachedRibVersion(), 10);
+
+  auto accepted = group_->tryAcceptPeersToGroup({adjRib});
+
+  EXPECT_TRUE(accepted.empty());
+  EXPECT_EQ(adjRib->getPeerState(), PeerUpdateState::DETACHED_RUNNING);
+  EXPECT_EQ(adjRib->getDetachedRibVersion(), 50);
 }
 
 } // namespace facebook::bgp

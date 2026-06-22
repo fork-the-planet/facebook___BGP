@@ -508,7 +508,7 @@ void FiberBgpPeer::run() noexcept {
       {getRemoteBgpPeerId(),
        peeringState_.state,
        0,
-       folly::none,
+       std::nullopt,
        nullptr,
        peeringState_.peerDelete});
 
@@ -544,7 +544,7 @@ void FiberBgpPeer::run() noexcept {
 }
 
 void FiberBgpPeer::stop(
-    const folly::Optional<BgpNotifCeaseErrSubCode>& ceaseErrSubCode,
+    const std::optional<BgpNotifCeaseErrSubCode>& ceaseErrSubCode,
     const bool gracefulRestart,
     const bool peerDelete) noexcept {
   if (ceaseErrSubCode) {

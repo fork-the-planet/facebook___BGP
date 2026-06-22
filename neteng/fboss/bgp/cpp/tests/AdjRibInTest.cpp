@@ -172,6 +172,7 @@
 #include "neteng/fboss/bgp/cpp/policy/PolicyManager.h"
 #include "neteng/fboss/bgp/cpp/stats/Stats.h"
 #include "neteng/fboss/bgp/cpp/tests/AdjRibInUtils.h"
+#include "neteng/fboss/bgp/cpp/tests/BoundedWaitUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/MockScubaData.h"
 #include "neteng/fboss/bgp/cpp/tests/RibPolicyUtils.h"
 
@@ -206,7 +207,7 @@ TEST_F(AdjRibInboundFixture, V4UpdateProcessingSingle) {
 
   fm_->addTask([&] {
     // Verify rib In message
-    auto msg = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
     auto announcement = std::get<RibInAnnouncement>(msg);
     EXPECT_EQ(kPeerAddr1, announcement.peer.addr);
@@ -265,7 +266,7 @@ TEST_F(AdjRibInboundFixture, RedistributePeerUpdate) {
       adjRibInQ_->fiberPush(std::move(update));
 
       // Verify rib In message
-      auto msg = folly::coro::blockingWait(ribInQ_.pop());
+      auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
       auto announcement = std::get<RibInAnnouncement>(msg);
       EXPECT_EQ(kPeerAddr1, announcement.peer.addr);
@@ -277,7 +278,7 @@ TEST_F(AdjRibInboundFixture, RedistributePeerUpdate) {
       adjRibInQ_->fiberPush(std::move(update));
 
       // Verify rib In message
-      auto msg = folly::coro::blockingWait(ribInQ_.pop());
+      auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(msg));
       auto withdrawal = std::get<RibInWithdrawal>(msg);
       EXPECT_EQ(kPeerAddr1, withdrawal.peer.addr);
@@ -330,7 +331,7 @@ TEST_F(AdjRibInboundFixture, LastUpdateRcvdTime) {
 
     {
       // Verify RibInUpdate for kV4Prefix1
-      auto msg = folly::coro::blockingWait(ribInQ_.pop());
+      auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       auto announcement = std::get<RibInAnnouncement>(msg);
       EXPECT_EQ(1, announcement.pfxPathIds.size());
       auto prefix = std::get<0>(announcement.pfxPathIds[0]);
@@ -340,7 +341,7 @@ TEST_F(AdjRibInboundFixture, LastUpdateRcvdTime) {
     }
     {
       // Verify the first RibInUpdate for kV4Prefix2
-      auto msg = folly::coro::blockingWait(ribInQ_.pop());
+      auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       auto announcement = std::get<RibInAnnouncement>(msg);
       EXPECT_EQ(1, announcement.pfxPathIds.size());
       auto prefix = std::get<0>(announcement.pfxPathIds[0]);
@@ -348,7 +349,7 @@ TEST_F(AdjRibInboundFixture, LastUpdateRcvdTime) {
     }
     {
       // Verify the second RibInUpdate for kV4Prefix2
-      auto msg = folly::coro::blockingWait(ribInQ_.pop());
+      auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       auto announcement = std::get<RibInAnnouncement>(msg);
       EXPECT_EQ(1, announcement.pfxPathIds.size());
       auto prefix = std::get<0>(announcement.pfxPathIds[0]);
@@ -386,7 +387,7 @@ TEST_F(AdjRibInboundFixture, V4UpdateProcessingMultiple) {
 
   fm_->addTask([&] {
     // Verify rib In message
-    auto msg = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
     auto announcement = std::get<RibInAnnouncement>(msg);
     EXPECT_EQ(kPeerAddr1, announcement.peer.addr);
@@ -461,14 +462,14 @@ TEST_F(AdjRibInboundFixture, V4UpdateProcessingMultipleInMultipleMsgs) {
 
   fm_->addTask([&] {
     // Verify rib In message
-    auto msg1 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg1 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg1));
     auto announcement1 = std::get<RibInAnnouncement>(msg1);
     EXPECT_EQ(kPeerAddr1, announcement1.peer.addr);
     EXPECT_EQ(pfxPathIds1, announcement1.pfxPathIds);
     EXPECT_EQ(kV4Nexthop1, announcement1.attrs->getNexthop());
 
-    auto msg2 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg2 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg2));
     auto announcement2 = std::get<RibInAnnouncement>(msg2);
     EXPECT_EQ(kPeerAddr1, announcement2.peer.addr);
@@ -614,7 +615,7 @@ TEST_F(AdjRibInboundFixture, V4UpdateProcessingMultipleWithAddPath) {
     // kV4Nexthop1 and path id 1
     // here we verify adjrib send ribannouncement for these two prefix with
     // kV4Nexthop1
-    auto msg = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
     auto announcement = std::get<RibInAnnouncement>(msg);
     EXPECT_EQ(kPeerAddr1, announcement.peer.addr);
@@ -644,7 +645,7 @@ TEST_F(AdjRibInboundFixture, V4UpdateProcessingMultipleWithAddPath) {
     // kV4Nexthop2
     bt2.post();
     // Verify rib In message
-    auto msg2 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg2 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg2));
     auto announcement2 = std::get<RibInAnnouncement>(msg2);
     EXPECT_EQ(kPeerAddr1, announcement2.peer.addr);
@@ -676,7 +677,7 @@ TEST_F(AdjRibInboundFixture, V4UpdateProcessingMultipleWithAddPath) {
     // with kV4Nexthop3.
     bt3.post();
     // Verify rib In message
-    auto msg3 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg3 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg3));
     auto announcement3 = std::get<RibInAnnouncement>(msg3);
     EXPECT_EQ(kPeerAddr1, announcement3.peer.addr);
@@ -706,7 +707,7 @@ TEST_F(AdjRibInboundFixture, V4UpdateProcessingMultipleWithAddPath) {
     // kV4Nexthop1 and path id 3
     // here we verify adjrib send ribannouncement for these two prefix with
     // kV4Nexthop1
-    auto msg4 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg4 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     auto announcement4 = std::get<RibInAnnouncement>(msg4);
     EXPECT_EQ(kPeerAddr1, announcement4.peer.addr);
     EXPECT_EQ(prefixSetAdjOutPathIds3, announcement4.pfxPathIds);
@@ -733,7 +734,7 @@ TEST_F(AdjRibInboundFixture, V4UpdateProcessingMultipleWithAddPath) {
     // peer withdraws path 2 for kV4Prefix1.
     // adjrib will send Ribwithdraw msg for  kV4Prefix1 with kV4Nexthop2
     bt5.post();
-    auto msg5 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg5 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     auto withdrawal = std::get<RibInWithdrawal>(msg5);
     EXPECT_EQ(kPeerAddr1, withdrawal.peer.addr);
     auto prefixSetAdjOutWithdrawal = PrefixPathIds{{kV4Prefix1, 2}};
@@ -761,7 +762,7 @@ TEST_F(AdjRibInboundFixture, V4UpdateProcessingMultipleWithAddPath) {
     // peer withdraws path 1 for kV4Prefix1.
     // adjrib will send Ribwithdraw msg for  kV4Prefix1 with kV4Nexthop3
     bt6.post();
-    auto msg6 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg6 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     auto withdrawal2 = std::get<RibInWithdrawal>(msg6);
     EXPECT_EQ(kPeerAddr1, withdrawal2.peer.addr);
     auto prefixSetAdjOutWithdrawal2 = PrefixPathIds{{kV4Prefix1, 1}};
@@ -789,7 +790,7 @@ TEST_F(AdjRibInboundFixture, V4UpdateProcessingMultipleWithAddPath) {
     // peer withdraws path 3 for kV4Prefix1.
     // adjrib will send Ribwithdraw msg for  kV4Prefix1 with kV4Nexthop1
     bt7.post();
-    auto msg7 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg7 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     auto withdrawal3 = std::get<RibInWithdrawal>(msg7);
     EXPECT_EQ(kPeerAddr1, withdrawal3.peer.addr);
     auto prefixSetAdjOutWithdrawal3 = PrefixPathIds{{kV4Prefix1, 3}};
@@ -834,7 +835,7 @@ TEST_F(AdjRibInboundFixture, V6UpdateProcessingMultiple) {
   });
 
   fm_->addTask([&] {
-    auto msg = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
     auto announcement = std::get<RibInAnnouncement>(msg);
     EXPECT_EQ(kPeerAddr1, announcement.peer.addr);
@@ -949,7 +950,7 @@ TEST_F(AdjRibInboundFixture, V6UpdateProcessingMultipleWithAddPath) {
     // kV6Nexthop1 and path id 1
     // here we verify adjrib send ribannouncement for these two prefix with
     // kV6Nexthop1
-    auto msg = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     auto announcement = std::get<RibInAnnouncement>(msg);
     EXPECT_EQ(kPeerAddr1, announcement.peer.addr);
     EXPECT_EQ(prefixBatchPathIds1, announcement.pfxPathIds);
@@ -977,7 +978,7 @@ TEST_F(AdjRibInboundFixture, V6UpdateProcessingMultipleWithAddPath) {
     // here we verify adjrib send ribannouncement for these two prefix with
     // kV6Nexthop2
     bt2.post();
-    auto msg2 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg2 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     auto announcement2 = std::get<RibInAnnouncement>(msg2);
     EXPECT_EQ(kPeerAddr1, announcement2.peer.addr);
     EXPECT_EQ(prefixBatchPathIds2, announcement2.pfxPathIds);
@@ -1007,7 +1008,7 @@ TEST_F(AdjRibInboundFixture, V6UpdateProcessingMultipleWithAddPath) {
     // here we verify adjrib send ribannouncement for updating these two prefix
     // with kV6Nexthop3.
     bt3.post();
-    auto msg3 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg3 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     auto announcement3 = std::get<RibInAnnouncement>(msg3);
     EXPECT_EQ(kPeerAddr1, announcement3.peer.addr);
     EXPECT_EQ(prefixBatchPathIds1, announcement3.pfxPathIds);
@@ -1031,7 +1032,7 @@ TEST_F(AdjRibInboundFixture, V6UpdateProcessingMultipleWithAddPath) {
     // kV6Nexthop1 and path id 3
     // here we verify adjrib send ribannouncement for these two prefix with
     // kV6Nexthop1
-    auto msg4 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg4 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     auto announcement4 = std::get<RibInAnnouncement>(msg4);
     EXPECT_EQ(kPeerAddr1, announcement4.peer.addr);
     EXPECT_EQ(prefixBatchPathIds3, announcement4.pfxPathIds);
@@ -1058,7 +1059,7 @@ TEST_F(AdjRibInboundFixture, V6UpdateProcessingMultipleWithAddPath) {
     // peer withdraws path 2 for kV6Prefix1.
     // adjrib will send Ribwithdraw msg for  kV6Prefix with kV6Nexthop2
     bt5.post();
-    auto msg5 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg5 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     auto withdrawal = std::get<RibInWithdrawal>(msg5);
     EXPECT_EQ(kPeerAddr1, withdrawal.peer.addr);
     auto prefixSetAdjOutWithdrawal = PrefixPathIds{{kV6Prefix1, 2}};
@@ -1074,7 +1075,7 @@ TEST_F(AdjRibInboundFixture, V6UpdateProcessingMultipleWithAddPath) {
     // peer withdraws path 1 for kV6Prefix1.
     // adjrib will send Ribwithdraw msg for  kV6Prefix with kV6Nexthop3
     bt6.post();
-    auto msg6 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg6 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     auto withdrawal2 = std::get<RibInWithdrawal>(msg6);
     EXPECT_EQ(kPeerAddr1, withdrawal2.peer.addr);
     auto prefixSetAdjOutWithdrawal2 = PrefixPathIds{{kV6Prefix1, 1}};
@@ -1102,7 +1103,7 @@ TEST_F(AdjRibInboundFixture, V6UpdateProcessingMultipleWithAddPath) {
     // peer withdraws path 1 for kV6Prefix1.
     // adjrib will send Ribwithdraw msg for  kV6Prefix with kV6Nexthop1
     bt7.post();
-    auto msg7 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg7 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     auto withdrawal3 = std::get<RibInWithdrawal>(msg7);
     EXPECT_EQ(kPeerAddr1, withdrawal3.peer.addr);
     auto prefixSetAdjOutWithdrawal3 = PrefixPathIds{{kV6Prefix1, 3}};
@@ -1150,9 +1151,10 @@ TEST_F(AdjRibInboundFixture, V4AnnounceAndWithdraw) {
   });
 
   fm_->addTask([&] {
-    auto msg1 =
-        folly::coro::blockingWait(ribInQ_.pop()); // add route1 and route2
-    auto msg2 = folly::coro::blockingWait(ribInQ_.pop()); // withdraw
+    auto msg1 = facebook::bgp::test::boundedBlockingPop(
+        ribInQ_, "ribInQ_"); // add route1 and route2
+    auto msg2 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_"); // withdraw
 
     // Verify withdrawal message
     ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(msg2));
@@ -1224,7 +1226,7 @@ TEST_F(AdjRibInboundFixture, ConsecutiveV4Withdraw) {
       adjRibInQ_->fiberPush(std::move(update1));
 
       // Ensure we add announcement before marking stale
-      folly::coro::blockingWait(ribInQ_.pop());
+      facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
 
       EXPECT_NE(
           0,
@@ -1252,7 +1254,8 @@ TEST_F(AdjRibInboundFixture, ConsecutiveV4Withdraw) {
       adjRibInQ_->fiberPush(std::move(withdraw2));
 
       // Ensure we check stats AFTER finish processing
-      auto msg1 = folly::coro::blockingWait(ribInQ_.pop()); // withdraw
+      auto msg1 = facebook::bgp::test::boundedBlockingPop(
+          ribInQ_, "ribInQ_"); // withdraw
 
       // Verify AdjRibStaleTree size. One stale entry (for the prefix with two
       // duplicate withdraws) was moved while the other stale entry was not
@@ -1340,7 +1343,7 @@ TEST_F(AdjRibInboundFixture, ReceivedPathIdReachesRib) {
 
     // Verify rib In messages
     PrefixPathIds announcePrefixSet{{kV4Prefix1, expectedPathId}};
-    auto msg = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
     auto announcement = std::get<RibInAnnouncement>(msg);
     EXPECT_EQ(kPeerAddr1, announcement.peer.addr);
@@ -1351,7 +1354,7 @@ TEST_F(AdjRibInboundFixture, ReceivedPathIdReachesRib) {
     adjRibInQ_->fiberPush(std::move(update2));
 
     PrefixPathIds withdrawPrefixSet{{kV4Prefix1, expectedPathId}};
-    auto msg2 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg2 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(msg2));
     auto withdrawal = std::get<RibInWithdrawal>(msg2);
     EXPECT_EQ(kPeerAddr1, withdrawal.peer.addr);
@@ -1371,7 +1374,7 @@ TEST_F(AdjRibInboundFixture, ReceivedPathIdReachesRib) {
 
     // Verify rib In messages
     PrefixPathIds announce2PrefixSet{{kV4Prefix1, expectedPathId}};
-    auto msg3 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg3 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg3));
     auto announcement2 = std::get<RibInAnnouncement>(msg3);
     EXPECT_EQ(kPeerAddr1, announcement2.peer.addr);
@@ -1382,7 +1385,7 @@ TEST_F(AdjRibInboundFixture, ReceivedPathIdReachesRib) {
     adjRibInQ_->fiberPush(std::move(update4));
 
     PrefixPathIds withdraw2PrefixSet{{kV4Prefix1, expectedPathId}};
-    auto msg4 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg4 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(msg4));
     auto withdrawal2 = std::get<RibInWithdrawal>(msg4);
     EXPECT_EQ(kPeerAddr1, withdrawal2.peer.addr);
@@ -2215,7 +2218,8 @@ TEST_F(AdjRibInboundFixture, RejectConfedAsPathFromNonConfedPeerWithEBGP) {
     fiberSleepFor(50ms);
     // expect to see 2 notification
     EXPECT_EQ(adjRibOutQ_->size(), 2);
-    auto result = folly::coro::blockingWait(adjRibOutQ_->pop());
+    auto result =
+        facebook::bgp::test::boundedBlockingPop(*adjRibOutQ_, "adjRibOutQ_");
     auto ret = folly::variant_match(
         *result,
         [&](BgpNotification notification) {
@@ -2295,11 +2299,13 @@ TEST_F(AdjRibInboundFixture, CheckConfedAsPathFromConfedEbgpPeer) {
         [](const BgpEndOfRib&) { return false; });
     // make sure both notifications are update error notification
     {
-      auto result = folly::coro::blockingWait(adjRibOutQ_->pop());
+      auto result =
+          facebook::bgp::test::boundedBlockingPop(*adjRibOutQ_, "adjRibOutQ_");
       EXPECT_TRUE(std::visit(isUpdateErrNotification, *result));
     }
     {
-      auto result = folly::coro::blockingWait(adjRibOutQ_->pop());
+      auto result =
+          facebook::bgp::test::boundedBlockingPop(*adjRibOutQ_, "adjRibOutQ_");
       EXPECT_TRUE(std::visit(isUpdateErrNotification, *result));
     }
     terminateAdjRib();
@@ -2544,7 +2550,7 @@ TEST_F(AdjRibInboundFixture, SessionGoingDown) {
 
   fm_->addTask([&] {
     // RibInAnnouncement route messages
-    auto msg1 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg1 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
 
     for (auto& prefix : prefixSet) {
       // Verify multiple RIB entries are created.
@@ -2567,7 +2573,7 @@ TEST_F(AdjRibInboundFixture, SessionGoingDown) {
         adjRib_->getRibTreeSize(/*ingress=*/true, /*isAddPathEnabled=*/true));
 
     // RibInWithdrawal message
-    auto msg2 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg2 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     auto withdraw = std::get<RibInWithdrawal>(msg2);
     EXPECT_EQ(withDrawalPrefixSet, withdraw.pfxPathIds);
     for (auto& prefix : prefixSet) {
@@ -2608,7 +2614,7 @@ TEST_F(AdjRibInboundFixture, VerifyCounterWithSessionFlap) {
   fm_->addTask([&] {
     auto lambdaVerifyCounts = [&](int size) {
       // wait till RibInAnnouncement route message is sent
-      folly::coro::blockingWait(ribInQ_.pop());
+      facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       // Verify AdjRibLiteTree size zero
       EXPECT_EQ(
           size,
@@ -2625,7 +2631,7 @@ TEST_F(AdjRibInboundFixture, VerifyCounterWithSessionFlap) {
       terminateAdjRib();
 
       // wait till RibInWithdrawal message is sent
-      folly::coro::blockingWait(ribInQ_.pop());
+      facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       // Verify AdjRibStaleTree size is zero since we are not in GR
       EXPECT_EQ(0, adjRib_->getRibInStaleTreeSize());
       // Verify AdjRibLiteTree size zero
@@ -2695,13 +2701,13 @@ TEST_F(AdjRibInboundFixture, VerifyStalePathTimerWithSessionFlap) {
   fm_->addTask([&] {
     auto update = createV6BgpUpdateMultipleAnnounce(prefixSet1);
     adjRibInQ_->fiberPush(std::move(update));
-    syncBaton[0].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[0], "syncBaton[0]");
     update = createV6BgpUpdateMultipleAnnounce(prefixSet2);
     adjRibInQ_->fiberPush(std::move(update));
-    syncBaton[1].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[1], "syncBaton[1]");
     update = createV4BgpUpdateMultipleAnnounce(prefixSet3);
     adjRibInQ_->fiberPush(std::move(update));
-    syncBaton[2].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[2], "syncBaton[2]");
     update = createV4BgpUpdateMultipleAnnounce(prefixSet3);
     adjRibInQ_->fiberPush(std::move(update));
   });
@@ -2709,7 +2715,7 @@ TEST_F(AdjRibInboundFixture, VerifyStalePathTimerWithSessionFlap) {
   fm_->addTask([&] {
     {
       // wait till RibInAnnouncement route message is sent
-      folly::coro::blockingWait(ribInQ_.pop());
+      facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       EXPECT_EQ(prefixSet1.size(), adjRib_->getStats().getPreInPrefixCount());
       EXPECT_EQ(prefixSet1.size(), adjRib_->getStats().getPostInPrefixCount());
       EXPECT_EQ(1, adjRib_->getStats().getRecvUpdateMsgs());
@@ -2751,7 +2757,7 @@ TEST_F(AdjRibInboundFixture, VerifyStalePathTimerWithSessionFlap) {
       adjRibInQ_->open();
       reEstablishSession(kLongGrRestartTime);
       // wait till RibInAnnouncement route message is sent
-      folly::coro::blockingWait(ribInQ_.pop());
+      facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       EXPECT_EQ(prefixSet2.size(), adjRib_->getStats().getPreInPrefixCount());
       EXPECT_EQ(prefixSet2.size(), adjRib_->getStats().getPostInPrefixCount());
       EXPECT_EQ(1, adjRib_->getStats().getRecvUpdateMsgs());
@@ -2791,7 +2797,7 @@ TEST_F(AdjRibInboundFixture, VerifyStalePathTimerWithSessionFlap) {
       adjRibInQ_->open();
       reEstablishSession(std::chrono::seconds(1));
       // wait till RibInAnnouncement route message is sent
-      folly::coro::blockingWait(ribInQ_.pop());
+      facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       EXPECT_EQ(
           prefixSet2.size() + prefixSet3.size(),
           adjRib_->getStats().getPreInPrefixCount());
@@ -2911,9 +2917,9 @@ TEST_F(AdjRibInboundFixture, VerifyWithdrawalBeforeStalePathExpiry) {
       // sessionEstablished already called inside setup method.
       // Trigger sending of Update message from fiber-bgp-peer.
       sendFirstUpdate.post();
-      folly::coro::blockingWait(fromAdjRibQ_.pop());
+      facebook::bgp::test::boundedBlockingPop(fromAdjRibQ_, "fromAdjRibQ_");
       // wait till RibInAnnouncement route message is sent
-      folly::coro::blockingWait(ribInQ_.pop());
+      facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
 
       // Verify AdjRibStaleTree size is zero since no GR yet
       EXPECT_EQ(0, adjRib_->getRibInStaleTreeSize());
@@ -2981,7 +2987,7 @@ TEST_F(AdjRibInboundFixture, VerifyWithdrawalBeforeStalePathExpiry) {
       // Send update for only kV4Prefix2 and withdrawal for p1
       sendWithdrawAndUpdate.post();
       // Wait till withdrawal is processed and announced to RIB
-      folly::coro::blockingWait(ribInQ_.pop());
+      facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       EXPECT_EQ(nullptr, adjRib_->getRibEntry(/*ingress=*/true, kV4Prefix1));
       EXPECT_NE(nullptr, adjRib_->getRibEntry(/*ingress=*/true, kV4Prefix2));
 
@@ -3006,7 +3012,7 @@ TEST_F(AdjRibInboundFixture, VerifyWithdrawalBeforeStalePathExpiry) {
       // Send EOR (This will trigger clean up of stale routes)
       sendEor.post();
       // wait till EoR Ack goes to peer-mgr
-      folly::coro::blockingWait(fromAdjRibQ_.pop());
+      facebook::bgp::test::boundedBlockingPop(fromAdjRibQ_, "fromAdjRibQ_");
 
       EXPECT_EQ(nullptr, adjRib_->getRibEntry(/*ingress=*/true, kV4Prefix1));
       EXPECT_NE(nullptr, adjRib_->getRibEntry(/*ingress=*/true, kV4Prefix2));
@@ -3065,7 +3071,7 @@ TEST_F(AdjRibInboundFixture, VerifyWithdrawalBeforeStalePathExpiryAddPath) {
   fm_->addTask([&] {
     // (3) wait until withdrawal is processed and announced to Rib. Verify
     // adjRibIn and adjRibInStale empty
-    folly::coro::blockingWait(ribInQ_.pop());
+    facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     EXPECT_EQ(adjRib_->adjRibInStale_.size(), 0);
     EXPECT_EQ(adjRib_->adjRibInPathTree_.size(), 0);
 
@@ -3105,9 +3111,9 @@ TEST_F(AdjRibInboundFixture, VerifyStalePathCleanupWithEoR) {
       // sessionEstablished already called inside setup method.
       // Trigger sending of Update message from fiber-bgp-peer.
       sendFirstUpdate.post();
-      folly::coro::blockingWait(fromAdjRibQ_.pop());
+      facebook::bgp::test::boundedBlockingPop(fromAdjRibQ_, "fromAdjRibQ_");
       // wait till RibInAnnouncement route message is sent
-      folly::coro::blockingWait(ribInQ_.pop());
+      facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       EXPECT_EQ(prefixSet1.size(), adjRib_->getStats().getPreInPrefixCount());
       EXPECT_EQ(prefixSet1.size(), adjRib_->getStats().getPostInPrefixCount());
       // wait for sometime
@@ -3136,7 +3142,7 @@ TEST_F(AdjRibInboundFixture, VerifyStalePathCleanupWithEoR) {
       // Send update for only kV6Prefix1 and then send the EoRs
       sendSecondUpdate.post();
       // wait till EoR Ack goes to peer-mgr
-      folly::coro::blockingWait(fromAdjRibQ_.pop());
+      facebook::bgp::test::boundedBlockingPop(fromAdjRibQ_, "fromAdjRibQ_");
 
       // Check that kV6Prefix2 (stale route) is removed
       EXPECT_NE(nullptr, adjRib_->getRibEntry(/*ingress=*/true, kV6Prefix1));
@@ -3164,10 +3170,10 @@ TEST_F(AdjRibInboundFixture, VerifyGRRestartStalePathRestore) {
   std::array<folly::fibers::Baton, 2> syncBaton;
 
   fm_->addTask([&] {
-    syncBaton[0].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[0], "syncBaton[0]");
     auto update = createV6BgpUpdateMultipleAnnounce(prefixSet1);
     adjRibInQ_->fiberPush(std::move(update));
-    syncBaton[1].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[1], "syncBaton[1]");
     update = createV6BgpUpdateMultipleAnnounce(prefixSet1);
     // update nexthop and attributes
     *update->mpAnnounced()->nexthop() = toBinaryAddress(kV6Nexthop2);
@@ -3183,7 +3189,7 @@ TEST_F(AdjRibInboundFixture, VerifyGRRestartStalePathRestore) {
     {
       syncBaton[0].post();
       // wait till RibInAnnouncement route message is sent
-      folly::coro::blockingWait(ribInQ_.pop());
+      facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       EXPECT_EQ(prefixSet1.size(), adjRib_->getStats().getPreInPrefixCount());
       // Terminate the session
       terminateAdjRib(true);
@@ -3239,7 +3245,7 @@ TEST_F(AdjRibInboundFixture, VerifyGRRestartStalePathRestoreAddPath) {
   std::array<folly::fibers::Baton, 4> syncBaton; // Added one more baton
 
   fm_->addTask([&] {
-    syncBaton[0].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[0], "syncBaton[0]");
     adjRib_->recAddPath_ = true;
     auto update = createV6BgpUpdateMultipleAnnounce(prefixSet1);
     for (auto& rigPrefix : *update->mpAnnounced()->prefixes()) {
@@ -3253,14 +3259,14 @@ TEST_F(AdjRibInboundFixture, VerifyGRRestartStalePathRestoreAddPath) {
     }
     adjRibInQ_->fiberPush(std::move(update));
 
-    syncBaton[1].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[1], "syncBaton[1]");
     update = createV6BgpUpdateMultipleAnnounce(prefixSet1);
     for (auto& rigPrefix : *update->mpAnnounced()->prefixes()) {
       rigPrefix.pathId() = 2;
     }
     adjRibInQ_->fiberPush(std::move(update));
 
-    syncBaton[2].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[2], "syncBaton[2]");
     adjRibInQ_->fiberPush(buildEndOfRib(BgpUpdateAfi::AFI_IPv4));
     adjRibInQ_->fiberPush(buildEndOfRib(BgpUpdateAfi::AFI_IPv6));
   });
@@ -3272,8 +3278,8 @@ TEST_F(AdjRibInboundFixture, VerifyGRRestartStalePathRestoreAddPath) {
     {
       syncBaton[0].post();
       // wait till RibInAnnouncement route message is sent
-      folly::coro::blockingWait(ribInQ_.pop());
-      folly::coro::blockingWait(ribInQ_.pop());
+      facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
+      facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       EXPECT_EQ(4, adjRib_->getStats().getPreInPrefixCount());
       // Terminate the session
       terminateAdjRib(true);
@@ -3351,7 +3357,7 @@ TEST_F(AdjRibInboundFixture, VerifyGRRestartStalePathRestoreAddPath) {
       EXPECT_TRUE(pfx2Itr.value().contains(1));
 
       syncBaton[2].post();
-      auto msg = folly::coro::blockingWait(ribInQ_.pop());
+      auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(msg));
       auto withdrawal = std::get<RibInWithdrawal>(msg);
       EXPECT_EQ(kPeerAddr1, withdrawal.peer.addr);
@@ -3428,7 +3434,7 @@ TEST_F(AdjRibInboundFixture, VerifyGRRestartStalePathShuffleAddPath) {
     update->attrs()->localPref() = B;
     adjRibInQ_->fiberPush(std::move(update));
     // Wait for routes to be marked as stale
-    syncBaton[1].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[1], "syncBaton[1]");
 
     // Step 1: Now announce {pathID z -> path A}
     update = createV6BgpUpdateMultipleAnnounce(prefixSet1);
@@ -3438,7 +3444,7 @@ TEST_F(AdjRibInboundFixture, VerifyGRRestartStalePathShuffleAddPath) {
     update->attrs()->localPref() = A;
     adjRibInQ_->fiberPush(std::move(update));
     // Wait for verification
-    syncBaton[2].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[2], "syncBaton[2]");
 
     // Step 2: Now announce {pathID x -> path B}
     update = createV6BgpUpdateMultipleAnnounce(prefixSet1);
@@ -3448,7 +3454,7 @@ TEST_F(AdjRibInboundFixture, VerifyGRRestartStalePathShuffleAddPath) {
     update->attrs()->localPref() = B;
     adjRibInQ_->fiberPush(std::move(update));
     // Wait for verification
-    syncBaton[3].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[3], "syncBaton[3]");
 
     // Step 3: Announce EOR. Other task should verify stale routes are moved as
     // expected
@@ -3460,14 +3466,16 @@ TEST_F(AdjRibInboundFixture, VerifyGRRestartStalePathShuffleAddPath) {
     {
       // Step 0: Wait for initial announcements {pathID x -> path A, pathID y ->
       // path B}. Check they reach Rib...
-      auto ribInMsg1 = folly::coro::blockingWait(ribInQ_.pop());
+      auto ribInMsg1 =
+          facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(ribInMsg1));
       auto announcement1 = std::get<RibInAnnouncement>(ribInMsg1);
       ASSERT_EQ(announcement1.pfxPathIds.size(), 1);
       EXPECT_EQ(get<0>(announcement1.pfxPathIds[0]), kV4Prefix1);
       EXPECT_EQ(get<1>(announcement1.pfxPathIds[0]), x);
       EXPECT_EQ(announcement1.attrs->getLocalPref(), A);
-      auto ribInMsg2 = folly::coro::blockingWait(ribInQ_.pop());
+      auto ribInMsg2 =
+          facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(ribInMsg2));
       auto announcement2 = std::get<RibInAnnouncement>(ribInMsg2);
       ASSERT_EQ(announcement2.pfxPathIds.size(), 1);
@@ -3512,7 +3520,8 @@ TEST_F(AdjRibInboundFixture, VerifyGRRestartStalePathShuffleAddPath) {
 
       // Step 1: Wait for first announce, {pathID z -> path A}. Verify it
       // reaches Rib...
-      auto ribInMsg3 = folly::coro::blockingWait(ribInQ_.pop());
+      auto ribInMsg3 =
+          facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(ribInMsg3));
       auto announcement3 = std::get<RibInAnnouncement>(ribInMsg3);
       ASSERT_EQ(announcement3.pfxPathIds.size(), 1);
@@ -3539,7 +3548,8 @@ TEST_F(AdjRibInboundFixture, VerifyGRRestartStalePathShuffleAddPath) {
 
       // Step 2: Wait for second announce, {pathID x -> path B}. Verify it
       // reaches Rib...
-      auto ribInMsg4 = folly::coro::blockingWait(ribInQ_.pop());
+      auto ribInMsg4 =
+          facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(ribInMsg4));
       auto announcement4 = std::get<RibInAnnouncement>(ribInMsg4);
       ASSERT_EQ(announcement4.pfxPathIds.size(), 1);
@@ -3580,7 +3590,8 @@ TEST_F(AdjRibInboundFixture, VerifyGRRestartStalePathShuffleAddPath) {
 
       // Step 3: Wait for ribInWithdrawal of stale route. Verify it reaches
       // Rib...
-      auto ribInMsg5 = folly::coro::blockingWait(ribInQ_.pop());
+      auto ribInMsg5 =
+          facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(ribInMsg5));
       auto withdrawal1 = std::get<RibInWithdrawal>(ribInMsg5);
       ASSERT_EQ(withdrawal1.pfxPathIds.size(), 1);
@@ -3616,7 +3627,7 @@ TEST_F(AdjRibInboundFixture, VerifyGRRestartStalePathCleanup) {
   folly::fibers::Baton syncBaton;
 
   fm_->addTask([&] {
-    syncBaton.wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton, "syncBaton");
     auto update = createV6BgpUpdateMultipleAnnounce(prefixSet1);
     adjRibInQ_->fiberPush(std::move(update));
   });
@@ -3628,7 +3639,7 @@ TEST_F(AdjRibInboundFixture, VerifyGRRestartStalePathCleanup) {
     {
       syncBaton.post();
       // wait till RibInAnnouncement route message is sent
-      folly::coro::blockingWait(ribInQ_.pop());
+      facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       EXPECT_EQ(prefixSet1.size(), adjRib_->getStats().getPreInPrefixCount());
       EXPECT_EQ(prefixSet1.size(), adjRib_->getStats().getPostInPrefixCount());
       // Terminate the session
@@ -3691,7 +3702,8 @@ TEST_F(AdjRibInboundFixture, EndOfRibTest) {
 
     fm_->addTask([&] {
       // Verify fromAdjRibQ_ message
-      auto msg = folly::coro::blockingWait(fromAdjRibQ_.pop());
+      auto msg =
+          facebook::bgp::test::boundedBlockingPop(fromAdjRibQ_, "fromAdjRibQ_");
       EXPECT_EQ(kPeerAddr1, msg.peerId.peerAddr);
 
       terminateAdjRib();
@@ -3714,7 +3726,8 @@ TEST_F(AdjRibInboundFixture, EndOfRibTest) {
 
     fm_->addTask([&] {
       // Verify fromAdjRibQ_ message
-      auto msg = folly::coro::blockingWait(fromAdjRibQ_.pop());
+      auto msg =
+          facebook::bgp::test::boundedBlockingPop(fromAdjRibQ_, "fromAdjRibQ_");
       EXPECT_EQ(kPeerAddr1, msg.peerId.peerAddr);
 
       terminateAdjRib();
@@ -3737,7 +3750,8 @@ TEST_F(AdjRibInboundFixture, EndOfRibTest) {
 
     fm_->addTask([&] {
       // Verify fromAdjRibQ_ message
-      auto msg = folly::coro::blockingWait(fromAdjRibQ_.pop());
+      auto msg =
+          facebook::bgp::test::boundedBlockingPop(fromAdjRibQ_, "fromAdjRibQ_");
       EXPECT_EQ(kPeerAddr1, msg.peerId.peerAddr);
 
       terminateAdjRib();
@@ -4575,14 +4589,14 @@ TEST_F(AdjRibInboundFixture, V4AndV6Policy) {
     // V4 and V6 policies are applied separately.
     // NOTE: Here order of messages is hardcoded.
     //       If we change order of processing we need to modify testcase.
-    auto msg1 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg1 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg1));
     const auto announcement1 = std::get<RibInAnnouncement>(msg1);
     EXPECT_EQ(kPeerAddr1, announcement1.peer.addr);
     const PrefixPathIds expectedPrefixSet1{{kV4Prefix1, kDefaultPathID}};
     EXPECT_EQ(expectedPrefixSet1, announcement1.pfxPathIds);
 
-    auto msg2 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg2 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg2));
     const auto announcement2 = std::get<RibInAnnouncement>(msg2);
     EXPECT_EQ(kPeerAddr1, announcement2.peer.addr);
@@ -4789,7 +4803,7 @@ TEST_F(AdjRibInboundFixture, VerifyTinyPeerInfoInRibInMessages) {
       PrefixPathIds pfxPathIds{{kV4Prefix1, kDefaultPathID}};
       {
         // Verify RibInAnnouncement
-        auto msg = folly::coro::blockingWait(ribInQ_.pop());
+        auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
         ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
         auto announcement = std::get<RibInAnnouncement>(msg);
         EXPECT_EQ(kPeerAddr1, announcement.peer.addr);
@@ -4803,7 +4817,7 @@ TEST_F(AdjRibInboundFixture, VerifyTinyPeerInfoInRibInMessages) {
       }
       {
         // Verify RibInWithdrawal
-        auto msg = folly::coro::blockingWait(ribInQ_.pop());
+        auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
         ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(msg));
         auto withdrawal = std::get<RibInWithdrawal>(msg);
         EXPECT_EQ(kPeerAddr1, withdrawal.peer.addr);
@@ -4842,7 +4856,7 @@ TEST_F(AdjRibInboundFixture, VerifyTinyPeerInfoInRibInMessages) {
       PrefixPathIds pfxPathIds{{kV4Prefix1, kDefaultPathID}};
       {
         // Verify RibInAnnouncement
-        auto msg = folly::coro::blockingWait(ribInQ_.pop());
+        auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
         ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
         auto announcement = std::get<RibInAnnouncement>(msg);
         EXPECT_EQ(kPeerAddr1, announcement.peer.addr);
@@ -4856,7 +4870,7 @@ TEST_F(AdjRibInboundFixture, VerifyTinyPeerInfoInRibInMessages) {
       }
       {
         // Verify RibInWithdrawal
-        auto msg = folly::coro::blockingWait(ribInQ_.pop());
+        auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
         ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(msg));
         auto withdrawal = std::get<RibInWithdrawal>(msg);
         EXPECT_EQ(kPeerAddr1, withdrawal.peer.addr);
@@ -4907,7 +4921,7 @@ TEST_F(AdjRibInboundFixture, VerifyTinyPeerInfoInRibInMessages) {
       PrefixPathIds pfxPathIds{{kV4Prefix1, kDefaultPathID}};
       {
         // Verify RibInAnnouncement
-        auto msg = folly::coro::blockingWait(ribInQ_.pop());
+        auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
         ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
         auto announcement = std::get<RibInAnnouncement>(msg);
         EXPECT_EQ(kPeerAddr1, announcement.peer.addr);
@@ -4921,7 +4935,7 @@ TEST_F(AdjRibInboundFixture, VerifyTinyPeerInfoInRibInMessages) {
       }
       {
         // Verify RibInWithdrawal
-        auto msg = folly::coro::blockingWait(ribInQ_.pop());
+        auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
         ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(msg));
         auto withdrawal = std::get<RibInWithdrawal>(msg);
         EXPECT_EQ(kPeerAddr1, withdrawal.peer.addr);
@@ -4963,8 +4977,10 @@ TEST_F(AdjRibInboundFixture, AsLoopRouteProcessingAfterLearning) {
   });
 
   fm_->addTask([&] {
-    auto msg1 = folly::coro::blockingWait(ribInQ_.pop()); // add route
-    auto msg2 = folly::coro::blockingWait(ribInQ_.pop()); // withdraw
+    auto msg1 = facebook::bgp::test::boundedBlockingPop(
+        ribInQ_, "ribInQ_"); // add route
+    auto msg2 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_"); // withdraw
 
     // Verify withdrawal message
     ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(msg2));
@@ -4998,8 +5014,10 @@ TEST_F(AdjRibInboundFixture, NexthopChangeHandling) {
   });
 
   fm_->addTask([&] {
-    auto msg1 = folly::coro::blockingWait(ribInQ_.pop()); // add route
-    auto msg2 = folly::coro::blockingWait(ribInQ_.pop()); // withdraw
+    auto msg1 = facebook::bgp::test::boundedBlockingPop(
+        ribInQ_, "ribInQ_"); // add route
+    auto msg2 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_"); // withdraw
 
     // Verify initial rib In message
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg1));
@@ -5059,7 +5077,8 @@ TEST_F(AdjRibInboundFixture, V4PolicyAcceptReject) {
       adjRibInQ_->fiberPush(std::move(update));
 
       // Appears in RIB as update
-      auto ribUpdate = folly::coro::blockingWait(ribInQ_.pop());
+      auto ribUpdate =
+          facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(ribUpdate));
       EXPECT_EQ(1, std::get<RibInAnnouncement>(ribUpdate).pfxPathIds.size());
 
@@ -5080,7 +5099,8 @@ TEST_F(AdjRibInboundFixture, V4PolicyAcceptReject) {
       adjRibInQ_->fiberPush(std::move(update));
 
       // Appears in RIB as withdraw
-      auto ribUpdate = folly::coro::blockingWait(ribInQ_.pop());
+      auto ribUpdate =
+          facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(ribUpdate));
       EXPECT_EQ(1, std::get<RibInWithdrawal>(ribUpdate).pfxPathIds.size());
 
@@ -5130,14 +5150,14 @@ TEST_F(AdjRibInboundFixture, V4UpdatePolicyProcessing) {
     // 2nd message with 2 prefixes sharing attributes
     // NOTE: Here order of messages is hardcoded.
     //       If we change order of processing we need to modify testcase.
-    auto msg1 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg1 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg1));
     const auto announcement1 = std::get<RibInAnnouncement>(msg1);
     EXPECT_EQ(kPeerAddr1, announcement1.peer.addr);
     const PrefixPathIds expectedPrefixSet1{{kV4Prefix4, kDefaultPathID}};
     EXPECT_EQ(expectedPrefixSet1, announcement1.pfxPathIds);
 
-    auto msg2 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg2 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg2));
     const auto announcement2 = std::get<RibInAnnouncement>(msg2);
     EXPECT_EQ(kPeerAddr1, announcement2.peer.addr);
@@ -5261,7 +5281,7 @@ TEST_F(AdjRibInboundFixture, VerifyPermitAfterDeny) {
   fm_->addTask([&] {
     // Update 1 will not lead to any Rib notification
     // Verifying only after Update 2 is sent
-    auto msg = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
     const auto announcement = std::get<RibInAnnouncement>(msg);
     EXPECT_EQ(kPeerAddr1, announcement.peer.addr);
@@ -5336,7 +5356,7 @@ TEST_F(AdjRibInboundFixture, VerifyDenyAfterPermit) {
   fm_->addTask([&] {
     {
       // Verifying first kV4Prefix1 update is announced
-      auto msg = folly::coro::blockingWait(ribInQ_.pop());
+      auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
       const auto announcement = std::get<RibInAnnouncement>(msg);
       EXPECT_EQ(kPeerAddr1, announcement.peer.addr);
@@ -5356,7 +5376,7 @@ TEST_F(AdjRibInboundFixture, VerifyDenyAfterPermit) {
     {
       // Verifying withdrawal due to policy denying kV4Prefix1
       // after attribute change
-      auto msg = folly::coro::blockingWait(ribInQ_.pop());
+      auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(msg));
       const auto withdrawal = std::get<RibInWithdrawal>(msg);
       const PrefixPathIds withdrawPrefixSet{{kV4Prefix1, kDefaultPathID}};
@@ -5427,7 +5447,7 @@ TEST_F(AdjRibInboundFixture, VerifyDenyAfterPermitAddpath) {
   fm_->addTask([&] {
     {
       // Verifying first kV4Prefix1 update is announced
-      auto msg = folly::coro::blockingWait(ribInQ_.pop());
+      auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
       const auto announcement = std::get<RibInAnnouncement>(msg);
       EXPECT_EQ(kPeerAddr1, announcement.peer.addr);
@@ -5453,7 +5473,7 @@ TEST_F(AdjRibInboundFixture, VerifyDenyAfterPermitAddpath) {
     {
       // Verifying withdrawal due to policy denying kV4Prefix1
       // after attribute change
-      auto msg = folly::coro::blockingWait(ribInQ_.pop());
+      auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(msg));
       const auto withdrawal = std::get<RibInWithdrawal>(msg);
       const PrefixPathIds withdrawPrefixSet{{kV4Prefix1, 1}};
@@ -5498,7 +5518,8 @@ TEST_F(AdjRibInboundFixture, LocalPrefPrePolicyProcessing) {
   });
 
   fm_->addTask([&] {
-    auto msg1 = folly::coro::blockingWait(ribInQ_.pop()); // add route
+    auto msg1 = facebook::bgp::test::boundedBlockingPop(
+        ribInQ_, "ribInQ_"); // add route
 
     // Verify preInAttrs is updated
     auto adjRibEntry = adjRib_->getRibEntry(/*ingress=*/true, kV4Prefix1);
@@ -5538,8 +5559,8 @@ TEST_F(AdjRibInboundFixture, AttributeChangeHandling) {
 
   fm_->addTask([&] {
     // Verify initial rib In message
-    auto msg1 = folly::coro::blockingWait(ribInQ_.pop());
-    auto msg2 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg1 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
+    auto msg2 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg2));
     auto ann2 = std::get<RibInAnnouncement>(msg2);
     EXPECT_EQ(medValue2, ann2.attrs->getMed());
@@ -5657,7 +5678,7 @@ TEST_F(AdjRibInboundFixture, DeepComparePostInAttributesBeforeNotifying) {
 
   fm_->addTask([&] {
     // Verifying first kV4Prefix1 update is announced
-    auto msg = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
     auto announcement = std::get<RibInAnnouncement>(msg);
     EXPECT_EQ(kPeerAddr1, announcement.peer.addr);
@@ -5716,7 +5737,7 @@ TEST_F(AdjRibInboundFixture, VipInjectorPrefixCount) {
 
   fm_->addTask([&] {
     // Verify rib In message
-    auto msg = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
     EXPECT_EQ(2, totalVipPrefixesCount);
 
@@ -5789,7 +5810,8 @@ TEST_F(AdjRibInboundFixture, IngressUcmpPolicyTestDecodeAll) {
   });
 
   fm_->addTask([&] {
-    auto msg1 = folly::coro::blockingWait(ribInQ_.pop()); // add route
+    auto msg1 = facebook::bgp::test::boundedBlockingPop(
+        ribInQ_, "ribInQ_"); // add route
 
     // Verify preInAttrs is updated
     auto adjRibEntry = adjRib_->getRibEntry(/*ingress=*/true, kV4Prefix1);
@@ -5841,7 +5863,8 @@ TEST_F(AdjRibInboundFixture, IngressUcmpPolicyTestAccept) {
   });
 
   fm_->addTask([&] {
-    auto msg1 = folly::coro::blockingWait(ribInQ_.pop()); // add route
+    auto msg1 = facebook::bgp::test::boundedBlockingPop(
+        ribInQ_, "ribInQ_"); // add route
 
     // Verify preInAttrs is updated
     auto adjRibEntry = adjRib_->getRibEntry(/*ingress=*/true, kV4Prefix1);
@@ -6017,7 +6040,7 @@ TEST_F(AdjRibInboundFixture, SetRouteFilterStatementEgressTest) {
   EXPECT_FALSE(ingressChanged1);
   EXPECT_FALSE(egressChanged1);
   EXPECT_FALSE(adjRib_->isPendingIngressPolicyUpdate());
-  EXPECT_FALSE(adjRib_->isPendingEgressPolicyUpdate());
+  EXPECT_FALSE(adjRib_->isEgressPolicyUpdateRequired());
 
   // nullptr -> stmt1 (should return (false, true), statement set)
   auto [ingressChanged2, egressChanged2] =
@@ -6247,7 +6270,8 @@ TEST_F(AdjRibInboundFixture, VerifyRouteFilterPolicyAllow) {
     adjRibInQ_->fiberPush(std::move(update1));
 
     // Should receive RibInAnnouncement for the allowed prefix
-    auto ribUpdate1 = folly::coro::blockingWait(ribInQ_.pop());
+    auto ribUpdate1 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(ribUpdate1));
     auto& announcement1 = std::get<RibInAnnouncement>(ribUpdate1);
     EXPECT_EQ(1, announcement1.pfxPathIds.size());
@@ -6264,7 +6288,8 @@ TEST_F(AdjRibInboundFixture, VerifyRouteFilterPolicyAllow) {
     adjRibInQ_->fiberPush(std::move(update2));
 
     // Should receive RibInAnnouncement for the second allowed prefix
-    auto ribUpdate2 = folly::coro::blockingWait(ribInQ_.pop());
+    auto ribUpdate2 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(ribUpdate2));
     auto& announcement2 = std::get<RibInAnnouncement>(ribUpdate2);
     EXPECT_EQ(1, announcement2.pfxPathIds.size());
@@ -6328,7 +6353,8 @@ TEST_F(
     adjRibInQ_->fiberPush(std::move(update1));
 
     // Should receive RibInAnnouncement for the allowed prefix
-    auto ribUpdate1 = folly::coro::blockingWait(ribInQ_.pop());
+    auto ribUpdate1 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(ribUpdate1));
     auto& announcement1 = std::get<RibInAnnouncement>(ribUpdate1);
     EXPECT_EQ(1, announcement1.pfxPathIds.size());
@@ -6345,7 +6371,8 @@ TEST_F(
     adjRibInQ_->fiberPush(std::move(update2));
 
     // Should receive RibInAnnouncement for the second allowed prefix
-    auto ribUpdate2 = folly::coro::blockingWait(ribInQ_.pop());
+    auto ribUpdate2 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(ribUpdate2));
     auto& announcement2 = std::get<RibInAnnouncement>(ribUpdate2);
     EXPECT_EQ(1, announcement2.pfxPathIds.size());
@@ -6388,7 +6415,8 @@ TEST_F(
     adjRibInQ_->fiberPush(std::move(update3));
 
     // Should receive RibInWithdrawal for Prefix1
-    auto ribUpdate3 = folly::coro::blockingWait(ribInQ_.pop());
+    auto ribUpdate3 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(ribUpdate3));
     auto& withdrawal1 = std::get<RibInWithdrawal>(ribUpdate3);
     EXPECT_EQ(1, withdrawal1.pfxPathIds.size());
@@ -6457,7 +6485,8 @@ TEST_F(AdjRibInboundFixture, VerifyAnnouncementsWithEgressRouteFilterPolicy) {
     adjRibInQ_->fiberPush(std::move(update1));
 
     // Should receive RibInAnnouncement for the allowed prefix
-    auto ribUpdate1 = folly::coro::blockingWait(ribInQ_.pop());
+    auto ribUpdate1 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(ribUpdate1));
     auto& announcement1 = std::get<RibInAnnouncement>(ribUpdate1);
     EXPECT_EQ(1, announcement1.pfxPathIds.size());
@@ -6474,7 +6503,8 @@ TEST_F(AdjRibInboundFixture, VerifyAnnouncementsWithEgressRouteFilterPolicy) {
     adjRibInQ_->fiberPush(std::move(update2));
 
     // Should receive RibInAnnouncement for the second allowed prefix
-    auto ribUpdate2 = folly::coro::blockingWait(ribInQ_.pop());
+    auto ribUpdate2 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(ribUpdate2));
     auto& announcement2 = std::get<RibInAnnouncement>(ribUpdate2);
     EXPECT_EQ(1, announcement2.pfxPathIds.size());
@@ -6537,7 +6567,8 @@ TEST_F(
     adjRibInQ_->fiberPush(std::move(update1));
 
     // Should receive RibInAnnouncement for the allowed prefix
-    auto ribUpdate1 = folly::coro::blockingWait(ribInQ_.pop());
+    auto ribUpdate1 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(ribUpdate1));
     auto& announcement1 = std::get<RibInAnnouncement>(ribUpdate1);
     EXPECT_EQ(1, announcement1.pfxPathIds.size());
@@ -6554,7 +6585,8 @@ TEST_F(
     adjRibInQ_->fiberPush(std::move(update2));
 
     // Should receive RibInAnnouncement for the second allowed prefix
-    auto ribUpdate2 = folly::coro::blockingWait(ribInQ_.pop());
+    auto ribUpdate2 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(ribUpdate2));
     auto& announcement2 = std::get<RibInAnnouncement>(ribUpdate2);
     EXPECT_EQ(1, announcement2.pfxPathIds.size());
@@ -6592,7 +6624,8 @@ TEST_F(
         RibPauseResumeCause::ROUTE_FILTER_POLICY_UPDATE));
 
     // Should receive RibInWithdrawal for Prefix1
-    auto ribUpdate3 = folly::coro::blockingWait(ribInQ_.pop());
+    auto ribUpdate3 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(ribUpdate3));
     auto& withdrawal1 = std::get<RibInWithdrawal>(ribUpdate3);
     EXPECT_EQ(1, withdrawal1.pfxPathIds.size());
@@ -6667,7 +6700,7 @@ TEST_F(
       kV4Prefix2, kV4Prefix3, kV4Prefix4};
 
   fm_->addTask([&] {
-    syncBaton[0].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[0], "syncBaton[0]");
     // Step 1: Set route filter statement to allow specific prefixes 1 and 2
     auto tStmt = createTRouteFilterStatement(
         {kV4Prefix1, kV4Prefix2}, false /* permissive */, false /* egress */);
@@ -6685,14 +6718,14 @@ TEST_F(
         BgpAttrOrigin::BGP_ORIGIN_IGP);
     adjRibInQ_->fiberPush(std::move(update1));
 
-    syncBaton[1].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[1], "syncBaton[1]");
 
     // Step 3: Announce 3 prefixes, 2 of them will be rejected by route filter
     // policy (kV4Prefix3 and kV4Prefix4) and 1 allowed (kV4Prefix2)
     auto update = createV4BgpUpdateMultipleAnnounce(prefixSet1);
     adjRibInQ_->fiberPush(std::move(update));
 
-    syncBaton[2].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[2], "syncBaton[2]");
 
     // Step 4: Update the policy to allow just Prefix3 and Prefix4
     tStmt = createTRouteFilterStatement(
@@ -6714,7 +6747,8 @@ TEST_F(
     // -------------Step 1-2 verifications------------------
     // Wait for and verify RibInAnnouncements for the initially allowed
     // prefixes
-    auto ribUpdate1 = folly::coro::blockingWait(ribInQ_.pop());
+    auto ribUpdate1 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(ribUpdate1));
     auto& announcement1 = std::get<RibInAnnouncement>(ribUpdate1);
     EXPECT_EQ(1, announcement1.pfxPathIds.size());
@@ -6736,7 +6770,8 @@ TEST_F(
     // -------------Step 3 verifications------------------
     // Wait for and verify RibInAnnouncements for the
     // allowed prefix (kV4Prefix2)
-    auto ribUpdate2 = folly::coro::blockingWait(ribInQ_.pop());
+    auto ribUpdate2 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(ribUpdate2));
     auto& announcement2 = std::get<RibInAnnouncement>(ribUpdate2);
     EXPECT_EQ(1, announcement2.pfxPathIds.size());
@@ -6781,7 +6816,8 @@ TEST_F(
     //  -------------Step 4-5 verifications------------------
     // Verify RibInWithdrawal is received for Prefix1 and Prefix2 in
     // batch
-    auto ribUpdateBatch1 = folly::coro::blockingWait(ribInQ_.pop());
+    auto ribUpdateBatch1 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(ribUpdateBatch1));
     auto& batch1 = std::get<RibInWithdrawal>(ribUpdateBatch1);
     EXPECT_EQ(2, batch1.pfxPathIds.size());
@@ -6814,7 +6850,8 @@ TEST_F(
 
     // Verify RibInAnnouncement is received for Prefix3 and Prefix4 in
     // batch
-    auto ribUpdateBatch2 = folly::coro::blockingWait(ribInQ_.pop());
+    auto ribUpdateBatch2 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(ribUpdateBatch2));
     auto& batch2 = std::get<RibInAnnouncement>(ribUpdateBatch2);
     EXPECT_EQ(2, batch2.pfxPathIds.size());
@@ -6888,7 +6925,7 @@ TEST_F(
   std::array<folly::fibers::Baton, 3> syncBaton;
 
   fm_->addTask([&] {
-    syncBaton[0].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[0], "syncBaton[0]");
 
     // Step 1: Set route filter statement to allow specific prefixes 1 and 2
     auto tStmt = createTRouteFilterStatement(
@@ -6916,7 +6953,7 @@ TEST_F(
         BgpAttrOrigin::BGP_ORIGIN_IGP);
     adjRibInQ_->fiberPush(std::move(update2));
 
-    syncBaton[1].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[1], "syncBaton[1]");
 
     // Step 3: Update the policy to deny all prefixes (empty list in blocking
     // mode)
@@ -6932,7 +6969,7 @@ TEST_F(
     adjRibInQ_->fiberPush(
         FiberBgpPeer::BgpSessionStop{GracefulRestartFlag{false}});
 
-    syncBaton[2].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[2], "syncBaton[2]");
 
     // Step 5: Issue policy re-evaluation after session termination is complete
     // This should be a no-op since the session is terminated
@@ -6945,14 +6982,16 @@ TEST_F(
 
     // -------------Step 1-2 verifications------------------
     // Verify RibInAnnouncements are received for the allowed prefixes
-    auto ribUpdate1 = folly::coro::blockingWait(ribInQ_.pop());
+    auto ribUpdate1 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(ribUpdate1));
     auto& announcement1 = std::get<RibInAnnouncement>(ribUpdate1);
     EXPECT_EQ(1, announcement1.pfxPathIds.size());
     // Verify the announced prefix is correct
     EXPECT_EQ(kV4Prefix1, std::get<0>(announcement1.pfxPathIds[0]));
 
-    auto ribUpdate2 = folly::coro::blockingWait(ribInQ_.pop());
+    auto ribUpdate2 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(ribUpdate2));
     auto& announcement2 = std::get<RibInAnnouncement>(ribUpdate2);
     EXPECT_EQ(1, announcement2.pfxPathIds.size());
@@ -6982,7 +7021,8 @@ TEST_F(
     syncBaton[1].post();
 
     // -------------Step 3-4 verifications------------------
-    auto ribUpdateAfterGr = folly::coro::blockingWait(ribInQ_.pop());
+    auto ribUpdateAfterGr =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(ribUpdateAfterGr));
     auto& batch = std::get<RibInWithdrawal>(ribUpdateAfterGr);
     EXPECT_EQ(2, batch.pfxPathIds.size());
@@ -7090,7 +7130,8 @@ TEST_F(AdjRibInboundFixture, VerifyRouteFilterPolicyReEvaluationWithGR) {
 
     // Verify RibInQ announcements are received
     for (int i = 0; i < 3; i++) {
-      auto ribInMsg = folly::coro::blockingWait(ribInQ_.pop());
+      auto ribInMsg =
+          facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(ribInMsg));
       auto announcement = std::get<RibInAnnouncement>(ribInMsg);
       EXPECT_EQ(1, announcement.pfxPathIds.size());
@@ -7141,7 +7182,7 @@ TEST_F(AdjRibInboundFixture, VerifyRouteFilterPolicyReEvaluationWithGR) {
         RibPauseResumeCause::ROUTE_FILTER_POLICY_UPDATE));
 
     // Step 6: Verify RibInQ withdrawals for the 3 prefixes are generated
-    auto ribInMsg = folly::coro::blockingWait(ribInQ_.pop());
+    auto ribInMsg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(ribInMsg));
     auto withdrawal = std::get<RibInWithdrawal>(ribInMsg);
     EXPECT_EQ(3, withdrawal.pfxPathIds.size());
@@ -7342,7 +7383,8 @@ TEST_F(
 
     // Verify RibInQ announcements are received
     for (int i = 0; i < 3; i++) {
-      auto ribInMsg = folly::coro::blockingWait(ribInQ_.pop());
+      auto ribInMsg =
+          facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(ribInMsg));
       auto announcement = std::get<RibInAnnouncement>(ribInMsg);
       EXPECT_EQ(1, announcement.pfxPathIds.size());
@@ -7420,14 +7462,16 @@ TEST_F(
     // Step 7: Verify withdrawals are sent for all prefixes
     // Expect withdrawal for kV4Prefix1 (from adjRibIn)
 
-    auto ribInMsg1 = folly::coro::blockingWait(ribInQ_.pop());
+    auto ribInMsg1 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(ribInMsg1));
     auto withdrawal1 = std::get<RibInWithdrawal>(ribInMsg1);
     EXPECT_EQ(1, withdrawal1.pfxPathIds.size());
     EXPECT_EQ(kV4Prefix1, std::get<0>(withdrawal1.pfxPathIds[0]));
 
     // Expect withdrawal for stale prefixes (kV4Prefix2, kV4Prefix3)
-    auto ribInMsg2 = folly::coro::blockingWait(ribInQ_.pop());
+    auto ribInMsg2 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(ribInMsg2));
     auto withdrawal2 = std::get<RibInWithdrawal>(ribInMsg2);
     EXPECT_EQ(2, withdrawal2.pfxPathIds.size());
@@ -7931,7 +7975,7 @@ TEST_F(AdjRibInboundFixture, VerifyPolicyReEvaluationSynchronization) {
 
     // Drain initial announcements from ribInQ
     for (int i = 0; i < 3; i++) {
-      auto msg = folly::coro::blockingWait(ribInQ_.pop());
+      auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
     }
 
@@ -7962,7 +8006,7 @@ TEST_F(AdjRibInboundFixture, VerifyPolicyReEvaluationSynchronization) {
     (void)reEvalResult; // Explicitly ignore the result
 
     // Step 6: Now the peer update should be processed
-    auto msg = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
 
     // Verify the new prefix exists
@@ -7999,7 +8043,7 @@ TEST_F(AdjRibInboundFixture, VerifyPolicyReEvaluationWithSessionTermination) {
 
     // Drain initial announcements
     for (int i = 0; i < 2; i++) {
-      auto msg = folly::coro::blockingWait(ribInQ_.pop());
+      auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
     }
 
@@ -8025,7 +8069,7 @@ TEST_F(AdjRibInboundFixture, VerifyPolicyReEvaluationWithSessionTermination) {
 
     // Step 6: Now session termination should process and send withdrawals
     // Wait for withdrawals from session termination
-    auto msg = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     // Could be announcement or withdrawal depending on what re-evaluation did
 
     XLOG(INFO, "Session termination correctly blocked by policy re-evaluation");
@@ -8254,7 +8298,8 @@ TEST_F(AdjRibInboundFixture, IngressPolicyLinkBandwidthPropagationTest) {
   });
 
   fm_->addTask([&] {
-    auto msg = folly::coro::blockingWait(ribInQ_.pop()); // add route
+    auto msg = facebook::bgp::test::boundedBlockingPop(
+        ribInQ_, "ribInQ_"); // add route
 
     // Verify post-policy attributes have both extended communities
     auto adjRibEntry = adjRib_->getRibEntry(/*ingress=*/true, kV4Prefix1);
@@ -8421,7 +8466,7 @@ TEST_F(AdjRibInboundFixture, SchedulePendingRibInPushTrimsReady) {
 
     // Drain the new push so stop()'s drain doesn't hang on the real
     // ribInQ_ — pop the message that was just pushed.
-    folly::coro::blockingWait(ribInQ_.pop());
+    facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     folly::coro::blockingWait(adjRib_->stop());
     EXPECT_EQ(0, adjRib_->pendingRibInPushes_.size());
 
@@ -8450,7 +8495,7 @@ TEST_F(AdjRibInboundFixture, PushStaleWithdrawalPushesToRibInQ) {
 
     folly::coro::blockingWait(adjRib_->pushStaleWithdrawal(std::move(w)));
 
-    auto msg = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(msg));
     const auto& got = std::get<RibInWithdrawal>(msg);
     ASSERT_EQ(1, got.pfxPathIds.size());

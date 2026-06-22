@@ -117,6 +117,22 @@ void FsdbSyncer::setRouteFilterPolicy(
   });
 }
 
+void FsdbSyncer::setPartialDrainState(
+    std::optional<bgp_thrift::TPartialDrainState>&& partialDrainState) {
+  stateSyncer_->updateState([partialDrainState = std::move(partialDrainState)](
+                                const auto& oldState) mutable {
+    auto newState = oldState->clone();
+    newState->template modify<k_fsdb_model::partialDrainState>();
+    if (partialDrainState) {
+      newState->template ref<k_fsdb_model::partialDrainState>()->fromThrift(
+          std::move(*partialDrainState));
+    } else {
+      newState->template ref<k_fsdb_model::partialDrainState>() = nullptr;
+    }
+    return newState;
+  });
+}
+
 void FsdbSyncer::setRibMap(std::map<std::string, bgp_thrift::TRibEntry> rib) {
   if (!FLAGS_publish_rib_to_fsdb) {
     return;

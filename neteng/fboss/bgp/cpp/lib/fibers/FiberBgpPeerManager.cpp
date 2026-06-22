@@ -39,7 +39,6 @@ using folly::AsyncSocket;
 using folly::Expected;
 using folly::IPAddress;
 using folly::makeUnexpected;
-using folly::Optional;
 using folly::SocketAddress;
 using folly::Unit;
 using folly::fibers::addTask;
@@ -213,7 +212,7 @@ void FiberBgpPeerManager::setServerSocketOptions() noexcept {
 }
 
 std::unique_ptr<FiberServerSocket> FiberBgpPeerManager::makeServerSocket(
-    const folly::Optional<folly::SocketAddress>& listenAddr) const noexcept {
+    const std::optional<folly::SocketAddress>& listenAddr) const noexcept {
   return std::make_unique<FiberServerSocket>(listenAddr);
 }
 
@@ -329,7 +328,7 @@ void FiberBgpPeerManager::shutdownFibers(bool gracefulRestart) noexcept {
       // Stop bgp session
       if (connectionInfo->activeSessionInfo) {
         connectionInfo->activeSessionInfo->peer->stop(
-            folly::none, gracefulRestart);
+            std::nullopt, gracefulRestart);
       }
     }
   }
@@ -653,7 +652,7 @@ void FiberBgpPeerManager::setSocketPauseState(
 }
 
 bool FiberBgpPeerManager::needToKeepThisPeer(
-    folly::Optional<SocketAddress> localListenAddress,
+    std::optional<SocketAddress> localListenAddress,
     std::shared_ptr<FiberBgpPeer> peer) {
   CHECK(localListenAddress);
 
@@ -713,7 +712,7 @@ Expected<Unit, FiberBgpPeerManager::ErrorCode> FiberBgpPeerManager::addPeer(
     const uint16_t peerPort,
     const ConnTimeParams& connTimeParams,
     const TBgpSessionConnectMode connectMode,
-    const Optional<uint32_t>& localBgpIdOpt) {
+    const std::optional<uint32_t>& localBgpIdOpt) {
   // sanity check for overlapping peerPrefix or peerAddress configuration:
   //    E.g. If dynamic peer 10.1.0.0/30 is configured already,
   //         peer 10.1.0.1 will be reject here
@@ -899,7 +898,7 @@ Expected<Unit, FiberBgpPeerManager::ErrorCode> FiberBgpPeerManager::stopPeer(
   for (const auto& [_, connectionInfo] : peerInfo->connectionInfos) {
     if (connectionInfo->activeSessionInfo) {
       if (withGR) {
-        connectionInfo->activeSessionInfo->peer->stop(folly::none, true);
+        connectionInfo->activeSessionInfo->peer->stop(std::nullopt, true);
       } else {
         connectionInfo->activeSessionInfo->peer->stop(
             BgpNotifCeaseErrSubCode::BN_CEASE_ADMIN_SHUTDOWN, false);
@@ -1376,14 +1375,14 @@ bool FiberBgpPeerManager::isPeerUp(const BgpPeerId& peerId) const noexcept {
              ->establishedSessionInfo != nullptr;
 }
 
-Optional<folly::CIDRNetwork> FiberBgpPeerManager::getPeerPrefix(
+std::optional<folly::CIDRNetwork> FiberBgpPeerManager::getPeerPrefix(
     const IPAddress& peerAddr) const noexcept {
   for (const auto& [peerPrefix, _] : dynamicPeerGroups_) {
     if (peerAddr.inSubnet(peerPrefix.first, peerPrefix.second)) {
       return peerPrefix;
     }
   }
-  return folly::none;
+  return std::nullopt;
 }
 
 std::vector<IPAddress> FiberBgpPeerManager::getPeerAddrs(
@@ -1848,12 +1847,12 @@ bool FiberBgpPeerManager::isDuplicateBgpPeerActiveSession(
   return true;
 }
 
-folly::Optional<SocketAddress> FiberBgpPeerManager::getListenAddress()
+std::optional<SocketAddress> FiberBgpPeerManager::getListenAddress()
     const noexcept {
   if (serverSocket_) {
     return serverSocket_->getListenAddress();
   }
-  return folly::none;
+  return std::nullopt;
 }
 
 RQueue<ObservableEventT> FiberBgpPeerManager::getNotifyQueue() noexcept {
@@ -2218,7 +2217,7 @@ BgpPeerDisplayInfo FiberBgpPeerManager::getIdlePeerDisplayInfoHelper(
   peerInfo.remoteBgpId = 0;
   peerInfo.state = BgpSessionState::IDLE;
   peerInfo.localAddr = connectionInfo->activeConnectInfo->localAddr;
-  peerInfo.negotiatedHoldTime = folly::none;
+  peerInfo.negotiatedHoldTime = std::nullopt;
   peerInfo.numOfConnectionAttempts =
       connectionInfo->activeConnectInfo->numOfConnectionAttempts;
   peerInfo.lastResetHoldTimer = 0;
@@ -2234,7 +2233,7 @@ BgpPeerDisplayInfo FiberBgpPeerManager::getIdlePeerDisplayInfoHelper(
       peerInfo.lastResetReason = lastSessionInfo->lastResetReason;
       peerInfo.numResets = lastSessionInfo->numResets;
     } else {
-      peerInfo.lastResetReason = folly::none;
+      peerInfo.lastResetReason = std::nullopt;
       peerInfo.numResets = 0;
     }
   } // end of weak_ptr lock(), shared_ptr is destroyed
@@ -2249,7 +2248,7 @@ BgpPeerDisplayInfo FiberBgpPeerManager::getActivePeerDisplayInfoHelper(
   // Applicable only for dynamic peers
   peerInfo.peeringParams.peerPrefix = std::nullopt;
   peerInfo.remoteBgpId = 0;
-  peerInfo.negotiatedHoldTime = folly::none;
+  peerInfo.negotiatedHoldTime = std::nullopt;
   peerInfo.state = connectionInfo->activeSessionInfo->state;
   peerInfo.localAddr =
       connectionInfo->activeSessionInfo->peer->getLocalSocketAddress();
@@ -2276,7 +2275,7 @@ BgpPeerDisplayInfo FiberBgpPeerManager::getActivePeerDisplayInfoHelper(
       peerInfo.lastResetReason = lastSessionInfo->lastResetReason;
       peerInfo.numResets = lastSessionInfo->numResets;
     } else {
-      peerInfo.lastResetReason = folly::none;
+      peerInfo.lastResetReason = std::nullopt;
       peerInfo.numResets = 0;
     }
   } // end of weak_ptr lock(), shared_ptr is destroyed
@@ -2307,7 +2306,7 @@ FiberBgpPeerManager::getAllPeerDisplayInfos() {
     peerInfo->remoteBgpId = 0;
     peerInfo->state = BgpSessionState::IDLE;
     peerInfo->localAddr = peer->peeringParams.bindAddr;
-    peerInfo->negotiatedHoldTime = folly::none;
+    peerInfo->negotiatedHoldTime = std::nullopt;
 
     allPeersInfo.emplace(peerPrefix.first, peerInfo);
   }
@@ -2315,15 +2314,15 @@ FiberBgpPeerManager::getAllPeerDisplayInfos() {
   return allPeersInfo;
 }
 
-Optional<std::shared_ptr<BgpSessionInfo>>
+std::optional<std::shared_ptr<BgpSessionInfo>>
 FiberBgpPeerManager::getBgpSessionInfo(const BgpPeerId& peerId) const noexcept {
   const auto& peerAddr = peerId.peerAddr;
   const auto remoteBgpId = peerId.remoteBgpId;
   if (!allPeers_.contains(peerAddr)) {
-    return folly::none;
+    return std::nullopt;
   }
   if (!allPeers_.at(peerAddr)->sessionInfos.contains(remoteBgpId)) {
-    return folly::none;
+    return std::nullopt;
   }
   auto sessionInfo = allPeers_.at(peerAddr)->sessionInfos.at(remoteBgpId);
   return sessionInfo;

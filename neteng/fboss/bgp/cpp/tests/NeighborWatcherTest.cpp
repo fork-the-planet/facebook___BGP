@@ -122,6 +122,7 @@
 #include "neteng/fboss/bgp/cpp/lib/coro/BackPressuredQueue.h"
 #include "neteng/fboss/bgp/cpp/peer/NeighborWatcher.h"
 #include "neteng/fboss/bgp/cpp/stats/Stats.h"
+#include "neteng/fboss/bgp/cpp/tests/BoundedWaitUtils.h"
 
 namespace facebook::bgp {
 
@@ -598,19 +599,22 @@ TYPED_TEST(NeighborWatcherTestFixture, nbrWatcherUseFsdb) {
 
   // Verify contents of the message
   {
-    auto msg = folly::coro::blockingWait(this->neighborEventQ_.pop());
+    auto msg = facebook::bgp::test::boundedBlockingPop(
+        this->neighborEventQ_, "neighborEventQ_");
     EXPECT_FALSE(std::get<NeighborEventMsg>(msg).isUp);
     EXPECT_EQ(std::get<NeighborEventMsg>(msg).nbrAddr.str(), ipaddr);
   }
 
   // Verify the contents of the two messages in ribInQ_
   {
-    auto msg = folly::coro::blockingWait(this->ribInQ_.pop());
+    auto msg =
+        facebook::bgp::test::boundedBlockingPop(this->ribInQ_, "ribInQ_");
     EXPECT_EQ(std::get<NexthopResolutionUpdate>(msg).resolved.size(), 1);
     EXPECT_EQ(std::get<NexthopResolutionUpdate>(msg).resolved[0].str(), ipaddr);
   }
   {
-    auto msg = folly::coro::blockingWait(this->ribInQ_.pop());
+    auto msg =
+        facebook::bgp::test::boundedBlockingPop(this->ribInQ_, "ribInQ_");
     EXPECT_EQ(std::get<NexthopResolutionUpdate>(msg).unresolved.size(), 1);
     EXPECT_EQ(
         std::get<NexthopResolutionUpdate>(msg).unresolved[0].str(), ipaddr);
@@ -679,7 +683,8 @@ CO_TYPED_TEST(NeighborWatcherTestFixture, SwitchImplicitlyNotReachableTest) {
   // Verify contents of the message. There is nothing
   // inside, so we just get the type of the variant.
   EXPECT_EQ(this->neighborEventQ_.size(), 1);
-  auto msg = folly::coro::blockingWait(this->neighborEventQ_.pop());
+  auto msg = facebook::bgp::test::boundedBlockingPop(
+      this->neighborEventQ_, "neighborEventQ_");
   EXPECT_TRUE(std::holds_alternative<NeighborReachabilityMsg>(msg));
 
   this->cleanUpFsdbPubSub();
@@ -722,7 +727,8 @@ CO_TYPED_TEST(NeighborWatcherTestFixture, SwitchExplicitlyNotReachableTest) {
   // Verify contents of the message. There is nothing
   // inside, so we just get the type of the variant.
   EXPECT_EQ(this->neighborEventQ_.size(), 1);
-  auto msg = folly::coro::blockingWait(this->neighborEventQ_.pop());
+  auto msg = facebook::bgp::test::boundedBlockingPop(
+      this->neighborEventQ_, "neighborEventQ_");
   EXPECT_TRUE(std::holds_alternative<NeighborReachabilityMsg>(msg));
 
   this->cleanUpFsdbPubSub();
@@ -854,7 +860,8 @@ CO_TYPED_TEST(NeighborWatcherTestFixture, fsdbCfgWatcherSub) {
   CO_ASSERT_EQ(this->neighborEventQ_.size(), 1);
 
   // Verify contents of the message
-  auto msg = folly::coro::blockingWait(this->neighborEventQ_.pop());
+  auto msg = facebook::bgp::test::boundedBlockingPop(
+      this->neighborEventQ_, "neighborEventQ_");
   EXPECT_FALSE(std::get<NeighborEventMsg>(msg).isUp);
   EXPECT_EQ(std::get<NeighborEventMsg>(msg).nbrAddr.str(), kCidrNbrV6.str());
 
@@ -1334,7 +1341,7 @@ TYPED_TEST(
 
   // Drain any messages from first update
   while (!this->ribInQ_.empty()) {
-    folly::coro::blockingWait(this->ribInQ_.pop());
+    facebook::bgp::test::boundedBlockingPop(this->ribInQ_, "ribInQ_");
   }
 
   // Now create new interfaceMap with only kInterfaceId1 (kInterfaceId2 is
@@ -1347,13 +1354,15 @@ TYPED_TEST(
 
   // Verify that the entry from interfaceId2 is marked as deleted
   ASSERT_EQ(this->neighborEventQ_.size(), 1);
-  auto msg = folly::coro::blockingWait(this->neighborEventQ_.pop());
+  auto msg = facebook::bgp::test::boundedBlockingPop(
+      this->neighborEventQ_, "neighborEventQ_");
   EXPECT_FALSE(std::get<NeighborEventMsg>(msg).isUp);
   EXPECT_EQ(std::get<NeighborEventMsg>(msg).nbrAddr.str(), "10.0.0.2");
 
   // Verify that the entry from interfaceId2 is marked as deleted in ribInQ_
   ASSERT_EQ(this->ribInQ_.size(), 1);
-  auto ribMsg = folly::coro::blockingWait(this->ribInQ_.pop());
+  auto ribMsg =
+      facebook::bgp::test::boundedBlockingPop(this->ribInQ_, "ribInQ_");
   EXPECT_EQ(std::get<NexthopResolutionUpdate>(ribMsg).unresolved.size(), 1);
   EXPECT_EQ(
       std::get<NexthopResolutionUpdate>(ribMsg).unresolved[0].str(),
@@ -1376,7 +1385,7 @@ TYPED_TEST(
 
   // Drain any messages from first update
   while (!this->ribInQ_.empty()) {
-    folly::coro::blockingWait(this->ribInQ_.pop());
+    facebook::bgp::test::boundedBlockingPop(this->ribInQ_, "ribInQ_");
   }
 
   // Now create new interfaceMap with both kInterfaceId1 and kInterfaceId2
@@ -1401,7 +1410,8 @@ TYPED_TEST(
 
   // Verify that the entry from kInterfaceId2 is marked as added in ribInQ_
   ASSERT_EQ(this->ribInQ_.size(), 1);
-  auto ribMsg = folly::coro::blockingWait(this->ribInQ_.pop());
+  auto ribMsg =
+      facebook::bgp::test::boundedBlockingPop(this->ribInQ_, "ribInQ_");
   EXPECT_EQ(std::get<NexthopResolutionUpdate>(ribMsg).resolved.size(), 1);
   EXPECT_EQ(
       std::get<NexthopResolutionUpdate>(ribMsg).resolved[0].str(), "10.0.0.2");
@@ -1428,7 +1438,8 @@ TYPED_TEST(
 
   // Verify that the entry is marked as added
   ASSERT_EQ(this->ribInQ_.size(), 1);
-  auto ribMsg = folly::coro::blockingWait(this->ribInQ_.pop());
+  auto ribMsg =
+      facebook::bgp::test::boundedBlockingPop(this->ribInQ_, "ribInQ_");
   EXPECT_EQ(std::get<NexthopResolutionUpdate>(ribMsg).resolved.size(), 1);
   EXPECT_EQ(
       std::get<NexthopResolutionUpdate>(ribMsg).resolved[0].str(), "10.0.0.1");
@@ -1451,10 +1462,11 @@ TYPED_TEST(
 
   // Drain any messages from first update
   while (!this->neighborEventQ_.empty()) {
-    folly::coro::blockingWait(this->neighborEventQ_.pop());
+    facebook::bgp::test::boundedBlockingPop(
+        this->neighborEventQ_, "neighborEventQ_");
   }
   while (!this->ribInQ_.empty()) {
-    folly::coro::blockingWait(this->ribInQ_.pop());
+    facebook::bgp::test::boundedBlockingPop(this->ribInQ_, "ribInQ_");
   }
 
   // Now create new interfaceMap:
@@ -1469,7 +1481,8 @@ TYPED_TEST(
   // Verify NexthopResolutionUpdate is pushed to ribInQ_
   // The queue should have one message: NexthopResolutionUpdate
   ASSERT_FALSE(this->ribInQ_.empty());
-  auto ribMsg = folly::coro::blockingWait(this->ribInQ_.pop());
+  auto ribMsg =
+      facebook::bgp::test::boundedBlockingPop(this->ribInQ_, "ribInQ_");
 
   // Verify the message is NexthopResolutionUpdate with correct values
   auto* nexthopUpdate = std::get_if<NexthopResolutionUpdate>(&ribMsg);
@@ -1500,10 +1513,11 @@ TYPED_TEST(
 
   // Drain any messages from first update
   while (!this->neighborEventQ_.empty()) {
-    folly::coro::blockingWait(this->neighborEventQ_.pop());
+    facebook::bgp::test::boundedBlockingPop(
+        this->neighborEventQ_, "neighborEventQ_");
   }
   while (!this->ribInQ_.empty()) {
-    folly::coro::blockingWait(this->ribInQ_.pop());
+    facebook::bgp::test::boundedBlockingPop(this->ribInQ_, "ribInQ_");
   }
 
   // Now call fsdbInterfaceStateCb with the same interfaceMap (no changes)
@@ -1537,7 +1551,7 @@ TYPED_TEST(
 
   // Drain messages from first update
   while (!this->ribInQ_.empty()) {
-    folly::coro::blockingWait(this->ribInQ_.pop());
+    facebook::bgp::test::boundedBlockingPop(this->ribInQ_, "ribInQ_");
   }
 
   // Call again with the same interfaceMap (no changes)

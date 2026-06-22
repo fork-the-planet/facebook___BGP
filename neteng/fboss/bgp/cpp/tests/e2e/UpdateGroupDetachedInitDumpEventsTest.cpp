@@ -109,6 +109,32 @@ TEST_P(UpdateGroupSlowPeerDetectionTest, DetachedInitDump_SlowFreqNoop) {
   bringUpPeer(kPeerAddr3);
 
   /*
+   * Peer3 re-enters the group in DETACHED_INIT_DUMP and runs an independent
+   * init dump sourced from the ShadowRib. Verify it catches up on the routes
+   * it missed while blocked (18.30/18.31/18.32), confirming the detached rib
+   * dump walks the ShadowRib and emits the right entries. Order-independent:
+   * the dump walks the ShadowRib in hash order.
+   */
+  EXPECT_TRUE(verifyRoutes(
+      "v4",
+      kPeerAddr3,
+      {{.prefix = "18.30.0.0",
+        .prefixLen = 16,
+        .expectedNexthop = getExpectedNexthop(kPeerAddr3),
+        .expectedAsPath = "4200000001",
+        .expectedCommunity = "1830:1"},
+       {.prefix = "18.31.0.0",
+        .prefixLen = 16,
+        .expectedNexthop = getExpectedNexthop(kPeerAddr3),
+        .expectedAsPath = "4200000001",
+        .expectedCommunity = "1831:1"},
+       {.prefix = "18.32.0.0",
+        .prefixLen = 16,
+        .expectedNexthop = getExpectedNexthop(kPeerAddr3),
+        .expectedAsPath = "4200000001",
+        .expectedCommunity = "1832:1"}}));
+
+  /*
    * N/A: peer is already detached. Inject more routes to simulate
    * activity -- freq threshold should NOT cause double-detachment.
    */
@@ -239,9 +265,39 @@ TEST_P(UpdateGroupSlowPeerDetectionTest, DetachedInitDump_PlDrain) {
   bringUpPeer(kPeerAddr3);
 
   /*
-   * Peer3 is in DETACHED_INIT_DUMP doing init dump. Drain its queue
-   * to simulate PL drain. The init dump includes shared routes peer3
-   * missed while detached.
+   * Peer3 is in DETACHED_INIT_DUMP and runs an independent init dump sourced
+   * from the ShadowRib. Verify it receives the correct routes: the shared
+   * route it already had (18.40) AND the routes it missed while blocked
+   * (18.41/18.42/18.43). This validates that the detached rib dump walks the
+   * ShadowRib and emits the right entries to the catching-up peer.
+   * Order-independent: the dump walks the ShadowRib in hash order.
+   */
+  EXPECT_TRUE(verifyRoutes(
+      "v4",
+      kPeerAddr3,
+      {{.prefix = "18.40.0.0",
+        .prefixLen = 16,
+        .expectedNexthop = getExpectedNexthop(kPeerAddr3),
+        .expectedAsPath = "4200000001",
+        .expectedCommunity = "1840:1"},
+       {.prefix = "18.41.0.0",
+        .prefixLen = 16,
+        .expectedNexthop = getExpectedNexthop(kPeerAddr3),
+        .expectedAsPath = "4200000001",
+        .expectedCommunity = "1841:1"},
+       {.prefix = "18.42.0.0",
+        .prefixLen = 16,
+        .expectedNexthop = getExpectedNexthop(kPeerAddr3),
+        .expectedAsPath = "4200000001",
+        .expectedCommunity = "1842:1"},
+       {.prefix = "18.43.0.0",
+        .prefixLen = 16,
+        .expectedNexthop = getExpectedNexthop(kPeerAddr3),
+        .expectedAsPath = "4200000001",
+        .expectedCommunity = "1843:1"}}));
+
+  /*
+   * Drain any remaining messages (e.g. EoR) from peer3's init dump queue.
    *
    * Do NOT wait for JOINED_RUNNING -- peers in DETACHED_INIT_DUMP
    * may never reach it (learned pattern).
@@ -357,6 +413,39 @@ TEST_P(UpdateGroupMultiPeerTest, DetachedInitDump_RouteWithdraw) {
   unblockPeer(kPeerAddr3);
   bringUpPeer(kPeerAddr3);
 
+  /*
+   * Peer3 re-enters the group in DETACHED_INIT_DUMP and runs an independent
+   * init dump sourced from the ShadowRib. Verify it receives the full set
+   * still in the ShadowRib -- the shared route it already had (71.1) and the
+   * routes it missed while blocked (71.2/71.3/71.4) -- before the withdrawal
+   * races in, confirming the detached rib dump walks the ShadowRib and emits
+   * the right entries. Order-independent: the dump walks the ShadowRib in hash
+   * order.
+   */
+  EXPECT_TRUE(verifyRoutes(
+      "v4",
+      kPeerAddr3,
+      {{.prefix = "71.1.0.0",
+        .prefixLen = 16,
+        .expectedNexthop = getExpectedNexthop(kPeerAddr3),
+        .expectedAsPath = "4200000001",
+        .expectedCommunity = "7101:1"},
+       {.prefix = "71.2.0.0",
+        .prefixLen = 16,
+        .expectedNexthop = getExpectedNexthop(kPeerAddr3),
+        .expectedAsPath = "4200000001",
+        .expectedCommunity = "7102:1"},
+       {.prefix = "71.3.0.0",
+        .prefixLen = 16,
+        .expectedNexthop = getExpectedNexthop(kPeerAddr3),
+        .expectedAsPath = "4200000001",
+        .expectedCommunity = "7103:1"},
+       {.prefix = "71.4.0.0",
+        .prefixLen = 16,
+        .expectedNexthop = getExpectedNexthop(kPeerAddr3),
+        .expectedAsPath = "4200000001",
+        .expectedCommunity = "7104:1"}}));
+
   /* Withdraw the shared route while peer3 is reconnecting */
   withdrawLocalRoutesAtRuntime({"71.1.0.0/16"});
 
@@ -428,6 +517,32 @@ TEST_P(UpdateGroupMultiPeerTest, DetachedInitDump_Unblock_NA) {
   EXPECT_TRUE(waitForPeerState(kPeerAddr3, PeerUpdateState::DOWN));
   unblockPeer(kPeerAddr3);
   bringUpPeer(kPeerAddr3);
+
+  /*
+   * Peer3 re-enters the group in DETACHED_INIT_DUMP and runs an independent
+   * init dump sourced from the ShadowRib. Verify it catches up on the routes
+   * it missed while blocked (71.10/71.11/71.12), confirming the detached rib
+   * dump walks the ShadowRib and emits the right entries. Order-independent:
+   * the dump walks the ShadowRib in hash order.
+   */
+  EXPECT_TRUE(verifyRoutes(
+      "v4",
+      kPeerAddr3,
+      {{.prefix = "71.10.0.0",
+        .prefixLen = 16,
+        .expectedNexthop = getExpectedNexthop(kPeerAddr3),
+        .expectedAsPath = "4200000001",
+        .expectedCommunity = "7110:1"},
+       {.prefix = "71.11.0.0",
+        .prefixLen = 16,
+        .expectedNexthop = getExpectedNexthop(kPeerAddr3),
+        .expectedAsPath = "4200000001",
+        .expectedCommunity = "7111:1"},
+       {.prefix = "71.12.0.0",
+        .prefixLen = 16,
+        .expectedNexthop = getExpectedNexthop(kPeerAddr3),
+        .expectedAsPath = "4200000001",
+        .expectedCommunity = "7112:1"}}));
 
   /* Unblock on reconnecting peer -- should be a no-op */
   unblockPeer(kPeerAddr3);

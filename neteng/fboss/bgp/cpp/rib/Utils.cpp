@@ -16,6 +16,12 @@
 
 #include "neteng/fboss/bgp/cpp/rib/Utils.h"
 
+#include "fboss/agent/AddressUtil.h"
+#include "neteng/fboss/bgp/cpp/BgpServiceUtil.h"
+
+using namespace facebook::neteng::fboss::bgp_attr;
+using namespace facebook::neteng::fboss::bgp::thrift;
+
 namespace facebook::bgp {
 
 int32_t getMinSupportRoutes(
@@ -93,6 +99,40 @@ std::pair<uint32_t, uint32_t> findLargestFreePathIdInterval(
     }
   }
   return {left, right};
+}
+
+TIpPrefix buildTPrefix(const folly::CIDRNetwork& prefix) {
+  TIpPrefix tPrefix;
+  tPrefix.afi() = prefix.first.isV4() ? TBgpAfi::AFI_IPV4 : TBgpAfi::AFI_IPV6;
+  tPrefix.num_bits() = prefix.second;
+  tPrefix.prefix_bin() =
+      facebook::network::toBinaryAddress(prefix.first).addr()->toStdString();
+  return tPrefix;
+}
+
+TBgpPath toTBgpPath(
+    const std::shared_ptr<RouteInfo>& routeinfo,
+    const std::shared_ptr<const WeightedNexthopMap>& weightedNexthops) {
+  auto tPath = createTBgpPath(*(routeinfo->attrs));
+  tPath.router_id() = routeinfo->peer.routerId;
+  tPath.peer_id() = createTIpPrefix(routeinfo->peer.addr);
+  tPath.peer_description() = routeinfo->peer.description;
+  if (weightedNexthops) {
+    auto it = weightedNexthops->find(routeinfo->peer.addr);
+    if (it != weightedNexthops->end()) {
+      tPath.next_hop_weight() = it->second;
+    }
+  }
+  if (routeinfo->isNextHopReachable()) {
+    tPath.igp_cost() = routeinfo->getIgpCostValue();
+  }
+  tPath.bestpath_filter_descr() = routeinfo->getBestPathFilterDescr();
+  tPath.last_modified_time() = routeinfo->lastModifiedTime_;
+  tPath.path_id() = routeinfo->receivedPathId;
+  if (routeinfo->pathIdToSend.has_value()) {
+    tPath.path_id_to_send() = routeinfo->pathIdToSend.value();
+  }
+  return tPath;
 }
 
 } // namespace facebook::bgp

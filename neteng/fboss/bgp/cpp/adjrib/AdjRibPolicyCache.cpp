@@ -81,6 +81,9 @@ std::size_t AdjRibPolicyCache::PolicyCacheMaskedKeyHash::operator()(
   if (policyActionData) {
     seed = folly::hash::hash_combine(seed, policyActionData->hash());
   }
+  // Always hash the partial-drain bit: it reflects a community mutation made
+  // outside policy evaluation and is not captured by the masked attrs above.
+  seed = folly::hash::hash_combine(seed, std::get<4>(key));
   return seed;
 }
 
@@ -102,6 +105,12 @@ bool AdjRibPolicyCache::PolicyCacheMaskedKeyEqualTo::operator()(
   auto& lhsData = std::get<3>(lhs);
   auto& rhsData = std::get<3>(rhs);
   if (!(lhsData == rhsData || (lhsData && rhsData && (*lhsData == *rhsData)))) {
+    return false;
+  }
+
+  // Partial-drain state must match: it reflects an out-of-policy community
+  // mutation not captured by the masked attribute comparison below.
+  if (std::get<4>(lhs) != std::get<4>(rhs)) {
     return false;
   }
 
@@ -186,7 +195,8 @@ AdjRibPolicyCache::lookupPolicyCache(
     const PolicyAttributesMask* mask,
     const folly::CIDRNetwork& prefix,
     std::shared_ptr<const BgpPath> attrs,
-    const std::shared_ptr<BgpPolicyActionData>& policyActionData) {
+    const std::shared_ptr<BgpPolicyActionData>& policyActionData,
+    bool isPartialDrain) {
   if (maxCacheSize_ == 0) {
     return std::nullopt;
   }
@@ -196,7 +206,7 @@ AdjRibPolicyCache::lookupPolicyCache(
       policyName,
       folly::IPAddress::networkToString(prefix));
   auto key = AdjRibPolicyCache::PolicyCacheMaskedKey(
-      mask, prefix, std::move(attrs), policyActionData);
+      mask, prefix, std::move(attrs), policyActionData, isPartialDrain);
 
   // Use wlock() for non-const operations
   auto guard = policyLruCache_.wlock();
@@ -217,7 +227,8 @@ void AdjRibPolicyCache::addToPolicyCache(
     std::shared_ptr<const BgpPath> attrs,
     const std::shared_ptr<BgpPolicyActionData>& policyActionData,
     std::shared_ptr<const routing::AttributesAndPolicy<BgpPath>>
-        postPolicyAttrsAndTerm) {
+        postPolicyAttrsAndTerm,
+    bool isPartialDrain) {
   static uint32_t totalRuns = 0;
 
   if (maxCacheSize_ == 0) {
@@ -236,7 +247,11 @@ void AdjRibPolicyCache::addToPolicyCache(
   }
 
   auto key = AdjRibPolicyCache::PolicyCacheMaskedKey(
-      mask, folly::CIDRNetwork(prefix), std::move(attrs), policyActionData);
+      mask,
+      folly::CIDRNetwork(prefix),
+      std::move(attrs),
+      policyActionData,
+      isPartialDrain);
   auto value = AdjRibPolicyCache::PolicyCacheValue{
       postPolicyAttrsAndTerm,
       policyActionData ? policyActionData->isMedSetByPolicy : false,

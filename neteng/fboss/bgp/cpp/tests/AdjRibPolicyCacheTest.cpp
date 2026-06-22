@@ -79,6 +79,7 @@
 #include "fboss/lib/CommonUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/AdjRibInUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/AdjRibOutUtils.h"
+#include "neteng/fboss/bgp/cpp/tests/BoundedWaitUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/PolicyUtils.h"
 
 using facebook::network::toIPPrefix;
@@ -155,9 +156,10 @@ TEST_F(AdjRibPolicyCacheFixture, PolicyCacheMaskedKeyHashTest) {
   // For readability and auto-populating policyActionData.
   auto MaskedKey = [&](const PolicyAttributesMask& mask,
                        const folly::CIDRNetwork& prefix,
-                       std::shared_ptr<const BgpPath> path) {
+                       std::shared_ptr<const BgpPath> path,
+                       bool isPartialDrain = false) {
     return AdjRibPolicyCache::PolicyCacheMaskedKey(
-        &mask, prefix, path, nullptr /* policyActionData */);
+        &mask, prefix, path, nullptr /* policyActionData */, isPartialDrain);
   };
   AdjRibPolicyCache::PolicyCacheMaskedKeyHash hasher{};
   // BEGIN TEST CASES
@@ -231,10 +233,23 @@ TEST_F(AdjRibPolicyCacheFixture, PolicyCacheMaskedKeyHashTest) {
   EXPECT_EQ(
       hasher(
           AdjRibPolicyCache::PolicyCacheMaskedKey(
-              &mask5Attrs, kV4Prefix1, path1, data1)),
+              &mask5Attrs, kV4Prefix1, path1, data1, /*isPartialDrain=*/false)),
       hasher(
           AdjRibPolicyCache::PolicyCacheMaskedKey(
-              &mask5Attrs, kV4Prefix1, path1, data2)));
+              &mask5Attrs,
+              kV4Prefix1,
+              path1,
+              data2,
+              /*isPartialDrain=*/false)));
+
+  // isPartialDrain differs => different hash. The drain community is mutated
+  // outside policy evaluation, so it is not captured by the masked attrs or
+  // policyActionData; keying on isPartialDrain keeps the two states distinct.
+  EXPECT_NE(
+      hasher(
+          MaskedKey(mask5Attrs, kV4Prefix1, path1, /*isPartialDrain=*/false)),
+      hasher(
+          MaskedKey(mask5Attrs, kV4Prefix1, path1, /*isPartialDrain=*/true)));
 }
 
 /**
@@ -298,9 +313,10 @@ TEST_F(AdjRibPolicyCacheFixture, PolicyCacheMaskedKeyEqualToTest) {
   // For readability and auto-populating policyActionData.
   auto MaskedKey = [&](const PolicyAttributesMask& mask,
                        const folly::CIDRNetwork& prefix,
-                       std::shared_ptr<const BgpPath> path) {
+                       std::shared_ptr<const BgpPath> path,
+                       bool isPartialDrain = false) {
     return AdjRibPolicyCache::PolicyCacheMaskedKey(
-        &mask, prefix, path, nullptr /* policyActionData */);
+        &mask, prefix, path, nullptr /* policyActionData */, isPartialDrain);
   };
   AdjRibPolicyCache::PolicyCacheMaskedKeyEqualTo maskedEquals{};
   // BEGIN TEST CASES
@@ -374,9 +390,19 @@ TEST_F(AdjRibPolicyCacheFixture, PolicyCacheMaskedKeyEqualToTest) {
   EXPECT_TRUE(*data1 == *data2);
   EXPECT_TRUE(maskedEquals(
       AdjRibPolicyCache::PolicyCacheMaskedKey(
-          &mask5Attrs, kV4Prefix1, path1, data1),
+          &mask5Attrs, kV4Prefix1, path1, data1, /*isPartialDrain=*/false),
       AdjRibPolicyCache::PolicyCacheMaskedKey(
-          &mask5Attrs, kV4Prefix1, path1, data2)));
+          &mask5Attrs, kV4Prefix1, path1, data2, /*isPartialDrain=*/false)));
+
+  // isPartialDrain differs => keys are NOT equal, even though every masked
+  // attribute is identical.
+  EXPECT_FALSE(maskedEquals(
+      MaskedKey(mask5Attrs, kV4Prefix1, path1, /*isPartialDrain=*/false),
+      MaskedKey(mask5Attrs, kV4Prefix1, path1, /*isPartialDrain=*/true)));
+  // Same isPartialDrain => keys remain equal.
+  EXPECT_TRUE(maskedEquals(
+      MaskedKey(mask5Attrs, kV4Prefix1, path1, /*isPartialDrain=*/true),
+      MaskedKey(mask5Attrs, kV4Prefix1, path1, /*isPartialDrain=*/true)));
 }
 
 TEST_F(AdjRibPolicyCacheFixture, PrefixMaskTest) {
@@ -394,9 +420,9 @@ TEST_F(AdjRibPolicyCacheFixture, PrefixMaskTest) {
   // Case 1: Ignoring prefix
   {
     AdjRibPolicyCache::PolicyCacheMaskedKey key1(
-        &noPrefix, kV4Prefix1, path, nullptr /* policyActionData */);
+        &noPrefix, kV4Prefix1, path, nullptr /* policyActionData */, false);
     AdjRibPolicyCache::PolicyCacheMaskedKey key2(
-        &noPrefix, kV4Prefix2, path, nullptr /* policyActionData */);
+        &noPrefix, kV4Prefix2, path, nullptr /* policyActionData */, false);
 
     EXPECT_EQ(hasher(key1), hasher(key1));
     EXPECT_TRUE(equals(key1, key1));
@@ -409,9 +435,9 @@ TEST_F(AdjRibPolicyCacheFixture, PrefixMaskTest) {
   // Case 2: Including prefix
   {
     AdjRibPolicyCache::PolicyCacheMaskedKey key1(
-        &withPrefix, kV4Prefix1, path, nullptr /* policyActionData */);
+        &withPrefix, kV4Prefix1, path, nullptr /* policyActionData */, false);
     AdjRibPolicyCache::PolicyCacheMaskedKey key2(
-        &withPrefix, kV4Prefix2, path, nullptr /* policyActionData */);
+        &withPrefix, kV4Prefix2, path, nullptr /* policyActionData */, false);
 
     EXPECT_EQ(hasher(key1), hasher(key1));
     EXPECT_TRUE(equals(key1, key1));
@@ -491,7 +517,8 @@ TEST_F(AdjRibOutPolicyCacheFixture, PolicyCacheLruEviction) {
       adjRib_->processRibMessage(ribMsg);
     }
     {
-      pfx1EgpUpdateBaton.wait();
+      facebook::bgp::test::boundedBatonWait(
+          pfx1EgpUpdateBaton, "pfx1EgpUpdateBaton");
       // Announcement 2 (EGP origin) for prefix1 will be accepted by
       // policy
       auto ribMsg = createRibSingleAnnounce(
@@ -503,7 +530,8 @@ TEST_F(AdjRibOutPolicyCacheFixture, PolicyCacheLruEviction) {
       adjRib_->processRibMessage(ribMsg);
     }
     {
-      pfx2EgpUpdateBaton.wait();
+      facebook::bgp::test::boundedBatonWait(
+          pfx2EgpUpdateBaton, "pfx2EgpUpdateBaton");
       // Announcement 3 (EGP origin) for prefix2 will be accepted by
       // policy
       auto ribMsg = createRibSingleAnnounce(
@@ -515,7 +543,8 @@ TEST_F(AdjRibOutPolicyCacheFixture, PolicyCacheLruEviction) {
       adjRib_->processRibMessage(ribMsg);
     }
     {
-      pfx3IncompleteUpdateBaton.wait();
+      facebook::bgp::test::boundedBatonWait(
+          pfx3IncompleteUpdateBaton, "pfx3IncompleteUpdateBaton");
       // Announcement 3 (origin INCOMPLETE) for prefix3 will be accepted by
       // policy
       auto ribMsg = createRibSingleAnnounce(
@@ -531,9 +560,10 @@ TEST_F(AdjRibOutPolicyCacheFixture, PolicyCacheLruEviction) {
   fm_->addTask([&] {
     // Announcement 1 will not lead to any bgp update but
     // we should see v4 and v6 EoRs
-    auto msg = folly::coro::blockingWait(adjRibOutQ_->pop());
+    auto msg =
+        facebook::bgp::test::boundedBlockingPop(*adjRibOutQ_, "adjRibOutQ_");
     ASSERT_TRUE(std::holds_alternative<BgpEndOfRib>(*msg));
-    msg = folly::coro::blockingWait(adjRibOutQ_->pop());
+    msg = facebook::bgp::test::boundedBlockingPop(*adjRibOutQ_, "adjRibOutQ_");
     ASSERT_TRUE(std::holds_alternative<BgpEndOfRib>(*msg));
 
     EXPECT_TRUE(adjRibOutQ_->empty());
@@ -561,7 +591,7 @@ TEST_F(AdjRibOutPolicyCacheFixture, PolicyCacheLruEviction) {
     pfx1EgpUpdateBaton.post();
     fiberSleepFor(10ms);
     // Verifying only after Announcement 2 is sent
-    msg = folly::coro::blockingWait(adjRibOutQ_->pop());
+    msg = facebook::bgp::test::boundedBlockingPop(*adjRibOutQ_, "adjRibOutQ_");
     ASSERT_TRUE(
         std::holds_alternative<std::shared_ptr<const BgpUpdate2>>(*msg));
     auto bgpUpdate = std::get<std::shared_ptr<const BgpUpdate2>>(*msg);
@@ -666,7 +696,7 @@ TEST_F(AdjRibOutPolicyCacheFixture, PolicyCacheLruEviction) {
     // belong to prefix1.
     pfx2EgpUpdateBaton.post();
     fiberSleepFor(10ms);
-    msg = folly::coro::blockingWait(adjRibOutQ_->pop());
+    msg = facebook::bgp::test::boundedBlockingPop(*adjRibOutQ_, "adjRibOutQ_");
     EXPECT_EQ(2, adjRib_->policyCache_->size());
     {
       adjRibEntry = adjRib_->getRibEntry(/*ingress=*/false, kV4Prefix1);
@@ -698,7 +728,7 @@ TEST_F(AdjRibOutPolicyCacheFixture, PolicyCacheLruEviction) {
     // prefix1.
     pfx3IncompleteUpdateBaton.post();
     fiberSleepFor(10ms);
-    msg = folly::coro::blockingWait(adjRibOutQ_->pop());
+    msg = facebook::bgp::test::boundedBlockingPop(*adjRibOutQ_, "adjRibOutQ_");
     EXPECT_EQ(2, adjRib_->policyCache_->size());
     {
       adjRibEntry = adjRib_->getRibEntry(/*ingress=*/false, kV4Prefix3);
@@ -774,9 +804,10 @@ TEST_F(AdjRibOutPolicyCacheFixture, PolicyCacheStaleEviction) {
   fm_->addTask([&] {
     // Announcement 1 will not lead to any bgp update but
     // we should see v4 and v6 EoRs
-    auto msg = folly::coro::blockingWait(adjRibOutQ_->pop());
+    auto msg =
+        facebook::bgp::test::boundedBlockingPop(*adjRibOutQ_, "adjRibOutQ_");
     ASSERT_TRUE(std::holds_alternative<BgpEndOfRib>(*msg));
-    msg = folly::coro::blockingWait(adjRibOutQ_->pop());
+    msg = facebook::bgp::test::boundedBlockingPop(*adjRibOutQ_, "adjRibOutQ_");
     ASSERT_TRUE(std::holds_alternative<BgpEndOfRib>(*msg));
 
     EXPECT_TRUE(adjRibOutQ_->empty());
@@ -804,7 +835,7 @@ TEST_F(AdjRibOutPolicyCacheFixture, PolicyCacheStaleEviction) {
     baton.post();
     fiberSleepFor(10ms);
     // Verifying only after Announcement 2 is sent
-    msg = folly::coro::blockingWait(adjRibOutQ_->pop());
+    msg = facebook::bgp::test::boundedBlockingPop(*adjRibOutQ_, "adjRibOutQ_");
     ASSERT_TRUE(
         std::holds_alternative<std::shared_ptr<const BgpUpdate2>>(*msg));
     auto bgpUpdate = std::get<std::shared_ptr<const BgpUpdate2>>(*msg);
@@ -1447,7 +1478,8 @@ TEST_F(AdjRibOutPolicyCacheFixture, MatchOriginEgpSetMedExpectedCacheHitTest) {
         policy->getPolicyAttributesMask(kEgressPolicyName),
         prefix,
         path,
-        adjRib_->createPolicyActionData(entry->getPreOut()));
+        adjRib_->createPolicyActionData(entry->getPreOut()),
+        /*isPartialDrain=*/false);
     auto guard = adjRib_->policyCache_->policyLruCache_.wlock();
     auto iter = guard->find(key);
     if (iter == guard->end()) {
@@ -1552,7 +1584,8 @@ TEST_F(AdjRibOutPolicyCacheFixture, MatchOriginEgpSetMedExpectedCacheMissTest) {
         policy->getPolicyAttributesMask(kEgressPolicyName),
         prefix,
         path,
-        adjRib_->createPolicyActionData(entry->getPreOut()));
+        adjRib_->createPolicyActionData(entry->getPreOut()),
+        /*isPartialDrain=*/false);
     auto guard = adjRib_->policyCache_->policyLruCache_.wlock();
     auto iter = guard->find(key);
     if (iter == guard->end()) {
@@ -1667,7 +1700,8 @@ TEST_F(AdjRibPolicyCacheFixture, MatchOriginEgpSetMedNoopTest) {
       policy->getPolicyAttributesMask(kEgressPolicyName),
       kV4Prefix1,
       path1,
-      adjRib_->createPolicyActionData(adjRibEntry->getPreOut()));
+      adjRib_->createPolicyActionData(adjRibEntry->getPreOut()),
+      /*isPartialDrain=*/false);
   auto guard = adjRib_->policyCache_->policyLruCache_.wlock();
   auto iter = guard->find(key);
 
@@ -1730,7 +1764,8 @@ TEST_F(AdjRibPolicyCacheFixture, CheckIsMedSetByPolicyWithRejectedTest) {
       policy->getPolicyAttributesMask(kEgressPolicyName),
       kV4Prefix1,
       path1,
-      adjRib_->createPolicyActionData(adjRibEntry->getPreOut()));
+      adjRib_->createPolicyActionData(adjRibEntry->getPreOut()),
+      /*isPartialDrain=*/false);
   auto guard = adjRib_->policyCache_->policyLruCache_.wlock();
   auto iter = guard->find(key);
 

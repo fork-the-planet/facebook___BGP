@@ -51,6 +51,12 @@ class NexthopInfoBase {
   virtual std::optional<uint32_t> getIgpCost() const = 0;
 
   virtual std::optional<bool> isConnected() const = 0;
+
+  /**
+   * @brief Whether the nexthop is resolved for best-path selection.
+   * @return true if the nexthop is eligible for best-path selection
+   */
+  virtual bool isResolvedForSelection() const = 0;
 };
 
 } // namespace facebook::bgp

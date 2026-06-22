@@ -30,6 +30,7 @@
 #include "neteng/fboss/bgp/cpp/common/RibMessage.h"
 #include "neteng/fboss/bgp/cpp/policy/PolicyManager.h"
 #include "neteng/fboss/bgp/cpp/tests/AdjRibInUtils.h"
+#include "neteng/fboss/bgp/cpp/tests/BoundedWaitUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/PolicyUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/Utils.h"
 
@@ -62,7 +63,7 @@ TEST_F(AdjRibInboundFixture, PeerLinkBandwidthBps) {
     adjRibInQ_->fiberPush(std::move(update));
 
     // Verify rib In message
-    auto msg = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
     auto announcement = std::get<RibInAnnouncement>(msg);
     EXPECT_EQ(kPeerAddr1, announcement.peer.addr);
@@ -101,7 +102,7 @@ TEST_F(AdjRibInboundFixture, ReceiveLinkBandwidth) {
       adjRibInQ_->fiberPush(std::move(update));
 
       // Verify rib In message
-      auto msg = folly::coro::blockingWait(ribInQ_.pop());
+      auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
       auto announcement = std::get<RibInAnnouncement>(msg);
       EXPECT_EQ(kPeerAddr1, announcement.peer.addr);
@@ -111,7 +112,8 @@ TEST_F(AdjRibInboundFixture, ReceiveLinkBandwidth) {
       // Enqueue messages for stop sequence
       terminateAdjRib();
 
-      auto msgWithdrawal = folly::coro::blockingWait(ribInQ_.pop());
+      auto msgWithdrawal =
+          facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       EXPECT_TRUE(std::holds_alternative<RibInWithdrawal>(msgWithdrawal));
     });
 
@@ -130,7 +132,7 @@ TEST_F(AdjRibInboundFixture, ReceiveLinkBandwidth) {
       adjRibInQ_->fiberPush(std::move(update));
 
       // Verify rib In message
-      auto msg = folly::coro::blockingWait(ribInQ_.pop());
+      auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
       auto announcement = std::get<RibInAnnouncement>(msg);
       EXPECT_EQ(kPeerAddr1, announcement.peer.addr);
@@ -145,7 +147,8 @@ TEST_F(AdjRibInboundFixture, ReceiveLinkBandwidth) {
       // Enqueue messages for stop sequence
       terminateAdjRib();
 
-      auto msgWithdrawal = folly::coro::blockingWait(ribInQ_.pop());
+      auto msgWithdrawal =
+          facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(msgWithdrawal));
     });
 
@@ -164,7 +167,7 @@ TEST_F(AdjRibInboundFixture, ReceiveLinkBandwidth) {
       adjRibInQ_->fiberPush(std::move(update));
 
       // Verify rib In message
-      auto msg = folly::coro::blockingWait(ribInQ_.pop());
+      auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
       auto announcement = std::get<RibInAnnouncement>(msg);
       EXPECT_EQ(kPeerAddr1, announcement.peer.addr);
@@ -181,7 +184,8 @@ TEST_F(AdjRibInboundFixture, ReceiveLinkBandwidth) {
       // Enqueue messages for stop sequence
       terminateAdjRib();
 
-      auto msgWithdrawal = folly::coro::blockingWait(ribInQ_.pop());
+      auto msgWithdrawal =
+          facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(msgWithdrawal));
     });
 
@@ -197,10 +201,11 @@ TEST_F(AdjRibInboundFixture, ReceiveLinkBandwidth) {
       auto update = createV4BgpUpdateSingleAnnounce(kV4Prefix1, kV4Nexthop1);
       adjRibInQ_->fiberPush(std::move(update));
 
-      auto msg = folly::coro::blockingWait(ribInQ_.pop());
+      auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       terminateAdjRib();
 
-      auto msgWithdrawal = folly::coro::blockingWait(ribInQ_.pop());
+      auto msgWithdrawal =
+          facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
 
       // Cover the case that BgpPath is nullptr
       adjRib_->updateReceiveLbwExtCommunity(nullptr);
@@ -394,7 +399,7 @@ TEST_P(IngressUcmpPolicyFixture, IngressUcmpPolicy) {
 
       // Verify rib In message, expect 2 msgs out, one for each prefix
       for (int i = 0; i < 2; ++i) {
-        auto msg = folly::coro::blockingWait(ribInQ_.pop());
+        auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
         ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
         auto announcement = std::get<RibInAnnouncement>(msg);
         EXPECT_EQ(kPeerAddr1, announcement.peer.addr);
@@ -416,7 +421,8 @@ TEST_P(IngressUcmpPolicyFixture, IngressUcmpPolicy) {
       // Enqueue messages for stop sequence
       terminateAdjRib();
 
-      auto msgWithdrawal = folly::coro::blockingWait(ribInQ_.pop());
+      auto msgWithdrawal =
+          facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(msgWithdrawal));
     });
 
@@ -478,7 +484,7 @@ TEST_F(AdjRibInboundFixture, IngressUcmpPolicyRouteUpdate) {
 
     {
       // Verify rib In message
-      auto msg = folly::coro::blockingWait(ribInQ_.pop());
+      auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
       auto announcement = std::get<RibInAnnouncement>(msg);
       EXPECT_EQ(kPeerAddr1, announcement.peer.addr);
@@ -504,7 +510,7 @@ TEST_F(AdjRibInboundFixture, IngressUcmpPolicyRouteUpdate) {
 
     {
       // Verify rib In message
-      auto msg = folly::coro::blockingWait(ribInQ_.pop());
+      auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
       ASSERT_TRUE(std::holds_alternative<RibInAnnouncement>(msg));
       auto announcement = std::get<RibInAnnouncement>(msg);
       EXPECT_EQ(kPeerAddr1, announcement.peer.addr);
@@ -522,7 +528,8 @@ TEST_F(AdjRibInboundFixture, IngressUcmpPolicyRouteUpdate) {
     // Enqueue messages for stop sequence
     terminateAdjRib();
 
-    auto msgWithdrawal = folly::coro::blockingWait(ribInQ_.pop());
+    auto msgWithdrawal =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(std::holds_alternative<RibInWithdrawal>(msgWithdrawal));
   });
 

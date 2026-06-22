@@ -22,6 +22,7 @@
 #include <boost/noncopyable.hpp>
 #include <fboss/lib/RadixTree.h>
 #include <fmt/core.h>
+#include <folly/CancellationToken.h>
 #include <folly/IPAddress.h>
 #include <folly/Singleton.h>
 #include <folly/container/F14Map.h>
@@ -293,6 +294,61 @@ class AdjRib : boost::noncopyable,
 
   virtual folly::coro::Task<void> stop() noexcept;
 
+  /*
+   * Clean up GR state (timers and stale routes) without joining the
+   * asyncScope_. Use this when a neighbor goes DOWN while in GR state
+   * (Double Failure / DSF fast teardown) — the coroutines have already
+   * exited during normal session teardown, so cancelAndJoinAsync() is
+   * unnecessary and would cause a double-join hang if stop() is later
+   * called again during daemon shutdown.
+   *
+   * @param isDaemonShutdown When true, skips cleanupStaleRoutes() because
+   *        RIB is already stopped and nonCancellablePush would hang.
+   */
+  virtual folly::coro::Task<void> cleanupGrState(
+      bool isDaemonShutdown) noexcept;
+
+  /*
+   * Whether a rib dump is currently scheduled or in flight for this peer: a
+   * cancellation source exists and has not been cancelled.
+   */
+  bool isRibDumpScheduled() const noexcept {
+    return ribDumpCancellationSource_.has_value() &&
+        !ribDumpCancellationSource_->isCancellationRequested();
+  }
+
+  /*
+   * Create a fresh cancellation source for a newly scheduled rib dump and
+   * return its token to pass into PeerManager's asyncScope_ when scheduling the
+   * dump.
+   */
+  folly::CancellationToken getCancellationTokenForNewRibDump() noexcept {
+    ribDumpCancellationSource_.emplace();
+    return ribDumpCancellationSource_->getToken();
+  }
+
+  /*
+   * Cancel an in-flight rib dump (e.g. on session teardown, or when superseding
+   * it with a newer dump) and clear the source so a subsequent dump can be
+   * scheduled. The in-flight task's token still observes the cancellation (the
+   * underlying state outlives the source via the token).
+   */
+  void cancelRibDump() noexcept {
+    if (ribDumpCancellationSource_) {
+      ribDumpCancellationSource_->requestCancellation();
+      ribDumpCancellationSource_.reset();
+    }
+  }
+
+  /*
+   * Clear rib-dump tracking on normal completion so a subsequent dump can be
+   * scheduled. The caller MUST only invoke this when its own task was not
+   * cancelled (a superseded/stopped task must not overwrite a newer one).
+   */
+  void resetRibDumpCancellationSource() noexcept {
+    ribDumpCancellationSource_.reset();
+  }
+
   // Called when BGP session gets established with new queue details
   void sessionEstablished(
       const std::optional<uint16_t>& remoteGrRestartTime,
@@ -341,23 +397,17 @@ class AdjRib : boost::noncopyable,
       uint32_t pathId = kDefaultPathID) noexcept;
 
   /*
-   * Look up an egress RIB-OUT entry, checking peer-owned entries first
-   * then falling back to group-owned entries. This ensures detached peers
-   * sharing group entries can find them during update processing.
+   * Look up an egress RIB-OUT entry when update groups are enabled.
+   * Checks peer-owned entries first, then falls back to group-owned entries.
+   * This ensures detached peers sharing group entries can find them during
+   * update processing.
    *
-   * When copyOnWriteIfShared is true and the entry is a shared group entry,
-   * it is cloned to a per-peer entry before being returned.
-   * This is needed when the caller modifies the entry (e.g. updating attributes
-   * on re-announcement).
-   *
-   * copyOnWriteIfShared should be false when the caller
-   * only needs to read the entry, such as when moving a detached peer from
-   * one group to another.
+   * If the entry is a shared group entry, it is cloned to a per-peer entry
+   * before being returned so the caller can safely modify it.
    */
-  std::pair<AdjRibEntry * FOLLY_NULLABLE, bool> getRibOutEntry(
+  AdjRibEntry* FOLLY_NULLABLE getRibEntryWithUpdateGroup(
       const folly::CIDRNetwork& prefix,
-      uint32_t pathId = kDefaultPathID,
-      bool copyOnWriteIfShared = true) noexcept;
+      uint32_t pathId = kDefaultPathID) noexcept;
 
   /**
    * Create an AdjRibOutOwnerKey for this peer.
@@ -525,8 +575,8 @@ class AdjRib : boost::noncopyable,
     return pendingIngressPolicyUpdate_;
   }
 
-  bool isPendingEgressPolicyUpdate() const {
-    return pendingEgressPolicyUpdate_;
+  bool isEgressPolicyUpdateRequired() const {
+    return egressPolicyUpdateRequired_;
   }
 
   // Helper methods to clear pending policy update flags
@@ -535,7 +585,7 @@ class AdjRib : boost::noncopyable,
   }
 
   void clearPendingEgressPolicyUpdate() {
-    pendingEgressPolicyUpdate_ = false;
+    egressPolicyUpdateRequired_ = false;
   }
 
   /**
@@ -823,8 +873,11 @@ class AdjRib : boost::noncopyable,
 
   void processShadowRibEntryChange(ShadowRibEntry& srEntry) noexcept;
 
-  // process a single Rib Update
-  void processRibMessage(const RibOutMessage& update) noexcept;
+  /*
+   * process a single Rib Update. virtual so tests can spy on rib-dump delivery
+   * via MockAdjRib.
+   */
+  virtual void processRibMessage(const RibOutMessage& update) noexcept;
 
   void enableEgressQueueBackpressure(bool enable) {
     enableEgressQueueBackpressure_ = enable;
@@ -843,6 +896,15 @@ class AdjRib : boost::noncopyable,
    * before exiting sendBgpUpdates.
    */
   void scheduleSendBgpUpdates(bool tryPullNewChangeItems) noexcept;
+
+  /*
+   * Schedule deferredPushToPeer on the AdjRib's asyncScope_.
+   * Called by AdjRibOutGroup::tryPushToPeer when the peer's queue is blocked.
+   * Returns false if scheduling failed (asyncScope null or cancelled),
+   * so the caller can avoid leaving the blocked bitmap bit set.
+   */
+  bool scheduleDeferredPushToPeer(
+      nettools::bgplib::FiberBgpPeer::InputMessageT message) noexcept;
 
   /*
    * Get the peer's bit position within the update group
@@ -898,6 +960,11 @@ class AdjRib : boost::noncopyable,
   }
 
   /*
+   * Build and set the UpdateGroupKey from the peer's current state.
+   */
+  const UpdateGroupKey& buildAndSetUpdateGroupKey();
+
+  /*
    * Get the bounded output queue (for backpressure-aware distribution)
    */
   std::shared_ptr<BoundedAdjRibOutQueueT> getBoundedAdjRibOutQueue() const {
@@ -951,12 +1018,27 @@ class AdjRib : boost::noncopyable,
    *        dump (DETACHED_INIT_DUMP), not via detachSlowPeer. During collapse,
    *        all group-only entries must be announced since the peer has no
    *        meaningful detachedRibVersion.
-   * Bits 3-31: Reserved for future use.
+   * Bit 3: SCHEDULED_PUSH_TO_PEER — a sendBgpUpdates or
+   *        deferredPushToPeer coroutine is pending for this peer.
+   *        Set when scheduled, cleared when the coroutine completes.
+   *        While set, processRibDumpReq skips activateChangeListConsumer
+   *        to avoid racing with the pending push.
+   *        These two coroutines are mutually exclusive by peer state:
+   *        sendBgpUpdates runs only for detached peers (draining their
+   *        independent PL), while deferredPushToPeer runs only for
+   *        IN_SYNC peers (pushed by the group via tryPushToPeer).
+   *        A peer cannot be both detached and in-sync simultaneously,
+   *        so only one coroutine can be pending at a time — no counter
+   *        is needed.
+   * Bits 5-31: Reserved for future use.
    */
   enum AdjRibFlag : uint32_t {
     RIB_OUT_DISCREPANCY = 0,
     IS_DETACHED_FAST_PEER = 1,
     WAS_DETACHED_INIT_DUMP_PEER = 2,
+    /* A sendBgpUpdates (detached) or deferredPushToPeer (in-sync) coroutine
+     * is pending. Mutually exclusive by peer state — see comment above. */
+    SCHEDULED_PUSH_TO_PEER = 3,
   };
 
   bool isAdjRibFlagSet(AdjRibFlag flag) const {
@@ -1002,8 +1084,10 @@ class AdjRib : boost::noncopyable,
    * and when processing RIB announcements/withdrawals.
    */
   void setLastSeenRibVersion(uint64_t version) {
-    lastSeenRibVersion_ = version;
-    stats_.setPeerTableVersion(version);
+    if (version > lastSeenRibVersion_) {
+      lastSeenRibVersion_ = version;
+      stats_.setPeerTableVersion(version);
+    }
   }
 
   /*
@@ -1435,6 +1519,18 @@ class AdjRib : boost::noncopyable,
    */
   bool capRoutesPerPeer(uint64_t routeCnt, bool isPrefilter);
 
+  /*
+   * Increment the fb303 counter peer.totalDroppedPrefixes by `count`. Called
+   * from every capacity/overload drop path (switch-level overload protection,
+   * per-peer route caps, and safe-mode golden-prefix purge) so the counter is
+   * populated consistently regardless of which protection mechanism dropped
+   * the route.
+   *
+   * Note: despite the "Prefix" name (kept for ODS continuity), `count` is a
+   * number of dropped routes (prefix + path), not unique prefixes.
+   */
+  void incrementPrefixesDroppedByLimit(uint32_t count = 1);
+
   /**
    * @brief Validate incoming attributes.
    * @details Checks for valid attributes. In the case for invalid AsPath, it
@@ -1685,7 +1781,8 @@ class AdjRib : boost::noncopyable,
       const std::string& policyName,
       const folly::CIDRNetwork& prefix,
       const std::shared_ptr<const BgpPath>& prePolicyAttrs,
-      const std::shared_ptr<BgpPolicyActionData>& policyActionData);
+      const std::shared_ptr<BgpPolicyActionData>& policyActionData,
+      bool isPartialDrain = false);
 
   /***********************************
    * AdjRibOut functions
@@ -1752,6 +1849,15 @@ class AdjRib : boost::noncopyable,
    * This task can only be run one at a time.
    */
   folly::coro::Task<void> sendBgpUpdates(bool tryPullNewChangeItems) noexcept;
+
+  /*
+   * Deferred push coroutine — waits for queue space then pushes.
+   * Runs on the peer's asyncScope_ (not the group's).
+   * RAII guard calls markPeerUnblocked on completion.
+   */
+  folly::coro::Task<void> deferredPushToPeer(
+      nettools::bgplib::FiberBgpPeer::InputMessageT message,
+      std::shared_ptr<AdjRib> self) noexcept;
 
   /*
    * Returns true if we should break out of sendBgpUpdates early due to
@@ -1982,6 +2088,14 @@ class AdjRib : boost::noncopyable,
   folly::EventBase& evb_;
   std::optional<folly::coro::CancellableAsyncScope> asyncScope_{std::in_place};
 
+  /*
+   * Cancellation source for the rib-dump task scheduled on PeerManager's
+   * asyncScope_. Its presence (and not-yet-cancelled state) indicates a rib
+   * dump is currently scheduled or in flight for this peer; cancelled in stop()
+   * so teardown cancels an in-flight dump.
+   */
+  std::optional<folly::CancellationSource> ribDumpCancellationSource_;
+
   // message queue to rib
   nettools::bgplib::MonitoredBackPressuredQueue<RibInMessage>& ribInQ_;
 
@@ -2041,13 +2155,13 @@ class AdjRib : boost::noncopyable,
    * AdjRib to determine which routes should be announced to or withdrawn from
    * the RIB based on the new policy.
    *
-   * @pendingEgressPolicyUpdate_:  When set to true, indicates that a RibDumpReq
-   * is yet to be sent for this adjRibOut to process the updated egress route
-   * filter policy.
+   * @egressPolicyUpdateRequired_:  When set to true, indicates that a
+   * RibDumpReq is yet to be sent for this adjRibOut to process the updated
+   * egress route filter policy.
    *
    */
   bool pendingIngressPolicyUpdate_{false};
-  bool pendingEgressPolicyUpdate_{false};
+  bool egressPolicyUpdateRequired_{false};
 
   /*
    * [AdjRibIn]

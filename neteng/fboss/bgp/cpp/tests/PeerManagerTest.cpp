@@ -68,6 +68,7 @@
       PeerManagerTestFixture, ClearIngressEgressRouteFiltersPolicyTest);       \
   FRIEND_TEST(PeerManagerTestFixture, ClearGoldenPrefixesPolicyTest);          \
   FRIEND_TEST(PeerManagerTestFixture, SetRouteFilterPolicyVersionCheckTest);   \
+  FRIEND_TEST(PeerManagerTestFixture, SetRouteFilterPolicyForceUpdateTest);    \
   FRIEND_TEST(PeerManagerTestFixture, UpdateShadowRibEntryUtil);               \
   FRIEND_TEST(PeerManagerTestFixture, DisableScubaLoggingTest);                \
   FRIEND_TEST(PeerManagerTestFixture, TriggerSafeModeMsgTest);                 \
@@ -158,6 +159,7 @@
   FRIEND_TEST(                                                                 \
       PeerManagerTestFixture, StatefulGrConvergenceTestWithNoGrNeighbor);      \
   FRIEND_TEST(PeerManagerTestFixture, SetRouteFilterPolicyTest);               \
+  FRIEND_TEST(PeerManagerTestFixture, SetRouteFilterPolicyForceUpdateTest);    \
   FRIEND_TEST(                                                                 \
       PeerManagerTestFixture,                                                  \
       SetRouteFilterPolicyMatchAgainstPeerGroupNameTest);                      \
@@ -218,6 +220,8 @@
 #include <fmt/core.h>
 #include <folly/Optional.h>
 #include <folly/coro/BlockingWait.h>
+#include <folly/coro/Task.h>
+#include <folly/executors/ManualExecutor.h>
 #include <folly/fibers/FiberManagerMap.h>
 #include <folly/logging/LoggerDB.h>
 #include <folly/logging/test/TestLogHandler.h>
@@ -228,6 +232,7 @@
 
 #include "neteng/fboss/bgp/cpp/config/ConfigManager.h"
 #include "neteng/fboss/bgp/cpp/peer/SessionManager.h"
+#include "neteng/fboss/bgp/cpp/tests/BoundedWaitUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/PeerManagerTestUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/RibPolicyUtils.h"
 #include "neteng/fboss/bgp/if/gen-cpp2/bgp_thrift_types.h"
@@ -406,7 +411,10 @@ TEST_F(PeerManagerTestFixture, SharedAdjRibOutGroupNameTest) {
     auto task = fm.addTaskFuture([&] {
       // Wait for sessions to be established and updates sent before
       // terminating the sessions.
-      peerStoppedBaton.wait();
+      facebook::bgp::test::boundedBatonWait(
+          peerStoppedBaton,
+          "peerStoppedBaton",
+          facebook::bgp::test::kDefaultPopTimeout);
 
       /*
        * Verify adjRibOutGroups were created as expected
@@ -466,12 +474,14 @@ TEST_F(PeerManagerTestFixture, SharedAdjRibOutGroupNameTest) {
   auto evbThread = std::thread([&]() { evb.loop(); });
   evb.waitUntilRunning();
 
-  stopPeerBaton.wait();
+  facebook::bgp::test::boundedBatonWait(
+      stopPeerBaton, "stopPeerBaton", facebook::bgp::test::kDefaultPopTimeout);
   /*
    * stop sessions by shutting down PeerManager
    */
-  peerMgr->stop();
+  peerMgr->markDaemonShutdown();
   localSessionMgr->stop();
+  peerMgr->stop();
   peerStoppedBaton.post();
 
   /*
@@ -593,8 +603,9 @@ TEST_F(PeerManagerTestFixture, AdjRibOutGroupPeerEntriesTest) {
 
     // Stop PeerManager
     fiberSleepFor(10ms);
-    peerMgr->stop();
+    peerMgr->markDaemonShutdown();
     sessionMgr->stop();
+    peerMgr->stop();
   });
 
   evb.loop();
@@ -893,8 +904,9 @@ TEST_F(PeerManagerTestFixture, ThriftStreamSubscribePreInitializationTest) {
       [&]() -> folly::coro::Task<void> { co_await *terminateBaton; }());
   EXPECT_EQ(TBgpPeerState::IDLE, peerMgr->streamSubscribers_.at(*myName).state);
 
-  peerMgr->stop();
+  peerMgr->markDaemonShutdown();
   sessionMgr->stop();
+  peerMgr->stop();
   peerMgrThread.join();
   sessionMgrThread.join();
 }
@@ -1267,6 +1279,9 @@ TEST_F(PeerManagerTestFixture, StatefulGrConfigEnabled) {
   //  wait for all futures to be executed
   folly::collectAll(taskFutures.begin(), taskFutures.end()).get();
 
+  // Save GR state before stop(), mirroring Main.cpp shutdown sequence
+  mockPeerMgr->markDaemonShutdown();
+  mockPeerMgr->saveGrState();
   mockPeerMgr->stop();
 
   // Verify that stateful GR file is created.
@@ -1686,7 +1701,8 @@ TEST_F(PeerManagerTestFixture, StatefulGrConvergenceTest) {
       XLOG(INFO, "Posting adjRibReady baton");
       adjRibReadyBaton.post();
       XLOG(INFO, "Waiting for nbrDownSent baton");
-      nbrDownSentBaton.wait();
+      facebook::bgp::test::boundedBatonWait(
+          nbrDownSentBaton, "nbrDownSentBaton");
 
       // Verify peer is removed from static EOR waiting list
       EXPECT_EQ(0, peerMgr->staticPeerEoRReceived_.size());
@@ -1701,19 +1717,22 @@ TEST_F(PeerManagerTestFixture, StatefulGrConvergenceTest) {
       adjRib->adjRibInLiteTree_.clear();
     }
 
-    // Stop PeerManager
+    /*
+     * Stop PeerManager — cancel local coroutines before stop() since
+     * stop() terminates the evb and coroutines can't process cancellation
+     * on a dead event loop.
+     */
     fiberSleepFor(10ms);
-    peerMgr->stop();
-    sessionMgr->stop();
-    sessionMgrThread.join();
-
-    // Cancel coroutines
+    peerMgr->markDaemonShutdown();
     folly::coro::blockingWait(asyncScope.cancelAndJoinAsync());
+    sessionMgr->stop();
+    peerMgr->stop();
+    sessionMgrThread.join();
   });
 
   fm.addTask([&] {
     XLOG(INFO, "Waiting for adjRibReady baton");
-    adjRibReadyBaton.wait();
+    facebook::bgp::test::boundedBatonWait(adjRibReadyBaton, "adjRibReadyBaton");
     nbrRouteChangeQ_->push(NeighborEventMsg(kPeerId3.peerAddr, false));
     // Sleep so that processNeighborRouteChangeLoop can run
     fiberSleepFor(10ms);
@@ -1791,7 +1810,8 @@ TEST_F(PeerManagerTestFixture, StatefulGrConvergenceTestWithNoGrNeighbor) {
       XLOG(INFO, "Posting adjRibReady baton");
       adjRibReadyBaton.post();
       XLOG(INFO, "Waiting for nbrDownSent baton");
-      nbrDownSentBaton.wait();
+      facebook::bgp::test::boundedBatonWait(
+          nbrDownSentBaton, "nbrDownSentBaton");
 
       // one static peer is removed
       EXPECT_EQ(0, peerMgr->staticPeerEoRReceived_.size());
@@ -1817,20 +1837,23 @@ TEST_F(PeerManagerTestFixture, StatefulGrConvergenceTestWithNoGrNeighbor) {
       EXPECT_FALSE(peerMgr->eorTimerExpired_);
     }
 
-    // Stop PeerManager
+    /*
+     * Stop PeerManager — cancel local coroutines before stop() since
+     * stop() terminates the evb and coroutines can't process cancellation
+     * on a dead event loop.
+     */
     fiberSleepFor(10ms);
-    peerMgr->stop();
+    peerMgr->markDaemonShutdown();
+    folly::coro::blockingWait(asyncScope.cancelAndJoinAsync());
     sessionMgr->stop();
+    peerMgr->stop();
 
     sessionMgrThread.join();
-
-    // Cancel coroutines
-    folly::coro::blockingWait(asyncScope.cancelAndJoinAsync());
   });
 
   fm.addTask([&] {
     XLOG(INFO, "Waiting for adjRibReady baton");
-    adjRibReadyBaton.wait();
+    facebook::bgp::test::boundedBatonWait(adjRibReadyBaton, "adjRibReadyBaton");
 
     // Initiate neighbor down event for a peer that was not present in previous
     // incarnation
@@ -1947,7 +1970,7 @@ TEST_F(PeerManagerTestFixture, StatefulGrConvergenceTestWithNoGrNeighbor2) {
     auto sessionMgrThread = sessionMgr->runInThread();
 
     XLOG(INFO, "Waiting for nbrDownSent baton");
-    nbrDownSentBaton.wait();
+    facebook::bgp::test::boundedBatonWait(nbrDownSentBaton, "nbrDownSentBaton");
 
     peerMgr->ribInitialAnnouncementStarted_ = true;
     for (const auto& peerId : {kPeerId3}) {
@@ -1958,15 +1981,18 @@ TEST_F(PeerManagerTestFixture, StatefulGrConvergenceTestWithNoGrNeighbor2) {
 
     EXPECT_TRUE(peerMgr->initialized_);
 
-    // Stop PeerManager
+    /*
+     * Stop PeerManager — cancel local coroutines before stop() since
+     * stop() terminates the evb and coroutines can't process cancellation
+     * on a dead event loop.
+     */
     fiberSleepFor(10ms);
-    peerMgr->stop();
+    peerMgr->markDaemonShutdown();
+    folly::coro::blockingWait(asyncScope.cancelAndJoinAsync());
     sessionMgr->stop();
+    peerMgr->stop();
 
     sessionMgrThread.join();
-
-    // Cancel coroutines
-    folly::coro::blockingWait(asyncScope.cancelAndJoinAsync());
   });
 
   evb.loop();
@@ -3027,7 +3053,8 @@ TEST_F(PeerManagerTestFixture, NbrDownAfterGRTest) {
       XLOG(INFO, "Posting adjRibReady baton");
       adjRibReadyBaton.post();
       XLOG(INFO, "Waiting for nbrDownSent baton");
-      nbrDownSentBaton.wait();
+      facebook::bgp::test::boundedBatonWait(
+          nbrDownSentBaton, "nbrDownSentBaton");
       // Verify that the entry has been removed from AdjRibInStale
       EXPECT_EQ(0, adjRib1->adjRibInLiteTree_.size());
       EXPECT_EQ(0, adjRib1->adjRibInStale_.size());
@@ -3035,19 +3062,18 @@ TEST_F(PeerManagerTestFixture, NbrDownAfterGRTest) {
       adjRib1->adjRibInLiteTree_.clear();
     }
 
-    // stop PeerManager
+    // Cancel local coroutines (processNeighborRouteChangeLoop).
     fiberSleepFor(10ms);
-    peerMgr->stop();
+    folly::coro::blockingWait(asyncScope.cancelAndJoinAsync());
+    peerMgr->markDaemonShutdown();
     sessionMgr->stop();
     sessionMgrThread.join();
-
-    // cancel coroutines
-    folly::coro::blockingWait(asyncScope.cancelAndJoinAsync());
+    peerMgr->stop();
   });
 
   fm.addTask([&] {
     XLOG(INFO, "Waiting for adjRibReady baton");
-    adjRibReadyBaton.wait();
+    facebook::bgp::test::boundedBatonWait(adjRibReadyBaton, "adjRibReadyBaton");
     nbrRouteChangeQ_->push(NeighborEventMsg(kPeerId1.peerAddr, false));
     // Sleep so that processNeighborRouteChangeLoop can run
     fiberSleepFor(10ms);
@@ -3226,8 +3252,13 @@ TEST_F(PeerManagerTestFixture, NeighborReachabilityMsgNoGrTest) {
 
     // Finish coroutine.
     folly::coro::blockingWait(asyncScope.cancelAndJoinAsync());
-    peerMgr->stop();
+    /*
+     * Stop sessionMgr before peerMgr to match Main.cpp shutdown sequence.
+     * peerMgr->stop() terminates the evb, and sessionMgr->stop() needs
+     * the evb alive to destroy FiberServerSocket on the correct thread.
+     */
     sessionMgr->stop();
+    peerMgr->stop();
     // Release gmock hold on shared_ptr of MockAdjRib
     testing::Mock::VerifyAndClearExpectations(adjRib.get());
 
@@ -3289,11 +3320,15 @@ TEST_F(PeerManagerTestFixture, NeighborReachabilityMsgWithGrTest) {
     EXPECT_EQ(2, peerMgr->adjRibs_.size());
     // Only one peer's session is stopped.
     EXPECT_CALL(*sessionMgr, stopPeer(kPeerAddr1, false /* withGR */)).Times(1);
-    // adjRib->stop() is called twice for dsf GR peer, once in
-    // handler and once when peerMgr is stopped.
+    // adjRib->cleanupGrState() is called once for dsf GR peer in
+    // handleNeighborReachabilityMsg, and adjRib->stop() is called once
+    // when peerMgr is stopped.
+    EXPECT_CALL(*dsfAdjRib, cleanupGrState(/*isDaemonShutdown=*/false))
+        .Times(1)
+        .WillOnce([](bool) -> folly::coro::Task<void> { co_return; });
     EXPECT_CALL(*dsfAdjRib, stop())
-        .Times(2)
-        .WillRepeatedly([]() -> folly::coro::Task<void> { co_return; });
+        .Times(1)
+        .WillOnce([]() -> folly::coro::Task<void> { co_return; });
     // adjRib->stop() is called once when peerMgr is stopped.
     EXPECT_CALL(*adjRib, stop())
         .Times(1)
@@ -3329,8 +3364,13 @@ TEST_F(PeerManagerTestFixture, NeighborReachabilityMsgWithGrTest) {
 
     // Finish coroutine.
     folly::coro::blockingWait(asyncScope.cancelAndJoinAsync());
-    peerMgr->stop();
+    /*
+     * Stop sessionMgr before peerMgr to match Main.cpp shutdown sequence.
+     * peerMgr->stop() terminates the evb, and sessionMgr->stop() needs
+     * the evb alive to destroy FiberServerSocket on the correct thread.
+     */
     sessionMgr->stop();
+    peerMgr->stop();
 
     // Release gmock hold on shared_ptr of MockAdjRib
     testing::Mock::VerifyAndClearExpectations(adjRib.get());
@@ -3545,8 +3585,9 @@ TEST_F(PeerManagerTestFixture, SetRouteFilterPolicyTest) {
     EXPECT_FALSE(peerMgr->goldenPrefixesPolicyActive_);
   }
 
-  peerMgr->stop();
+  peerMgr->markDaemonShutdown();
   sessionMgr->stop();
+  peerMgr->stop();
   peerMgrThread.join();
   sessionMgrThread.join();
   SUCCEED();
@@ -3639,20 +3680,23 @@ TEST_F(PeerManagerTestFixture, SetRouteFilterPolicyVersionCheckTest) {
     });
   }
 
-  // Try to set policy with same version (10) - should be ignored
+  // Same version (10) without forceUpdate - should be accepted
   {
     rib_policy::TRouteFilterPolicy tPolicy;
     tPolicy.statements()->emplace(
         "adjRib1", createTRouteFilterStatement({}, true /* permissive */));
     tPolicy.version() = 10;
+    auto expectedStmt = tPolicy.statements()->at("adjRib1");
     auto policy = std::make_unique<RouteFilterPolicy>(tPolicy);
     peerMgr->setRouteFilterPolicy(std::move(policy));
 
-    // Wait for the event to be processed and verify policy was NOT updated
-    REPEAT({
+    WITH_RETRIES({
       evb.runInEventBaseThreadAndWait([&]() {
-        // Version should still be 10
-        EXPECT_EQ(10, peerMgr->routeFilterPolicy_->getVersion());
+        EXPECT_EVENTUALLY_EQ(10, peerMgr->routeFilterPolicy_->getVersion());
+        EXPECT_EVENTUALLY_EQ(
+            expectedStmt,
+            peerMgr->routeFilterPolicy_->toThrift().statements()->at(
+                "adjRib1"));
       });
     });
   }
@@ -3670,6 +3714,132 @@ TEST_F(PeerManagerTestFixture, SetRouteFilterPolicyVersionCheckTest) {
       evb.runInEventBaseThreadAndWait([&]() {
         // Version should now be 11
         EXPECT_EVENTUALLY_EQ(11, peerMgr->routeFilterPolicy_->getVersion());
+      });
+    });
+  }
+
+  peerMgr->markDaemonShutdown();
+  sessionMgr->stop();
+  peerMgr->stop();
+  peerMgrThread.join();
+  sessionMgrThread.join();
+  SUCCEED();
+}
+
+/*
+ * This test verifies that setRouteFilterPolicy() with forceUpdate=true
+ * bypasses the version check and applies the policy even when the new
+ * version is the same as the cached version. This is used by FILE_MODE
+ * (setCrfPolicyFromFile) where the version may not increment.
+ */
+TEST_F(PeerManagerTestFixture, SetRouteFilterPolicyForceUpdateTest) {
+  auto config = getConfig(
+      true,
+      true,
+      false,
+      false,
+      false,
+      true,
+      kDefaultEorTimeS,
+      false,
+      true /* enable switch level limit */,
+      true /* enable golden prefixes policy */);
+  auto configManager = std::make_shared<ConfigManager>(config);
+  auto peerMgr = std::make_shared<PeerManager>(
+      configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
+
+  auto globalConfig = config->getBgpGlobalConfig();
+  auto sessionMgr = std::make_shared<SessionManager>(*globalConfig, false);
+  peerMgr->setSessionManager(sessionMgr);
+
+  auto& evb = peerMgr->getEventBase();
+
+  auto adjRib1 = setupAdjRib(
+      evb,
+      peerMgr->getChangeListTracker(),
+      kPeerId1,
+      AsNum(kAsn1),
+      sessionTerminateBaton_,
+      config);
+  adjRib1->peeringParams_.description = "adjRib1";
+  adjRib1->isSafeModeOn_ = std::make_shared<std::atomic<bool>>(false);
+  adjRib1->adjRibOutGroup_ = std::make_shared<AdjRibOutGroup>(evb, "Group1");
+
+  peerMgr->adjRibs_[kPeerId1] = adjRib1;
+
+  auto peerMgrThread = peerMgr->runInThread();
+  auto sessionMgrThread = sessionMgr->runInThread();
+
+  // Set initial policy with version 10
+  {
+    rib_policy::TRouteFilterPolicy tPolicy;
+    tPolicy.statements()->emplace("adjRib1", createTRouteFilterStatement({}));
+    tPolicy.version() = 10;
+    auto policy = std::make_unique<RouteFilterPolicy>(tPolicy);
+    peerMgr->setRouteFilterPolicy(std::move(policy));
+
+    evb.runInEventBaseThreadAndWait([&]() {
+      EXPECT_NE(nullptr, peerMgr->routeFilterPolicy_);
+      EXPECT_EQ(10, peerMgr->routeFilterPolicy_->getVersion());
+    });
+  }
+
+  // Same version (10) without forceUpdate - should be accepted
+  {
+    rib_policy::TRouteFilterPolicy tPolicy;
+    tPolicy.statements()->emplace(
+        "adjRib1", createTRouteFilterStatement({}, true /* permissive */));
+    tPolicy.version() = 10;
+    auto expectedStmt = tPolicy.statements()->at("adjRib1");
+    auto policy = std::make_unique<RouteFilterPolicy>(tPolicy);
+    peerMgr->setRouteFilterPolicy(std::move(policy));
+
+    WITH_RETRIES({
+      evb.runInEventBaseThreadAndWait([&]() {
+        EXPECT_EVENTUALLY_EQ(10, peerMgr->routeFilterPolicy_->getVersion());
+        EXPECT_EVENTUALLY_EQ(
+            expectedStmt,
+            peerMgr->routeFilterPolicy_->toThrift().statements()->at(
+                "adjRib1"));
+      });
+    });
+  }
+
+  // Same version (10) with forceUpdate=true - should also be accepted
+  {
+    rib_policy::TRouteFilterPolicy tPolicy;
+    tPolicy.statements()->emplace(
+        "adjRib1", createTRouteFilterStatement({}, true /* permissive */));
+    tPolicy.version() = 10;
+    auto expectedStmt = tPolicy.statements()->at("adjRib1");
+    auto policy = std::make_unique<RouteFilterPolicy>(tPolicy);
+    peerMgr->setRouteFilterPolicy(std::move(policy), /*forceUpdate=*/true);
+
+    WITH_RETRIES({
+      evb.runInEventBaseThreadAndWait([&]() {
+        EXPECT_EVENTUALLY_NE(nullptr, peerMgr->routeFilterPolicy_);
+        EXPECT_EVENTUALLY_EQ(10, peerMgr->routeFilterPolicy_->getVersion());
+        // Verify the policy content was actually replaced (permissive stmt)
+        EXPECT_EVENTUALLY_EQ(
+            expectedStmt,
+            peerMgr->routeFilterPolicy_->toThrift().statements()->at(
+                "adjRib1"));
+      });
+    });
+  }
+
+  // Lower version (5) with forceUpdate=true - should be accepted
+  // This is the primary FILE_MODE scenario (daemon restart, version resets)
+  {
+    rib_policy::TRouteFilterPolicy tPolicy;
+    tPolicy.statements()->emplace("adjRib1", createTRouteFilterStatement({}));
+    tPolicy.version() = 5;
+    auto policy = std::make_unique<RouteFilterPolicy>(tPolicy);
+    peerMgr->setRouteFilterPolicy(std::move(policy), /*forceUpdate=*/true);
+
+    WITH_RETRIES({
+      evb.runInEventBaseThreadAndWait([&]() {
+        EXPECT_EVENTUALLY_EQ(5, peerMgr->routeFilterPolicy_->getVersion());
       });
     });
   }
@@ -3797,8 +3967,9 @@ TEST_F(
         tPolicy.statements()->at("PEERGROUP_FSW_RSW_V4"));
   }
 
-  peerMgr->stop();
+  peerMgr->markDaemonShutdown();
   sessionMgr->stop();
+  peerMgr->stop();
   peerMgrThread.join();
   sessionMgrThread.join();
   SUCCEED();
@@ -4145,8 +4316,9 @@ TEST_F(
       fb303::ThreadCachedServiceData::get()->getCounter(
           BgpStats::kEgressRouteFilterPolicyAffectedPeers));
 
-  peerMgr->stop();
+  peerMgr->markDaemonShutdown();
   sessionMgr->stop();
+  peerMgr->stop();
   peerMgrThread.join();
   sessionMgrThread.join();
   SUCCEED();
@@ -4310,8 +4482,9 @@ TEST_F(
       fb303::ThreadCachedServiceData::get()->getCounter(
           BgpStats::kEgressRouteFilterPolicyAffectedPeers));
 
-  peerMgr->stop();
+  peerMgr->markDaemonShutdown();
   sessionMgr->stop();
+  peerMgr->stop();
   peerMgrThread.join();
   sessionMgrThread.join();
   SUCCEED();
@@ -4527,8 +4700,9 @@ TEST_F(
       fb303::ThreadCachedServiceData::get()->getCounter(
           BgpStats::kEgressRouteFilterPolicyAffectedPeers));
 
-  peerMgr->stop();
+  peerMgr->markDaemonShutdown();
   sessionMgr->stop();
+  peerMgr->stop();
   peerMgrThread.join();
   sessionMgrThread.join();
   SUCCEED();
@@ -4610,8 +4784,9 @@ TEST_F(PeerManagerTestFixture, GoldenPrefixesPolicyStatusTestDropMode) {
     EXPECT_FALSE(peerMgr->goldenPrefixesPolicyActive_);
   }
 
-  peerMgr->stop();
+  peerMgr->markDaemonShutdown();
   sessionMgr->stop();
+  peerMgr->stop();
   peerMgrThread.join();
   sessionMgrThread.join();
   SUCCEED();
@@ -4692,8 +4867,9 @@ TEST_F(PeerManagerTestFixture, GoldenPrefixesPolicyStatusTestSwitchLimitUnset) {
     EXPECT_FALSE(peerMgr->goldenPrefixesPolicyActive_);
   }
 
-  peerMgr->stop();
+  peerMgr->markDaemonShutdown();
   sessionMgr->stop();
+  peerMgr->stop();
   peerMgrThread.join();
   sessionMgrThread.join();
   SUCCEED();
@@ -4799,11 +4975,15 @@ TEST_F(PeerManagerTestFixture, PolicyCachePeriodicEvictionTest) {
     EXPECT_NE(nullptr, policyCache);
     EXPECT_EQ(0, policyCache->size());
 
-    // stop PeerManager
-    peerMgr->stop();
-    sessionMgr->stop();
-    // Cancel coroutines
+    /*
+     * Stop PeerManager — cancel local coroutines before stop() since
+     * stop() terminates the evb and coroutines can't process cancellation
+     * on a dead event loop.
+     */
+    peerMgr->markDaemonShutdown();
     folly::coro::blockingWait(asyncScope.cancelAndJoinAsync());
+    sessionMgr->stop();
+    peerMgr->stop();
 
     sessionMgrThread.join();
   });
@@ -4941,8 +5121,9 @@ TEST_F(PeerManagerTestFixture, ClearIngressEgressRouteFiltersPolicyTest) {
     });
   }
 
-  peerMgr->stop();
+  peerMgr->markDaemonShutdown();
   sessionMgr->stop();
+  peerMgr->stop();
   peerMgrThread.join();
   sessionMgrThread.join();
   SUCCEED();
@@ -5030,8 +5211,9 @@ TEST_F(PeerManagerTestFixture, ClearGoldenPrefixesPolicyTest) {
     });
   }
 
-  peerMgr->stop();
+  peerMgr->markDaemonShutdown();
   sessionMgr->stop();
+  peerMgr->stop();
   peerMgrThread.join();
   sessionMgrThread.join();
   SUCCEED();
@@ -5121,8 +5303,9 @@ TEST_F(PeerManagerTestFixture, DisableScubaLoggingTest) {
         tPolicy.statements()->at("adjRib1"));
   }
 
-  peerMgr->stop();
+  peerMgr->markDaemonShutdown();
   sessionMgr->stop();
+  peerMgr->stop();
   peerMgrThread.join();
   sessionMgrThread.join();
   SUCCEED();
@@ -5341,11 +5524,13 @@ TEST_F(PeerManagerTestFixture, TriggerSafeModeMsgTest) {
     // Verify PauseBestPathAndFibProgramming and ResumeBestPathAndFibProgramming
     // message is sent to RIB
     WITH_RETRIES(EXPECT_EVENTUALLY_EQ(2, ribInQ_.size()));
-    auto ribInQItem0 = folly::coro::blockingWait(ribInQ_.pop());
+    auto ribInQItem0 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(
         std::holds_alternative<PauseBestPathAndFibProgramming>(ribInQItem0));
 
-    auto ribInQItem1 = folly::coro::blockingWait(ribInQ_.pop());
+    auto ribInQItem1 =
+        facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     ASSERT_TRUE(
         std::holds_alternative<ResumeBestPathAndFibProgramming>(ribInQItem1));
 
@@ -5779,39 +5964,66 @@ TEST_F(PeerManagerTestFixture, WaitForSessionTerminateBatonTest) {
   auto sessionTerminateBaton = std::make_shared<folly::coro::Baton>();
   mockPeerMgr->sessionTerminateBatons_[kPeerId] = sessionTerminateBaton;
 
-  // Baton to signal that the wait thread has executed right before
-  // waitForSessionTerminateBaton. This baton is to avoid flaky tests as
-  // thread creation could take some time
-  auto waitThreadReadyBaton = std::make_shared<folly::fibers::Baton>();
+  // Scope the subscription to the PeerManager log category. PeerManager.cpp
+  // has no XLOG_SET_CATEGORY_NAME, so its XLOGF messages land in the
+  // path-derived category below. Subscribing to the root ("") instead captured
+  // stray DBG1 logs emitted by other components active during the wait, which
+  // made messages.size() exceed 2 and shifted the expected ordering (observed
+  // ~20/300 failures, all with size == 3). This matches the scoping the other
+  // PeerManager log-assertion tests in this file already use.
+  auto& messages = subscribeToLogMessages(
+      "neteng.fboss.bgp.cpp.peer.PeerManager", folly::LogLevel::DBG1);
 
-  auto& messages = subscribeToLogMessages("", folly::LogLevel::DBG1);
+  // Drive the coroutine under test on a ManualExecutor on THIS thread. This
+  // keeps all logging on a single thread (TestLogHandler is not thread-safe)
+  // and makes the wait deterministic: drain() runs the coroutine until it
+  // suspends on the (un-posted) baton, i.e. until it has emitted the entry log
+  // and recorded its wait start time. Only after that confirmed suspension do
+  // we let the production 1ms duration threshold elapse and post the baton, so
+  // the "blocked" duration log fires every time.
+  //
+  // Earlier versions raced the post against the coroutine reaching co_await:
+  // a two-thread version timed a sleep from thread creation, and an
+  // EventBase-timer version relied on the queued coroutine being serviced
+  // before a delayed timer. Under load the baton was occasionally posted
+  // first, making the measured wait ~0ms (baton latch passes through) and
+  // dropping the duration log (observed ~3-5/300 failures with size == 1 once
+  // the stray-log pollution above was removed).
+  folly::ManualExecutor executor;
+  auto future =
+      folly::coro::co_withExecutor(
+          &executor, mockPeerMgr->waitForSessionTerminateBaton(kPeerId))
+          .start();
 
-  // Create a thread to wait for session terminate baton
-  std::thread waitThread([&]() {
-    waitThreadReadyBaton->post();
+  // Run the coroutine until it suspends on co_await *baton. After this the
+  // coroutine has emitted the entry log and recorded its start time.
+  executor.drain();
+  ASSERT_FALSE(future.isReady());
 
-    folly::coro::blockingWait(
-        mockPeerMgr->waitForSessionTerminateBaton(kPeerId));
-  });
-
-  waitThreadReadyBaton->wait();
-
-  // Wait a bit to ensure the duration > 1ms so that the log message is emitted.
-  // This 100ms allows the waitThread to enter co_await before we post.
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-  // Post the baton (in real scenario, posted by postTerminateBaton after both
-  // message loops complete)
+  // The coroutine is now provably blocked on the baton, so there is no race
+  // left. Spin until strictly more than the production 1ms threshold has
+  // elapsed, then post. The coroutine's startTime was recorded at or before
+  // gateStart, so the wait it measures (postTime - startTime) is guaranteed to
+  // exceed 1ms and the duration log is emitted. This is a deterministic time
+  // gate exercising the production threshold, not a sleep used to paper over
+  // missing synchronization.
+  const auto gateStart = std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() - gateStart <=
+         std::chrono::milliseconds(2)) {
+  }
   sessionTerminateBaton->post();
 
-  // Wait for the thread to finish
-  waitThread.join();
+  // Resume the coroutine to completion; emits the duration log.
+  executor.drain();
+  ASSERT_TRUE(future.isReady());
 
+  // Read the captured messages only after the coroutine has completed — no
+  // concurrent access to the non-thread-safe handler.
   // Expect 2 log messages:
   // 1. Entry log: "Peer Manager waiting for adjRib..."
   // 2. Duration log: "Peer Manager blocked waiting for adjRib..." (since
   // duration > 1ms)
-  EXPECT_EQ(2, messages.size());
+  ASSERT_EQ(2, messages.size());
   EXPECT_TRUE(
       messages[0].first.getMessage().starts_with(
           "Peer Manager waiting for adjRib"));
@@ -6077,8 +6289,9 @@ TEST_F(
       fb303::ThreadCachedServiceData::get()->getCounter(
           BgpStats::kEgressRoutingPolicyAffectedPeers));
 
-  peerMgr->stop();
+  peerMgr->markDaemonShutdown();
   sessionMgr->stop();
+  peerMgr->stop();
   peerMgrThread.join();
   sessionMgrThread.join();
   SUCCEED();
@@ -6257,8 +6470,9 @@ TEST_F(
       fb303::ThreadCachedServiceData::get()->getCounter(
           BgpStats::kEgressRoutingPolicyAffectedPeers));
 
-  peerMgr->stop();
+  peerMgr->markDaemonShutdown();
   sessionMgr->stop();
+  peerMgr->stop();
   peerMgrThread.join();
   sessionMgrThread.join();
   SUCCEED();
@@ -6343,8 +6557,9 @@ TEST_F(
       fb303::ThreadCachedServiceData::get()->getCounter(
           BgpStats::kEgressRoutingPolicyAffectedPeers));
 
-  peerMgr->stop();
+  peerMgr->markDaemonShutdown();
   sessionMgr->stop();
+  peerMgr->stop();
   peerMgrThread.join();
   sessionMgrThread.join();
   SUCCEED();
@@ -6433,8 +6648,9 @@ TEST_F(
     EXPECT_EQ("egress_policy_v1", adjRib1->egressPolicyName_.value());
   });
 
-  peerMgr->stop();
+  peerMgr->markDaemonShutdown();
   sessionMgr->stop();
+  peerMgr->stop();
   peerMgrThread.join();
   sessionMgrThread.join();
   SUCCEED();
@@ -6535,8 +6751,9 @@ TEST_F(PeerManagerDynamicPolicyEvaluationFixture, StalePolicyUpdateIsSkipped) {
     EXPECT_EQ("policy_v2", adjRib1->ingressPolicyName_.value());
   });
 
-  peerMgr->stop();
+  peerMgr->markDaemonShutdown();
   sessionMgr->stop();
+  peerMgr->stop();
   peerMgrThread.join();
   sessionMgrThread.join();
   SUCCEED();
@@ -6630,8 +6847,9 @@ TEST_F(
     EXPECT_TRUE(adjRib1->ingressPolicyName_.has_value());
   });
 
-  peerMgr->stop();
+  peerMgr->markDaemonShutdown();
   sessionMgr->stop();
+  peerMgr->stop();
   peerMgrThread.join();
   sessionMgrThread.join();
   SUCCEED();
@@ -6721,8 +6939,9 @@ TEST_F(
     });
   });
 
-  peerMgr->stop();
+  peerMgr->markDaemonShutdown();
   sessionMgr->stop();
+  peerMgr->stop();
   peerMgrThread.join();
   sessionMgrThread.join();
   SUCCEED();
@@ -7119,8 +7338,9 @@ TEST_F(PeerManagerTestFixture, AddPeersTest) {
   auto result3 = folly::coro::blockingWait(peerMgr->addPeers(multiplePeers));
   EXPECT_TRUE(result3.hasValue());
 
-  peerMgr->stop();
+  peerMgr->markDaemonShutdown();
   sessionMgr->stop();
+  peerMgr->stop();
   peerMgrThread.join();
   sessionMgrThread.join();
   SUCCEED();

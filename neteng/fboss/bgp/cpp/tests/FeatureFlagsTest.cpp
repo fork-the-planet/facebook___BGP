@@ -79,6 +79,7 @@ TEST(FeatureFlagsTest, DefaultBgpBestpathFeaturesTest) {
   EXPECT_THAT(config.enableMedMissingAsWorst, IsFalse());
   EXPECT_THAT(config.enableWeightComparison, IsFalse());
   EXPECT_THAT(config.enableNextHopTracking, IsFalse());
+  EXPECT_THAT(config.nextHopTrackingUseOpenrIgpCost, IsFalse());
   EXPECT_THAT(config.enableEiBgpMultipath, IsFalse());
 }
 
@@ -90,6 +91,8 @@ TEST(FeatureFlagsTest, LoadBgpBestpathFeaturesTest) {
   thriftConfig.bgp_setting_config()->enable_med_missing_as_worst() = true;
   thriftConfig.bgp_setting_config()->enable_weight_comparison() = true;
   thriftConfig.bgp_setting_config()->enable_next_hop_tracking() = true;
+  thriftConfig.bgp_setting_config()->next_hop_tracking_use_openr_igp_cost() =
+      true;
   thriftConfig.bgp_setting_config()->enable_eibgp_multipath() = true;
 
   FeatureFlags::LoadFromThriftConfig(thriftConfig);
@@ -102,6 +105,7 @@ TEST(FeatureFlagsTest, LoadBgpBestpathFeaturesTest) {
   EXPECT_THAT(config.enableMedMissingAsWorst, IsTrue());
   EXPECT_THAT(config.enableWeightComparison, IsTrue());
   EXPECT_THAT(config.enableNextHopTracking, IsTrue());
+  EXPECT_THAT(config.nextHopTrackingUseOpenrIgpCost, IsTrue());
   EXPECT_THAT(config.enableEiBgpMultipath, IsTrue());
 }
 

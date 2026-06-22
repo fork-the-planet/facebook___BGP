@@ -251,6 +251,28 @@ void updateOriginAndClusterListCommon(
     std::shared_ptr<BgpPath> attrsToUpdate) noexcept;
 
 /**
+ * @brief Attach the partial-drain community on an outbound attribute clone.
+ *
+ * @details Adds kDrainCommunity (65446:10) and removes kLiveCommunity
+ * (65446:30) on the cloned per-peer pre-policy attributes. Used by both
+ * AdjRibOut (per-peer) and AdjRibGroup (group RIB-OUT) when announcing a
+ * route flagged isPartialDrain so peers deprioritize the path gracefully
+ * instead of withdrawing it.
+ *
+ * Placement rationale: this runs on the per-peer (or per-group) clone of
+ * `update.attrs` after `update.attrs->clone()` and before the egress policy
+ * step. The published RIB-side BgpPath is immutable; mutating it at the RIB
+ * level would force a fresh BgpPath clone per drained prefix, defeating the
+ * 4-layer dedup chain (sub-attrs -> attrs -> paths -> strings) and incurring
+ * significant memory overhead at scale. Riding the existing per-peer attrs
+ * clone in AdjRib piggybacks on a clone that already happens.
+ *
+ * @param attrsToUpdate - Attributes to modify (must not be published)
+ */
+void applyPartialDrainCommunities(
+    const std::shared_ptr<BgpPath>& attrsToUpdate) noexcept;
+
+/**
  * @brief Keep the lowest non-negative transitive and non-transitive LBWs only.
  *
  * @details Removes all but the lowest transitive and non-transitive non-

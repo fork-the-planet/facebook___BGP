@@ -44,12 +44,6 @@ TEST(StatsTest, RibStatsInitCounterTest) {
   {
     // validate empty counters
     auto counters = fb303::ThreadCachedServiceData::getShared();
-    EXPECT_FALSE(counters->hasCounter(RibStats::kPsPolicyRcvd));
-    EXPECT_FALSE(counters->hasCounter(RibStats::kPsPolicyUpdate));
-    EXPECT_FALSE(counters->hasCounter(RibStats::kRaPolicyRcvd));
-    EXPECT_FALSE(counters->hasCounter(RibStats::kRaPolicyUpdate));
-    EXPECT_FALSE(counters->hasCounter(RibStats::kRfPolicyRcvd));
-    EXPECT_FALSE(counters->hasCounter(RibStats::kRfPolicyUpdate));
     EXPECT_FALSE(counters->hasCounter(RibStats::kTotalShadowRibEntries));
     EXPECT_FALSE(counters->hasCounter(RibStats::kTotalRibPaths));
     EXPECT_FALSE(counters->hasCounter(RibStats::kTotalAdjRibs));
@@ -71,12 +65,6 @@ TEST(StatsTest, RibStatsInitCounterTest) {
   }
   {
     auto counters = fb303::ThreadCachedServiceData::getShared();
-    EXPECT_EQ(0, counters->getCounter(RibStats::kPsPolicyRcvd));
-    EXPECT_EQ(0, counters->getCounter(RibStats::kPsPolicyUpdate));
-    EXPECT_EQ(0, counters->getCounter(RibStats::kRaPolicyRcvd));
-    EXPECT_EQ(0, counters->getCounter(RibStats::kRaPolicyUpdate));
-    EXPECT_EQ(0, counters->getCounter(RibStats::kRfPolicyRcvd));
-    EXPECT_EQ(0, counters->getCounter(RibStats::kRfPolicyUpdate));
     EXPECT_EQ(-1, counters->getCounter(RibStats::kTotalShadowRibEntries));
     EXPECT_EQ(0, counters->getCounter(RibStats::kTotalRibPaths));
     EXPECT_EQ(-1, counters->getCounter(RibStats::kTotalAdjRibs));
@@ -463,7 +451,7 @@ TEST(StatsTest, PeerStatsInitCounterTest) {
     EXPECT_FALSE(counters->hasCounter(PeerStats::kNoGrRestart));
     EXPECT_FALSE(
         counters->hasCounter(PeerStats::kTotalPeerWithNoRouteExchange));
-    EXPECT_FALSE(counters->hasCounter(PeerStats::kTotalDroppedPrefixes));
+    EXPECT_FALSE(counters->hasCounter(PeerStats::kTotalPrefixesDroppedByLimit));
     // Message sent keys
     EXPECT_FALSE(counters->hasCounter(messageSentOpenKey));
     EXPECT_FALSE(counters->hasCounter(messageSentNotificationKey));
@@ -512,13 +500,15 @@ TEST(StatsTest, PeerStatsInitCounterTest) {
     auto counters = fb303::ThreadCachedServiceData::getShared();
     EXPECT_EQ(-1, counters->getCounter(PeerStats::kTotalRcvdPrefixes));
     EXPECT_EQ(-1, counters->getCounter(PeerStats::kTotalAcceptedPrefixes));
-    EXPECT_EQ(-1, counters->getCounter(PeerStats::kTotalDroppedPrefixes));
+    // droppedPrefixes is initialized to 0 (always populated), not -1. See
+    // S676351.
+    EXPECT_EQ(0, counters->getCounter(PeerStats::kTotalPrefixesDroppedByLimit));
     EXPECT_EQ(-1, counters->getCounter(PeerStats::kTotalSentPrefixes));
     EXPECT_EQ(-1, counters->getCounter(PeerStats::kTotalPaths));
     EXPECT_EQ(-1, counters->getCounter(PeerStats::kTotalUniquePrefixes));
     EXPECT_EQ(-1, counters->getCounter(PeerStats::kTotalVipPrefixes));
     EXPECT_EQ(-1, counters->getCounter(PeerStats::kMaxPeerRcvdPrefixes));
-    EXPECT_EQ(0, counters->getCounter(PeerStats::kNoGrRestart));
+    EXPECT_EQ(0, counters->getCounter(PeerStats::kNoGrRestart + ".count"));
     EXPECT_EQ(
         0, counters->getCounter(PeerStats::kTotalPeerWithNoRouteExchange));
     // Message sent keys

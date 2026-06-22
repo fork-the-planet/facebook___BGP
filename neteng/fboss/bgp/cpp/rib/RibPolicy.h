@@ -130,8 +130,46 @@ class PathSelectionPolicyResult : public RibPolicyResultBase {
   explicit PathSelectionPolicyResult(const std::string& stmtName)
       : RibPolicyResultBase(stmtName) {}
 
+  /*
+   * True when the outcome indicates a CPS capacity-threshold violation —
+   * either insufficient nexthops (MIN_NEXTHOP) or insufficient aggregate
+   * link bandwidth (MIN_AGG_LBW).
+   */
+  bool isCapacityThresholdViolation() const noexcept {
+    return outcome == Outcome::BGP_FAILED_CPS_MIN_NEXTHOP ||
+        outcome == Outcome::BGP_FAILED_CPS_MIN_AGG_LBW;
+  }
+
+  /*
+   * True when the result is a CPS capacity-threshold violation that should
+   * cause bestpath nullification. When drainOnMinCapacityThresholdViolation
+   * is set, partial drain takes effect instead and this returns false even
+   * though the underlying outcome is a violation.
+   */
+  bool isFailedCpsNativeCriteria() const noexcept {
+    return isCapacityThresholdViolation() &&
+        !drainOnMinCapacityThresholdViolation;
+  }
+
   const PathSelectionCriteria* activeCriteria{nullptr};
   Outcome outcome;
+  bool drainOnMinCapacityThresholdViolation{false};
+  /*
+   * Min-nexthop threshold (count) captured when
+   * drainOnMinCapacityThresholdViolation is set via the MNH branch of
+   * overrideMultipathSelection. 0 when not applicable (LBW branch or no
+   * drain). Surfaced as TMinCapacityThreshold.mnh on
+   * TPartiallyDrainedPrefix.
+   */
+  int32_t mnhThreshold{0};
+  /*
+   * Aggregate LBW threshold (bps) captured when
+   * drainOnMinCapacityThresholdViolation is set via the LBW branch of
+   * overrideMultipathSelection. 0 when not applicable (MNH branch or no
+   * drain). Surfaced as TMinCapacityThreshold.agg_lbw_bps on
+   * TPartiallyDrainedPrefix.
+   */
+  int64_t aggLbwBpsThreshold{0};
 };
 
 /**
@@ -143,7 +181,7 @@ class PathSelector {
       : centralizedCriteriaList_(getCentralizedCriteriaList(selector)),
         bgpNativeMinNexthop_(
             selector.bgp_native_path_selection_min_nexthop().to_optional()),
-        drainOnMinNexthopViolation_(
+        drainOnMinCapacityThresholdViolation_(
             selector.drain_on_min_nexthop_violation().to_optional()),
         bgpNativeMinAggLbwbps_(
             selector.bgp_min_aggregate_lbw_bps().to_optional()),
@@ -177,8 +215,8 @@ class PathSelector {
     return bgpNativeMinNexthop_;
   }
 
-  const std::optional<bool>& getDrainOnMinNexthopViolation() const {
-    return drainOnMinNexthopViolation_;
+  const std::optional<bool>& getDrainOnMinCapacityThresholdViolation() const {
+    return drainOnMinCapacityThresholdViolation_;
   }
 
   const std::optional<int64_t>& getBgpNativeMinAggLbwbps() const {
@@ -202,7 +240,7 @@ class PathSelector {
 
   // the additional Bgp criterion
   const std::optional<int32_t> bgpNativeMinNexthop_{std::nullopt};
-  const std::optional<bool> drainOnMinNexthopViolation_{std::nullopt};
+  const std::optional<bool> drainOnMinCapacityThresholdViolation_{std::nullopt};
   const std::optional<int64_t> bgpNativeMinAggLbwbps_{std::nullopt};
   const std::optional<bool> relaxBgpNativeMinAggLbwbps_{std::nullopt};
 
@@ -710,8 +748,8 @@ class PathSelectionStatement {
     return pathSelector_.getBgpNativeMinNexthop();
   }
 
-  const std::optional<bool> getDrainOnMinNexthopViolation() const {
-    return pathSelector_.getDrainOnMinNexthopViolation();
+  const std::optional<bool> getDrainOnMinCapacityThresholdViolation() const {
+    return pathSelector_.getDrainOnMinCapacityThresholdViolation();
   }
 
   const std::optional<int64_t>& getBgpNativeMinAggLbwbps() const {

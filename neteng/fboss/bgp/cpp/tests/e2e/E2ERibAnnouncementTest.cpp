@@ -159,4 +159,121 @@ TEST_F(E2ERibAnnouncementTest, RouteWithCommunity) {
   EXPECT_TRUE(verifyRouteAdd("v4", "10.0.0.0", 8, kPeerAddr5, "127.5.0.4"));
 }
 
+/*
+ * Peer specs for the multi-peer flap test (peers 3-5 reuse the defaults).
+ */
+inline const BgpPeerSpec kFlapPeerSpec6 = {
+    .asn = kPeerAsn6,
+    .localAddr = kLocalAddr6,
+    .peerAddr = kPeerAddr6,
+    .v4Nexthop = kNextHopV4_6,
+    .v6Nexthop = kNextHopV6_6,
+};
+
+inline const BgpPeerSpec kFlapPeerSpec7 = {
+    .asn = kPeerAsn7,
+    .localAddr = kLocalAddr7,
+    .peerAddr = kPeerAddr7,
+    .v4Nexthop = kNextHopV4_7,
+    .v6Nexthop = kNextHopV6_7,
+};
+
+/*
+ * Fixture with 5 eBGP peers (3-7), update groups off. Routes are RIB-originated
+ * (local) so every peer is a recipient that gets dumped the full RIB.
+ */
+class E2EMultiPeerFlapTest : public E2ETestFixture {
+ protected:
+  void SetUp() override {
+    addPeer(kDefaultPeerSpec3);
+    addPeer(kDefaultPeerSpec4);
+    addPeer(kDefaultPeerSpec5);
+    addPeer(kFlapPeerSpec6);
+    addPeer(kFlapPeerSpec7);
+    createRib();
+    createPeerManager(
+        /*enableUpdateGroup=*/false, /*enableEgressBackpressure=*/true);
+  }
+};
+
+/*
+ * Stress the rib-dump scheduling/cancellation path across many peers: with 10
+ * routes in the RIB, flap all 5 peers up/down 10 times (each bring-up schedules
+ * a rib dump; each bring-down cancels it via cancelRibDumpForAdjRib), then
+ * bring them all up stably and verify every peer converges to the full RIB.
+ */
+TEST_F(E2EMultiPeerFlapTest, FlapAllPeersDuringRibDumpConvergeToFullRib) {
+  struct FlapPeer {
+    folly::IPAddress addr;
+    folly::IPAddress nexthop;
+  };
+  const std::vector<FlapPeer> peers = {
+      {kPeerAddr3, kNextHopV4_3},
+      {kPeerAddr4, kNextHopV4_4},
+      {kPeerAddr5, kNextHopV4_5},
+      {kPeerAddr6, kNextHopV4_6},
+      {kPeerAddr7, kNextHopV4_7},
+  };
+
+  /*
+   * Inject 10 RIB-originated routes so there are 10 routes to dump to each peer
+   * that comes up.
+   */
+  constexpr int kNumRoutes = 10;
+  std::vector<std::string> prefixes;
+  for (int i = 0; i < kNumRoutes; ++i) {
+    const auto prefix = fmt::format("10.{}.0.0", i);
+    prefixes.push_back(prefix);
+    injectLocalRoutesAtRuntime({fmt::format("{}/16", prefix)}, {}, kLocalPref);
+    ASSERT_TRUE(waitForRouteInShadowRib(
+        folly::IPAddress::createNetwork(fmt::format("{}/16", prefix))));
+  }
+
+  /*
+   * Flap all 5 peers up/down 10 times: each round brings every peer up (rib
+   * dumps in flight) then tears every peer down (cancelling them). Increasing
+   * version numbers keep each incarnation fresh.
+   */
+  for (int round = 0; round < 10; ++round) {
+    for (const auto& p : peers) {
+      bringUpPeer(p.addr, round + 1);
+    }
+    for (const auto& p : peers) {
+      bringDownPeer(p.addr);
+    }
+  }
+
+  /*
+   * Final stable bring-up of all peers EXCEPT the last one, which is kept down.
+   * The peers that come up must converge to the full RIB; the one left down
+   * must not become established (its last scheduled dump was cancelled on
+   * teardown).
+   */
+  const auto& downPeer = peers.back();
+  for (size_t i = 0; i + 1 < peers.size(); ++i) {
+    bringUpPeer(peers[i].addr, 100);
+    sendEoRToPeer(BgpPeerId{peers[i].addr, peers[i].addr.asV4().toLongHBO()});
+  }
+  for (size_t i = 0; i + 1 < peers.size(); ++i) {
+    const auto& p = peers[i];
+    std::vector<VerifySpec> expected;
+    for (const auto& prefix : prefixes) {
+      expected.push_back(
+          {.prefix = prefix,
+           .prefixLen = 16,
+           .expectedNexthop = p.nexthop.str()});
+    }
+    EXPECT_TRUE(verifyRoutes("v4", p.addr, expected))
+        << "peer " << p.addr.str() << " did not converge to the full RIB";
+  }
+
+  /* The peer kept down must not be established. */
+  auto downAdjRib = getAdjRibByAddr(downPeer.addr);
+  if (downAdjRib) {
+    EXPECT_FALSE(downAdjRib->isStateEstablished())
+        << "peer " << downPeer.addr.str()
+        << " was kept down but is established";
+  }
+}
+
 } // namespace facebook::bgp

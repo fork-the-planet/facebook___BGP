@@ -17,14 +17,22 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <boost/filesystem.hpp>
+
 #include <fb303/FollyLoggingHandler.h>
 #include <fb303/ServiceData.h>
+#include <folly/FileUtil.h>
+#include <folly/ScopeGuard.h>
 #include <folly/coro/BlockingWait.h>
+#include <folly/coro/Collect.h>
 #include <folly/coro/GtestHelpers.h>
+#include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/logging/LogMessage.h>
 #include <folly/logging/LoggerDB.h>
 #include <folly/logging/test/TestLogHandler.h>
 #include <folly/test/JsonTestUtil.h>
+#include <thrift/lib/cpp2/protocol/Serializer.h>
+#include <thrift/lib/cpp2/util/ScopedServerInterfaceThread.h>
 
 #include "neteng/fboss/bgp/cpp/BgpServiceDC.h"
 #include "neteng/fboss/bgp/cpp/BgpServiceUtil.h"
@@ -1197,6 +1205,343 @@ TEST_F(BgpServiceTestFixture, GetNexthopInfoForNexthopInvalidTest) {
   EXPECT_FALSE(
       apache::thrift::is_non_optional_field_set_manually_or_by_serializer(
           nexthopInfo->next_hop()));
+
+  rib_->stop();
+  ribThread.join();
+}
+
+/**
+ * [CRF File Mode Tests]
+ */
+class BgpServiceCrfFileModeTestFixture
+    : public BgpServicePeerGroupValidationTestFixture {
+ public:
+  void SetUp() override {
+    BgpServicePeerGroupValidationTestFixture::SetUp();
+    crfTmpFile_ =
+        fmt::format("/tmp/bgp_service_crf_test_artifact_{}.json", getpid());
+    FLAGS_crf_policy_file = crfTmpFile_;
+  }
+
+  void TearDown() override {
+    boost::filesystem::remove(crfTmpFile_);
+    BgpServicePeerGroupValidationTestFixture::TearDown();
+  }
+
+  void writeCrfArtifact(bool dryrun, int64_t version = 1) {
+    rib_policy::CrfPolicyArtifact artifact;
+    artifact.dryrun() = dryrun;
+    rib_policy::TRouteFilterPolicy policy;
+    policy.version() = version;
+    artifact.policy() = policy;
+
+    folly::writeFileAtomic(
+        crfTmpFile_,
+        apache::thrift::SimpleJSONSerializer::serialize<std::string>(artifact));
+  }
+
+  std::string crfTmpFile_;
+};
+
+CO_TEST_F(
+    BgpServiceCrfFileModeTestFixture,
+    SetCrfPolicyFromFileHappyPathDryrunFalse) {
+  writeCrfArtifact(/*dryrun=*/false);
+
+  /*
+   * Remove non-thread-safe TestLogHandler before starting worker threads
+   * to avoid TSAN data races on the handler's message vector.
+   */
+  folly::LoggerDB::get().getCategory("")->clearHandlers();
+
+  auto peerMgrThread = peerManager_->runInThread();
+  auto sessionMgrThread = sessionMgr_->runInThread();
+  auto ribThread = rib_->runInThread();
+  SCOPE_EXIT {
+    rib_->stop();
+    peerManager_->stop();
+    sessionMgr_->stop();
+    ribThread.join();
+    peerMgrThread.join();
+    sessionMgrThread.join();
+  };
+
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto ret = co_await service_->co_setCrfPolicyFromFile();
+
+  EXPECT_TRUE(*ret->success());
+  EXPECT_THAT(*ret->err(), HasSubstr("FILE_MODE"));
+  EXPECT_TRUE(rib_->isCrfFileModeEnabled());
+}
+
+CO_TEST_F(BgpServiceCrfFileModeTestFixture, SetCrfPolicyFromFileDryrunTrue) {
+  writeCrfArtifact(/*dryrun=*/true);
+
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto ret = co_await service_->co_setCrfPolicyFromFile();
+
+  EXPECT_TRUE(*ret->success());
+  EXPECT_THAT(*ret->err(), HasSubstr("THRIFT_MODE"));
+  EXPECT_FALSE(rib_->isCrfFileModeEnabled());
+}
+
+CO_TEST_F(BgpServiceCrfFileModeTestFixture, SetCrfPolicyFromFileNoArtifact) {
+  FLAGS_crf_policy_file = "/tmp/nonexistent_bgp_service_crf_test_file";
+  boost::filesystem::remove(FLAGS_crf_policy_file);
+
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto ret = co_await service_->co_setCrfPolicyFromFile();
+
+  EXPECT_FALSE(*ret->success());
+}
+
+CO_TEST_F(
+    BgpServiceCrfFileModeTestFixture,
+    SetRouteFilterPolicyRejectedInFileMode) {
+  rib_->setCrfFileModeEnabled(true);
+
+  rib_policy::TRouteFilterPolicy tPolicy;
+  tPolicy.version() = 1;
+
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto res = co_await service_->co_setRouteFilterPolicy(
+      std::make_unique<rib_policy::TRouteFilterPolicy>(tPolicy));
+
+  EXPECT_FALSE(*res->success());
+  EXPECT_THAT(*res->err(), HasSubstr("FILE_MODE"));
+}
+
+CO_TEST_F(
+    BgpServiceCrfFileModeTestFixture,
+    ClearRouteFilterPolicySkippedInFileMode) {
+  // First apply a CRF policy via FILE_MODE
+  writeCrfArtifact(/*dryrun=*/false, /*version=*/42);
+
+  folly::LoggerDB::get().getCategory("")->clearHandlers();
+  auto peerMgrThread = peerManager_->runInThread();
+  auto sessionMgrThread = sessionMgr_->runInThread();
+  auto ribThread = rib_->runInThread();
+  SCOPE_EXIT {
+    rib_->stop();
+    peerManager_->stop();
+    sessionMgr_->stop();
+    ribThread.join();
+    peerMgrThread.join();
+    sessionMgrThread.join();
+  };
+
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto ret = co_await service_->co_setCrfPolicyFromFile();
+  CO_ASSERT_TRUE(*ret->success());
+  EXPECT_TRUE(rib_->isCrfFileModeEnabled());
+
+  // Try to clear — should be silently skipped in FILE_MODE
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  co_await service_->co_clearRouteFilterPolicy();
+
+  // Verify FILE_MODE is still active and policy was NOT cleared
+  EXPECT_TRUE(rib_->isCrfFileModeEnabled());
+}
+
+// Validation failure: artifact policy references a non-existent peer group
+CO_TEST_F(
+    BgpServiceCrfFileModeTestFixture,
+    SetCrfPolicyFromFileValidationFailure) {
+  // Write an artifact with key_type=PEER_GROUP_NAME and a non-existent group
+  rib_policy::CrfPolicyArtifact artifact;
+  artifact.dryrun() = false;
+  rib_policy::TRouteFilterPolicy policy;
+  policy.version() = 1;
+  policy.key_type() = rib_policy::KeyType::PEER_GROUP_NAME;
+  policy.statements()->emplace(
+      "nonexistent-peer-group", createTRouteFilterStatement({}, false, true));
+  artifact.policy() = policy;
+
+  folly::writeFileAtomic(
+      crfTmpFile_,
+      apache::thrift::SimpleJSONSerializer::serialize<std::string>(artifact));
+
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto ret = co_await service_->co_setCrfPolicyFromFile();
+
+  EXPECT_FALSE(*ret->success());
+  EXPECT_THAT(*ret->err(), HasSubstr("PEER_GROUP_NOT_FOUND"));
+  // FILE_MODE should NOT be set on validation failure
+  EXPECT_FALSE(rib_->isCrfFileModeEnabled());
+}
+
+// Full lifecycle: enable FILE_MODE → reject Thrift → disable → accept Thrift
+CO_TEST_F(
+    BgpServiceCrfFileModeTestFixture,
+    CrfFileModeCycleEnableRejectDisableAccept) {
+  // Step 1: Enable FILE_MODE via setCrfPolicyFromFile(dryrun=false)
+  writeCrfArtifact(/*dryrun=*/false);
+
+  folly::LoggerDB::get().getCategory("")->clearHandlers();
+  auto peerMgrThread = peerManager_->runInThread();
+  auto sessionMgrThread = sessionMgr_->runInThread();
+  auto ribThread = rib_->runInThread();
+  SCOPE_EXIT {
+    rib_->stop();
+    peerManager_->stop();
+    sessionMgr_->stop();
+    ribThread.join();
+    peerMgrThread.join();
+    sessionMgrThread.join();
+  };
+
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto ret = co_await service_->co_setCrfPolicyFromFile();
+  CO_ASSERT_TRUE(*ret->success());
+  EXPECT_TRUE(rib_->isCrfFileModeEnabled());
+
+  // Step 2: Thrift setRouteFilterPolicy should be rejected
+  rib_policy::TRouteFilterPolicy tPolicy;
+  tPolicy.version() = 99;
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto setRet = co_await service_->co_setRouteFilterPolicy(
+      std::make_unique<rib_policy::TRouteFilterPolicy>(tPolicy));
+  EXPECT_FALSE(*setRet->success());
+  EXPECT_THAT(*setRet->err(), HasSubstr("FILE_MODE"));
+
+  // Step 3: Disable FILE_MODE via setCrfPolicyFromFile(dryrun=true)
+  writeCrfArtifact(/*dryrun=*/true);
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto disableRet = co_await service_->co_setCrfPolicyFromFile();
+  EXPECT_TRUE(*disableRet->success());
+  EXPECT_FALSE(rib_->isCrfFileModeEnabled());
+
+  // Step 4: Thrift setRouteFilterPolicy should now succeed
+  rib_policy::TRouteFilterPolicy tPolicy2;
+  tPolicy2.version() = 50;
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto acceptRet = co_await service_->co_setRouteFilterPolicy(
+      std::make_unique<rib_policy::TRouteFilterPolicy>(tPolicy2));
+  EXPECT_TRUE(*acceptRet->success());
+}
+
+/*
+ * Concurrency: file-mode refreshes racing Thrift CRF updates must be serialized
+ * by crfPolicyMutex_ (the file API takes the exclusive lock; the Thrift API
+ * takes a shared lock and is gated on FILE_MODE). The fleet of operations runs
+ * in parallel on a multi-threaded executor; the test asserts there is no crash,
+ * deadlock, or data race (under TSAN) and that the service is left in a
+ * consistent state.
+ */
+CO_TEST_F(
+    BgpServiceCrfFileModeTestFixture,
+    CrfFileModeConcurrentThriftAndFileMode) {
+  // dryrun=false → every file-mode refresh enables and applies FILE_MODE.
+  writeCrfArtifact(/*dryrun=*/false);
+
+  /*
+   * Remove non-thread-safe TestLogHandler before starting worker threads to
+   * avoid TSAN data races on the handler's message vector.
+   */
+  folly::LoggerDB::get().getCategory("")->clearHandlers();
+
+  auto peerMgrThread = peerManager_->runInThread();
+  auto sessionMgrThread = sessionMgr_->runInThread();
+  auto ribThread = rib_->runInThread();
+  SCOPE_EXIT {
+    rib_->stop();
+    peerManager_->stop();
+    sessionMgr_->stop();
+    ribThread.join();
+    peerMgrThread.join();
+    sessionMgrThread.join();
+  };
+
+  constexpr int kIters = 25;
+  folly::CPUThreadPoolExecutor exec(4);
+
+  // Interleave file-mode refreshes and Thrift CRF updates so they contend for
+  // crfPolicyMutex_. Both RPCs return std::unique_ptr<TResult>.
+  std::vector<folly::coro::Task<std::unique_ptr<TResult>>> tasks;
+  tasks.reserve(kIters * 2);
+  for (int i = 0; i < kIters; ++i) {
+    // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+    tasks.push_back(service_->co_setCrfPolicyFromFile());
+
+    rib_policy::TRouteFilterPolicy tPolicy;
+    tPolicy.version() = 1000 + i;
+    // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+    tasks.push_back(service_->co_setRouteFilterPolicy(
+        std::make_unique<rib_policy::TRouteFilterPolicy>(tPolicy)));
+  }
+
+  auto results = co_await folly::coro::co_withExecutor(
+      &exec, folly::coro::collectAllRange(std::move(tasks)));
+
+  // Every operation completed with a well-formed result. A Thrift update either
+  // succeeded (it ran before FILE_MODE took effect) or was gracefully rejected
+  // with a FILE_MODE error — never UB or a partial/garbage result.
+  for (const auto& res : results) {
+    CO_ASSERT_NE(res, nullptr);
+    if (!*res->success()) {
+      EXPECT_THAT(*res->err(), HasSubstr("FILE_MODE"));
+    }
+  }
+
+  // Thrift updates never clear FILE_MODE, so once any refresh has run the
+  // terminal state is deterministically FILE_MODE enabled.
+  EXPECT_TRUE(rib_->isCrfFileModeEnabled());
+}
+
+// Test co_getPartialDrainStatus — dispatches onto Rib evb, returns empty
+// status when no partial-drain entries exist.
+TEST_F(BgpServiceTestFixture, CoGetPartialDrainStatusTest) {
+  auto ribThread = rib_->runInThread();
+
+  auto handler = std::shared_ptr<BgpServiceBase>(service_.get(), [](auto*) {});
+  apache::thrift::ScopedServerInterfaceThread server(handler);
+  auto client = server.newClient<apache::thrift::Client<TBgpService>>();
+
+  auto status = folly::coro::blockingWait(client->co_getPartialDrainStatus());
+
+  EXPECT_FALSE(*status.is_partially_drained());
+  EXPECT_EQ(0, *status.num_affected_prefixes());
+  EXPECT_EQ(0, *status.partial_drain_transition_count());
+  EXPECT_EQ(0, service_->numRequestsInExecution());
+
+  rib_->stop();
+  ribThread.join();
+}
+
+// Test co_getPartialDrainState — dispatches onto Rib evb, returns empty
+// state when no partial-drain entries exist.
+TEST_F(BgpServiceTestFixture, CoGetPartialDrainStateTest) {
+  auto ribThread = rib_->runInThread();
+
+  auto handler = std::shared_ptr<BgpServiceBase>(service_.get(), [](auto*) {});
+  apache::thrift::ScopedServerInterfaceThread server(handler);
+  auto client = server.newClient<apache::thrift::Client<TBgpService>>();
+
+  auto state = folly::coro::blockingWait(client->co_getPartialDrainState());
+
+  EXPECT_FALSE(*state.partial_drain_state()->is_partially_drained());
+  EXPECT_EQ(0, *state.partial_drain_state()->num_affected_prefixes());
+  EXPECT_TRUE(state.drained_prefixes()->empty());
+  EXPECT_EQ(0, service_->numRequestsInExecution());
+
+  rib_->stop();
+  ribThread.join();
+}
+
+// Test co_getPartiallyDrainedPrefixes — dispatches onto Rib evb, returns
+// empty list when no partial-drain entries exist.
+TEST_F(BgpServiceTestFixture, CoGetPartiallyDrainedPrefixesTest) {
+  auto ribThread = rib_->runInThread();
+
+  auto handler = std::shared_ptr<BgpServiceBase>(service_.get(), [](auto*) {});
+  apache::thrift::ScopedServerInterfaceThread server(handler);
+  auto client = server.newClient<apache::thrift::Client<TBgpService>>();
+
+  auto prefixes =
+      folly::coro::blockingWait(client->co_getPartiallyDrainedPrefixes());
+
+  EXPECT_TRUE(prefixes.empty());
+  EXPECT_EQ(0, service_->numRequestsInExecution());
 
   rib_->stop();
   ribThread.join();

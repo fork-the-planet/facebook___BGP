@@ -16,9 +16,11 @@
 
 #pragma once
 
+#include <folly/IPAddress.h>
 #include <folly/logging/xlog.h>
 
 #include "neteng/fboss/bgp/cpp/common/RibMessage.h"
+#include "neteng/fboss/bgp/cpp/common/Structs.h"
 #include "neteng/fboss/bgp/if/gen-cpp2/bgp_thrift_types.h"
 
 namespace facebook::bgp {
@@ -46,4 +48,16 @@ std::pair<uint32_t, uint32_t> findLargestFreePathIdInterval(
         folly::F14NodeMap<uint32_t, std::shared_ptr<RouteInfo>>>& routeInfos,
     uint32_t minPathId,
     uint32_t maxPathId);
+
+// Build the thrift TIpPrefix (afi / num_bits / prefix_bin) for a CIDRNetwork.
+neteng::fboss::bgp_attr::TIpPrefix buildTPrefix(
+    const folly::CIDRNetwork& prefix);
+
+/*
+ * Build the thrift TBgpPath for a single RouteInfo. Does not set is_best_path;
+ * the caller sets that on the selected best path.
+ */
+neteng::fboss::bgp::thrift::TBgpPath toTBgpPath(
+    const std::shared_ptr<RouteInfo>& routeinfo,
+    const std::shared_ptr<const WeightedNexthopMap>& weightedNexthops);
 } // namespace facebook::bgp

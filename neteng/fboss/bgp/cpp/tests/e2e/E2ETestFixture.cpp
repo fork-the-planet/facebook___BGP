@@ -31,8 +31,12 @@
 #include "neteng/fboss/bgp/cpp/policy/PolicyManager.h"
 #include "neteng/fboss/bgp/cpp/tests/AdjRibInUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/AdjRibOutUtils.h"
+#include "neteng/fboss/bgp/cpp/tests/BoundedWaitUtils.h"
 
 #include "neteng/fboss/bgp/cpp/tests/PeerManagerTestUtils.h"
+
+using facebook::bgp::test::boundedBlockingPop;
+using facebook::bgp::test::BoundedWaitTimeout;
 
 namespace facebook {
 namespace bgp {
@@ -48,7 +52,7 @@ std::shared_ptr<Config> E2ETestFixture::getConfig(
   thriftConfig.graceful_restart_convergence_seconds() =
       grConvergenceSecondsOverride_.value_or(kGrRestartTime.count());
   thriftConfig.listen_addr() = kLocalAddr1.str();
-  thriftConfig.eor_time_s() = 45;
+  thriftConfig.eor_time_s() = eorTimeSecondsOverride_.value_or(45);
   /*
    * Use port 0 for OS-assigned dynamic port allocation. This avoids port
    * collision when running multiple tests in parallel (e.g., with stress-runs).
@@ -296,10 +300,27 @@ void E2ETestFixture::bringDownPeer(
       .sessionInfo = nullptr,
       .peerDelete = peerDelete};
 
-  auto& evb = peerManager_->getEventBase();
-  folly::via(&evb, [this, terminateEvent]() {
-    folly::coro::blockingWait(peerManager_->sessionTerminated(terminateEvent));
-  }).wait();
+  /*
+   * Drive sessionTerminated on the PeerManager EVB while blocking the *test*
+   * thread (not the EVB thread) for completion, mirroring delPeerAtRuntime().
+   *
+   * The earlier folly::via(&evb, [...]{ blockingWait(...); }).wait() ran
+   * blockingWait *on* the EVB thread, occupying the EVB loop for the whole
+   * duration of sessionTerminated. When the terminate removes the last member
+   * of an update group, sessionTerminated co_awaits
+   * UpdateGroupManager::maybeDestroyUpdateGroup() ->
+   * AdjRibOutGroup::drainAsyncScope(), which requests cancellation of the
+   * group's async-scope coroutines and then co_awaits asyncScope_.joinAsync().
+   * Those coroutines are bound to the EVB; with the loop blocked inside
+   * blockingWait they can never run to observe the cancellation, so
+   * joinAsync() never completes and the EVB deadlocks. Scheduling the task on
+   * the EVB and waiting from the test thread keeps the loop free to drain the
+   * scope, exactly as sessionTerminated runs in production.
+   */
+  folly::coro::blockingWait(
+      folly::coro::co_withExecutor(
+          &peerManager_->getEventBase(),
+          peerManager_->sessionTerminated(terminateEvent)));
 
   XLOGF(INFO, "Session termination complete for peer: {}", peerAddr.str());
 }
@@ -1392,15 +1413,23 @@ std::optional<QueueMessage> popFromQueue(
           INFO,
           "Test READING from QUEUE POINTER {}",
           (void*)queues.boundedAdjRibOutQ.get());
-      return folly::coro::blockingWait(queues.boundedAdjRibOutQ->pop());
+      return boundedBlockingPop(*queues.boundedAdjRibOutQ, "boundedAdjRibOutQ");
     } else {
       XLOGF(
           INFO,
           "Test READING from QUEUE POINTER {}",
           (void*)queues.adjRibOutQ.get());
-      return folly::coro::blockingWait(queues.adjRibOutQ->pop());
+      return boundedBlockingPop(*queues.adjRibOutQ, "adjRibOutQ");
     }
+  } catch (const BoundedWaitTimeout&) {
+    /*
+     * Wait timed out — propagate so the test fails fast with the
+     * descriptive message from boundedBlockingPop instead of silently
+     * returning nullopt (which would let the test hang elsewhere).
+     */
+    throw;
   } catch (const std::exception&) {
+    /* Queue closed / cancelled — callers handle nullopt gracefully. */
     return std::nullopt;
   }
 }
@@ -1759,11 +1788,12 @@ std::optional<std::shared_ptr<const BgpUpdate2>> deserializeUpdateDescriptor(
  * here.
  *
  * maxDrainAttempts caps how many pops we issue while skipping non-UPDATE
- * messages (e.g. multiple EoRs in a row). Default 0 = unbounded for
- * backwards compatibility with callers that depend on the blocking
- * semantics. Bounded callers (e.g. waitForOutboundUpdate) pass a small
- * positive limit so a queue that runs dry between empty-check and pop
- * doesn't trap the test thread in popFromQueue's unbounded blockingWait.
+ * messages (e.g. multiple EoRs in a row). Default 0 means "no early-exit
+ * check, just keep popping" — safe now that popFromQueue is bounded via
+ * boundedBlockingPop (kDefaultPopTimeout), so a permanently empty queue
+ * surfaces as a BoundedWaitTimeout instead of a real hang. Bounded
+ * callers (e.g. waitForOutboundUpdate) pass a small positive limit to
+ * bail early when the queue runs dry between checks.
  */
 std::optional<std::shared_ptr<const BgpUpdate2>> tryReadUpdateFromQueue(
     const E2ETestFixture::PeerQueues& queues,
@@ -1875,7 +1905,11 @@ E2ETestFixture::readOutboundUpdateToPeer(const BgpPeerId& peerId) {
       (void*)queues->boundedAdjRibOutQ.get(),
       useBoundedQueue);
 
-  /* popFromQueue() does blockingWait - no retries needed */
+  /*
+   * popFromQueue() is now bounded (boundedBlockingPop, kDefaultPopTimeout).
+   * If no UPDATE arrives within that budget, the test fails with a
+   * descriptive BoundedWaitTimeout instead of hanging until tpx kills it.
+   */
   return tryReadUpdateFromQueue(*queues, useBoundedQueue);
 }
 

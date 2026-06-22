@@ -103,7 +103,7 @@ class ConnTimeParams {
     return connectTimeout;
   }
 
-  folly::Optional<Duration> getMaxRetryTimeout() const {
+  std::optional<Duration> getMaxRetryTimeout() const {
     return maxRetryTimeout;
   }
 
@@ -137,7 +137,7 @@ class ConnTimeParams {
   Duration minRetryTimeout{kDefaultConnRetryTimeoutMs};
   Duration connectTimeout{kDefaultConnectTimeoutMs};
   // Max retry timeout applicable only when exponentional backoff is turned ON
-  folly::Optional<Duration> maxRetryTimeout;
+  std::optional<Duration> maxRetryTimeout;
   bool enableSessionExponentialBackoff{false};
   Duration minSessionRetryTimeout{};
   Duration maxSessionRetryTimeout{};
@@ -157,16 +157,14 @@ struct BgpPeerActiveConnectInfo {
    * TCP connection backoff. Failure to establish TCP connection will
    * backoff for the next attempt
    */
-  folly::Optional<
-      facebook::fboss::ExponentialBackoff<std::chrono::milliseconds>>
+  std::optional<facebook::fboss::ExponentialBackoff<std::chrono::milliseconds>>
       connectBackoff;
   /**
    * BGP session backoff. Excluding TCP connection attempts, failures
    * to keep BGP sessions up and running within dampening duration
    * results in this backoff
    */
-  folly::Optional<
-      facebook::fboss::ExponentialBackoff<std::chrono::milliseconds>>
+  std::optional<facebook::fboss::ExponentialBackoff<std::chrono::milliseconds>>
       sessionBackoff;
 
   void connectBackoffReportError() {
@@ -360,7 +358,7 @@ struct BgpSessionInfo {
   // established --> terminate or terminate --> established
   std::shared_ptr<VersionNumber> versionNumber;
   // Set only when session goes down from ESTABLISHED state
-  folly::Optional<ResetReason> lastResetReason;
+  std::optional<ResetReason> lastResetReason;
   // number of times peer went down
   uint64_t numResets{0};
   // last time peer went down
@@ -551,7 +549,7 @@ class FiberBgpPeerManager
           ConnTimeParams(kDefaultStartAfterDelayMs, kDefaultConnRetryTimeoutMs),
       const bgp::TBgpSessionConnectMode connectMode =
           bgp::TBgpSessionConnectMode::PASSIVE_ACTIVE,
-      const folly::Optional<uint32_t>& localBgpIdOpt = folly::none);
+      const std::optional<uint32_t>& localBgpIdOpt = std::nullopt);
   virtual folly::Expected<folly::Unit, ErrorCode> addPeer(
       const folly::IPAddress& peerAddr,
       const bgp::PeeringParams& params,
@@ -653,7 +651,7 @@ class FiberBgpPeerManager
       const uint64_t versionNumber) const noexcept;
 
   // accessor
-  folly::Optional<folly::SocketAddress> getListenAddress() const noexcept;
+  std::optional<folly::SocketAddress> getListenAddress() const noexcept;
   RQueue<ObservableEventT> getNotifyQueue() noexcept;
   bgp::coro::MPMCQueue<ObservableEventT>& getNotifyCoroQueue() noexcept;
 
@@ -679,7 +677,7 @@ class FiberBgpPeerManager
 
   MAKE_CORO_FUNCTION(getAllPeerDisplayInfos)
 
-  folly::Optional<std::shared_ptr<BgpSessionInfo>> getBgpSessionInfo(
+  std::optional<std::shared_ptr<BgpSessionInfo>> getBgpSessionInfo(
       const BgpPeerId& peerId) const noexcept;
 
   // returns a vector because there could be more than one active session
@@ -700,7 +698,7 @@ class FiberBgpPeerManager
 
   // Util functions used inside observable event processing
   static bool needToKeepThisPeer(
-      folly::Optional<folly::SocketAddress> localListenAddress,
+      std::optional<folly::SocketAddress> localListenAddress,
       std::shared_ptr<FiberBgpPeer> peer);
 
   // get establishedSessionInfo from peerInfo for the given bgpId
@@ -776,7 +774,7 @@ class FiberBgpPeerManager
       FiberSocket&& socket) noexcept;
 
   virtual std::unique_ptr<FiberServerSocket> makeServerSocket(
-      const folly::Optional<folly::SocketAddress>& listenAddr) const noexcept;
+      const std::optional<folly::SocketAddress>& listenAddr) const noexcept;
 
   // Set necessary socket options on server socket
   void setServerSocketOptions() noexcept;
@@ -796,7 +794,7 @@ class FiberBgpPeerManager
       const BgpPeerId& peerId) const noexcept;
 
   // Given a peer address check if it falls into one of the dynamic peer groups
-  folly::Optional<folly::CIDRNetwork> getPeerPrefix(
+  std::optional<folly::CIDRNetwork> getPeerPrefix(
       const folly::IPAddress& peerAddr) const noexcept;
 
   // Given a peer prefix get all configured peer address within the prefix range

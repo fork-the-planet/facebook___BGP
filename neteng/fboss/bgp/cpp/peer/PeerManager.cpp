@@ -24,6 +24,8 @@
 #include <folly/IPAddress.h>
 #include <folly/Likely.h>
 #include <folly/Overload.h>
+#include <folly/ScopeGuard.h>
+#include <folly/coro/CurrentExecutor.h>
 #include <folly/coro/Sleep.h>
 #include <folly/coro/WithCancellation.h>
 #include <folly/logging/xlog.h>
@@ -570,23 +572,15 @@ void PeerManager::stop() noexcept {
   auto task = [&]() -> folly::coro::Task<void> {
     XLOG(INFO, "Signaling all peer manager fibers to stop ...");
 
-    // Mark daemon shutdown first to enable fast cleanup paths in
-    // adjribs' sessionTerminated() before shutdownWithGR triggers them
-    markDaemonShutdown();
-
-    saveGrState();
+    /*
+     * markDaemonShutdown() and saveGrState() are now called from Main.cpp
+     * before sessionMgr->stop() to preserve GR state before sessions terminate.
+     * shutdownWithGR() is called by SessionManager::stop() in Main.cpp.
+     */
 
     // reset all of the timers
     eorTimer_.reset();
     initializedSignalTimer_.reset();
-
-    // stop Session Manager fibers -> all AdjRib sessionTerminated()
-    // -> stop processPeerEvent loop
-    // Null check needed because stop() can be called without run() (e.g. in
-    // test cleanup where PeerManager is driven manually without a session mgr)
-    if (sessionMgr_) {
-      sessionMgr_->shutdownWithGR(GracefulRestartFlag{false});
-    }
 
     for (const auto& [_, adjRib] : adjRibs_) {
       if (adjRib) {
@@ -627,16 +621,20 @@ void PeerManager::stop() noexcept {
   folly::coro::blockingWait(folly::coro::co_withExecutor(&evb_, task()));
 
   folly::coro::blockingWait(asyncScope_.cancelAndJoinAsync());
-  XLOG(INFO, "[Exit] All coro tasks finished.");
+  XLOGF(INFO, "[Exit] All coro tasks finished.");
 }
 
-void PeerManager::markDaemonShutdown() noexcept {
-  XLOG(INFO, "Marking BGP daemon shutdown for all AdjRibs...");
-  for (const auto& [_, adjRib] : adjRibs_) {
-    if (adjRib) {
-      adjRib->setDaemonShutdown();
+void PeerManager::markDaemonShutdown() {
+  evb_.runImmediatelyOrRunInEventBaseThreadAndWait([this] {
+    XLOGF(INFO, "Marking BGP daemon shutdown for all AdjRibs...");
+    daemonShutdown_ = true;
+
+    for (const auto& [_, adjRib] : adjRibs_) {
+      if (adjRib) {
+        adjRib->setDaemonShutdown();
+      }
     }
-  }
+  });
 }
 
 folly::coro::Task<void> PeerManager::processPeerEventLoop() noexcept {
@@ -795,17 +793,26 @@ void PeerManager::markRibInitialAnnouncementDone() noexcept {
 
   ribInitialAnnouncementDone_ = true;
 
-  if (enableUpdateGroup_ && updateGroupManager_) {
-    /*
-     * BGP initialization complete - trigger group-level initial dumps
-     * for any update groups in UNINITIALIZED state
-     */
-    updateGroupManager_->triggerInitialDumpsForUninitializedGroups();
+  if (enableUpdateGroup_) {
+    if (updateGroupManager_) {
+      /*
+       * BGP initialization complete - trigger group-level initial dumps
+       * for any update groups in UNINITIALIZED state
+       */
+      updateGroupManager_->triggerInitialDumpsForUninitializedGroups();
+    } else {
+      XLOG(
+          ERR,
+          "Unexpected uninitialized UpdateGroupManager when update groups is enabled");
+    }
   } else {
     /*
      * Non-update-group mode: handle all pending RibDumpReqs
      */
-    asyncScope_.add(co_withExecutor(&evb_, handleBufferedRibDumpReqs()));
+    if (!handleRibDumpsScheduled_) {
+      handleRibDumpsScheduled_ = true;
+      asyncScope_.add(co_withExecutor(&evb_, handleBufferedRibDumpReqs()));
+    }
   }
 }
 
@@ -942,16 +949,67 @@ folly::coro::Task<void> PeerManager::processRibDumpReqCoro(
         ribDumpReq.peerId.str());
     co_return;
   }
-  if (FOLLY_UNLIKELY(adjrib->second->testOnlyDeferInitDump)) {
-    XLOGF(
-        INFO,
-        "testOnlyDeferInitDump: re-buffering RibDumpReq for peer {}",
-        ribDumpReq.peerId.str());
-    maybeBufferRibDumpReq(adjrib->second);
+
+  processRibDumpReq(adjrib->second, ribDumpReq.sendAddPath);
+  co_return;
+}
+
+/*
+ * Cancellable variant of processRibDumpReqCoro used by scheduleRibDumpForAdjRib
+ * for update-group peers. The rib dump is tracked by the AdjRib's cancellation
+ * source so it can be superseded by a newer dump or cancelled on session
+ * teardown.
+ */
+folly::coro::Task<void> PeerManager::processRibDumpReqWithCancellationCoro(
+    std::shared_ptr<AdjRib> adjRib) {
+  auto cancelToken = co_await folly::coro::co_current_cancellation_token;
+
+  /*
+   * If this dump was cancelled -- superseded by a newer dump for the same peer,
+   * or cancelled on session teardown -- skip it entirely. Whoever cancelled us
+   * now owns the cancellation source, so we must neither deliver a stale dump
+   * nor touch the source.
+   */
+  if (cancelToken.isCancellationRequested()) {
     co_return;
   }
 
-  processRibDumpReq(adjrib->second, ribDumpReq.sendAddPath);
+  if (FOLLY_UNLIKELY(adjRib->testOnlyDeferInitDump)) {
+    /*
+     * The dump is deferred, not completed. Retire this coro's cancellation
+     * source and schedule a fresh dump so the peer stays "scheduled" (a dump is
+     * always in flight) until the defer condition clears. We must reset before
+     * rescheduling so scheduleRibDumpForAdjRib does not coalesce against our
+     * own existing source, and we keep this above the SCOPE_EXIT below so the
+     * reset does not discard the new source.
+     */
+    XLOGF(
+        INFO,
+        "testOnlyDeferInitDump: re-scheduling RibDumpReq for peer {}",
+        adjRib->getRemotePeerId().str());
+    adjRib->resetRibDumpCancellationSource();
+    scheduleRibDumpForAdjRib(adjRib);
+    co_return;
+  }
+
+  /*
+   * On NORMAL completion, clear the AdjRib's rib-dump tracking so a subsequent
+   * dump can be scheduled. Guard on our own token: if cancellation was
+   * requested (superseded by a newer dump or session teardown), the source has
+   * already been retired/replaced, so we must not overwrite it.
+   *
+   * The dump re-applies the AdjRib's current egress policy to the full RIB, so
+   * also clear any pending egress policy update here (no-op when none is
+   * pending). If we were cancelled, a superseding dump will clear it instead.
+   */
+  SCOPE_EXIT {
+    if (!cancelToken.isCancellationRequested()) {
+      adjRib->resetRibDumpCancellationSource();
+      adjRib->clearPendingEgressPolicyUpdate();
+    }
+  };
+
+  processRibDumpReq(adjRib, adjRib->sendAddPath());
   co_return;
 }
 
@@ -1008,7 +1066,11 @@ void PeerManager::processRibDumpReq(
             shadowRibEntry.multiPathSize,
             shadowRibEntry.aggregateReceivedUcmpWeight,
             shadowRibEntry.aggregateLocalUcmpWeight,
-            shadowRibEntry.ribPolicyUcmpWeight);
+            shadowRibEntry.ribPolicyUcmpWeight,
+            /*newlyInstalledInLocalRib=*/false,
+            std::chrono::system_clock::now(),
+            shadowRibEntry.ribVersion,
+            bestpath->isPartialDrain);
       }
     } else {
       // send out all multipaths with add-path capable peer
@@ -1026,7 +1088,11 @@ void PeerManager::processRibDumpReq(
               shadowRibEntry.multiPathSize,
               shadowRibEntry.aggregateReceivedUcmpWeight,
               shadowRibEntry.aggregateLocalUcmpWeight,
-              shadowRibEntry.ribPolicyUcmpWeight);
+              shadowRibEntry.ribPolicyUcmpWeight,
+              /*newlyInstalledInLocalRib=*/false,
+              std::chrono::system_clock::now(),
+              shadowRibEntry.ribVersion,
+              multipath->isPartialDrain);
         }
       }
     }
@@ -1062,14 +1128,56 @@ void PeerManager::processRibDumpReq(
   }
 }
 
+bool PeerManager::isRibDumpScheduledForAdjRib(
+    const std::shared_ptr<AdjRib>& adjRib) const {
+  /*
+   * A dump is pending for this detached peer if it is either buffered (in
+   * pendingRibDumpAdjRibs_, waiting for the drain) or already scheduled / in
+   * flight on asyncScope_ (its cancellation source is armed). Pure predicate,
+   * no side effects. Update-group only.
+   */
+  return adjRib->isRibDumpScheduled() ||
+      pendingRibDumpAdjRibs_.contains(adjRib);
+}
+
+void PeerManager::cancelRibDumpForAdjRib(
+    const std::shared_ptr<AdjRib>& adjRib) {
+  /*
+   * Cancel a detached peer's pending rib dump. Invokes the cancellation from
+   * AdjRib, but should also unconditionally remove a buffered request so that
+   * the AdjRib isn't serviced in handleBufferedRibDumpsForDetachedPeers.
+   * Update-group only.
+   */
+  if (pendingRibDumpAdjRibs_.erase(adjRib) > 0) {
+    BgpStats::decrPendingRibDumpReqsCount(1);
+  }
+  adjRib->cancelRibDump();
+}
+
+void PeerManager::scheduleRibDumpForAdjRib(
+    const std::shared_ptr<AdjRib>& adjRib) {
+  /*
+   * Coalesce: if a rib dump is already pending for this detached peer --
+   * buffered in pendingRibDumpAdjRibs_ (the drain will serve it) or scheduled /
+   * in flight on asyncScope_ -- do not schedule another. The in-flight/buffered
+   * walk serves the latest ShadowRib state. Update-group only.
+   */
+  if (isRibDumpScheduledForAdjRib(adjRib)) {
+    return;
+  }
+  asyncScope_.add(
+      co_withExecutor(&evb_, processRibDumpReqWithCancellationCoro(adjRib)),
+      adjRib->getCancellationTokenForNewRibDump());
+}
+
 void PeerManager::maybeBufferRibDumpReq(const std::shared_ptr<AdjRib>& adjRib) {
-  const auto& peerId = adjRib->getRemotePeerId();
   /**
    *    Start     Rib is announcing...    Done
    *      | [A1, A2,    ....,          AN] |
    * -----|--------------------------------|--------------> PeerMgr timeline
    *      |                                |
    */
+  const auto& peerId = adjRib->getRemotePeerId();
   if (!ribInitialAnnouncementStarted_) {
     /*
      * For peers that come up before Start
@@ -1102,16 +1210,12 @@ void PeerManager::maybeBufferRibDumpReq(const std::shared_ptr<AdjRib>& adjRib) {
 }
 
 folly::coro::Task<void> PeerManager::handleBufferedRibDumpReqs() {
-  // Skip handling ribDumpReq since EoR is not sent yet.
-  if (!isRibInitialAnnouncementStart()) {
-    XLOG(
-        INFO, "Skip handling buffered RibdumpReqs with ongoing initialization");
-    BgpStats::decrPendingRibDumpReqsCount(pendingRibDumpReqs_.size());
-    pendingRibDumpReqs_.clear();
-    handleRibDumpsScheduled_ = false;
-    co_return;
-  }
-
+  /*
+   * This coroutine is only scheduled when ribInitialAnnouncementDone_ is true
+   * (callers check before scheduling). ribInitialAnnouncementStarted_ is
+   * always set before ribInitialAnnouncementDone_, so
+   * isRibInitialAnnouncementStart() is guaranteed true here.
+   */
   XLOG(INFO, "Handling all buffered RibDumpReqs");
 
   folly::F14NodeMap<nettools::bgplib::BgpPeerId, bool /* sendAddPath */>
@@ -1142,6 +1246,91 @@ folly::coro::Task<void> PeerManager::handleBufferedRibDumpReqs() {
     handleRibDumpsScheduled_ = false;
   }
 
+  co_return;
+}
+
+void PeerManager::maybeBufferRibDumpForDetachedPeer(
+    const std::shared_ptr<AdjRib>& adjRib) {
+  /**
+   *    Start  Shadow Rib is populating  Done
+   *      | [A1, A2,    ....,          AN] |
+   * -----|--------------------------------|--------------> PeerMgr timeline
+   *      |                                |
+   */
+  const auto& peerId = adjRib->getRemotePeerId();
+  if (!ribInitialAnnouncementDone_) {
+    /*
+     * For peers that come up before DONE
+     * (i.e. ribInitialAnnouncementDone_ = false),
+     * they should wait with the update group that they have joined;
+     * on markRibInitialAnnouncementDone_ = true, all the groups will
+     * begin to walk the shadow RIB. No need to entertain RibDumpReq
+     * for independent peer.
+     *
+     * We must also not buffer one here: a pre-DONE entry would linger in
+     * pendingRibDumpAdjRibs_ and later get drained by
+     * handleBufferedRibDumpsForDetachedPeers() when the next peer comes up
+     * after DONE (the drain serves the whole set), giving this peer a spurious
+     * independent RIB dump on top of the group's initial shadow-RIB walk.
+     */
+    XLOGF(
+        DBG1,
+        "Waiting for group RIB walk for {}; Rib has not finished initial announcement.",
+        peerId.str());
+    return;
+  }
+
+  /*
+   * For peers that come up after ribInitialAnnouncementDone_, buffer
+   * them in the pending list to be served
+   */
+  XLOGF(INFO, "Insert RibDumpReq in pending list for {}", peerId.str());
+
+  auto [it, inserted] = pendingRibDumpAdjRibs_.insert(adjRib);
+  if (inserted) {
+    BgpStats::incrPendingRibDumpReqsCount();
+  }
+
+  if (!handleRibDumpsScheduled_) {
+    asyncScope_.add(
+        co_withExecutor(&evb_, handleBufferedRibDumpsForDetachedPeers()));
+    handleRibDumpsScheduled_ = true;
+  }
+}
+
+folly::coro::Task<void> PeerManager::handleBufferedRibDumpsForDetachedPeers() {
+  /*
+   * This coroutine is only scheduled when ribInitialAnnouncementDone_ is true
+   * (callers check before scheduling). ribInitialAnnouncementStarted_ is
+   * always set before ribInitialAnnouncementDone_, so
+   * isRibInitialAnnouncementStart() is guaranteed true here.
+   */
+  XLOG(INFO, "Handling all buffered RibDumpReqs for detached peers");
+
+  /**
+   * Drain the buffered RibDumpReqs one at a time, co_awaiting each per-peer
+   * dump inline so they run sequentially. The sleep between dumps paces the
+   * ShadowRib walks so a large batch does not monopolize the event base. Always
+   * take begin(): requests buffered during a sleep are picked up by a later
+   * iteration, so no copy or self-reschedule is needed. No lock is needed
+   * because only one fiber or coro runs at once on the PeerManager event base.
+   */
+  while (!pendingRibDumpAdjRibs_.empty()) {
+    auto adjRib = *pendingRibDumpAdjRibs_.begin();
+    pendingRibDumpAdjRibs_.erase(pendingRibDumpAdjRibs_.begin());
+    BgpStats::decrPendingRibDumpReqsCount(1);
+
+    XLOGF(
+        INFO,
+        "Handling pending RibDumpReq for detached peer {}",
+        adjRib->getRemotePeerId().str());
+
+    co_await processRibDumpReqWithCancellationCoro(adjRib);
+    co_await folly::coro::sleepReturnEarlyOnCancel(
+        std::chrono::milliseconds(1));
+  }
+
+  handleRibDumpsScheduled_ = false;
   co_return;
 }
 
@@ -1223,7 +1412,7 @@ void PeerManager::handleShadowRibEntryAnnouncement(
   for (const auto& entry : announcement.entries) {
     // bestpath only advertisement, hence the pathId will always be 0
     auto srRouteInfo = std::make_shared<ShadowRibRouteInfo>(
-        entry.peer, entry.attrs, kDefaultPathID);
+        entry.peer, entry.attrs, kDefaultPathID, entry.isPartialDrain);
     setShadowRibRouteState(srRouteInfo, SHADOWRIBROUTE_IN_UPDATE);
     resetShadowRibRouteState(srRouteInfo, SHADOWRIBROUTE_IN_WITHDRAW);
 
@@ -1280,7 +1469,10 @@ void PeerManager::handleShadowRibEntryAnnouncement(
       ShadowRibRouteInfos multipaths = {
           {pathId,
            std::make_shared<ShadowRibRouteInfo>(
-               entry.peer, entry.attrs, entry.pathIdToSend)}};
+               entry.peer,
+               entry.attrs,
+               entry.pathIdToSend,
+               entry.isPartialDrain)}};
       setShadowRibRouteState(
           multipaths.begin()->second, SHADOWRIBROUTE_IN_UPDATE);
       auto trackableShadowRibEntry =
@@ -1308,7 +1500,7 @@ void PeerManager::handleShadowRibEntryAnnouncement(
       auto trackedObject = srEntryIter->second.get();
       auto& srEntry = trackedObject->get();
       auto srRouteInfo = std::make_shared<ShadowRibRouteInfo>(
-          entry.peer, entry.attrs, entry.pathIdToSend);
+          entry.peer, entry.attrs, entry.pathIdToSend, entry.isPartialDrain);
       setShadowRibRouteState(srRouteInfo, SHADOWRIBROUTE_IN_UPDATE);
       resetShadowRibRouteState(srRouteInfo, SHADOWRIBROUTE_IN_WITHDRAW);
 
@@ -1351,6 +1543,9 @@ void PeerManager::handleShadowRibEntryWithdrawal(
     if (srEntry.bestpath) {
       setShadowRibRouteState(srEntry.bestpath, SHADOWRIBROUTE_IN_WITHDRAW);
       resetShadowRibRouteState(srEntry.bestpath, SHADOWRIBROUTE_IN_UPDATE);
+    }
+    if (entry.ribVersion > srEntry.ribVersion) {
+      srEntry.ribVersion = entry.ribVersion;
     }
     changeListTracker_->publishChange(
         trackedObject, getConsumerBitmapForChange(true /* isBestpathChange */));
@@ -1395,6 +1590,9 @@ void PeerManager::handleShadowRibEntryWithdrawal(
         srEntry.multipaths.at(pathId), SHADOWRIBROUTE_IN_WITHDRAW);
     resetShadowRibRouteState(
         srEntry.multipaths.at(pathId), SHADOWRIBROUTE_IN_UPDATE);
+    if (entry.ribVersion > srEntry.ribVersion) {
+      srEntry.ribVersion = entry.ribVersion;
+    }
     const auto& bitmap =
         getConsumerBitmapForChange(false /* isBestpathChange */);
     changeListTracker_->publishChange(trackedObject, bitmap);
@@ -1479,14 +1677,16 @@ folly::coro::Task<void> PeerManager::handleNeighborEventMsg(
      * sessionMgr_->stopPeer() does not work in this case because BGP
      * session is already down and FiberBgpPeer has lost communication
      * with AdjRib.  Therefore, if peer is in GR state, we call
-     * adjRib->stop() directly do this clean up.  See T107593063 /
-     * S254616 for motivation.
+     * adjRib->cleanupGrState() to do this clean up without joining
+     * the asyncScope (which would cause a double-join hang if stop()
+     * is later called during daemon shutdown).
+     * See T107593063 / S254616 for motivation.
      */
     for (auto [peerId, adjRib] : adjRibs_) {
       if (peerId.peerAddr == msg.nbrAddr) {
         if (adjRib && adjRib->isPeerGracefulRestarting()) {
           XLOGF(INFO, "Received {} DOWN while nbr in GR state", peerId.str());
-          co_await adjRib->stop();
+          co_await adjRib->cleanupGrState(/*isDaemonShutdown=*/false);
         }
         // If BGP is in initialization and the NeighborWatcher thread
         // reports a neighbor as down, remove the neighbor from static
@@ -1519,7 +1719,7 @@ folly::coro::Task<void> PeerManager::handleNeighborReachabilityMsg() noexcept {
     }
     if (adjRib && adjRib->isPeerGracefulRestarting()) {
       XLOGF(INFO, "Stopping peer while peer in GR state: {}", peerId.str());
-      co_await adjRib->stop();
+      co_await adjRib->cleanupGrState(/*isDaemonShutdown=*/false);
     } else {
       XLOGF(INFO, "Stopping peer: {}", peerId.str());
     }
@@ -1701,7 +1901,10 @@ folly::coro::Task<void> PeerManager::cleanupPeerState(
     if (establishedGrPeers_.erase(peerId) > 0) {
       BgpStats::decrEstablishedGrPeersCount();
     }
-    if (pendingRibDumpReqs_.erase(peerId) > 0) {
+    const bool removedPendingRibDump = enableUpdateGroup_
+        ? pendingRibDumpAdjRibs_.erase(adjRib) > 0
+        : pendingRibDumpReqs_.erase(peerId) > 0;
+    if (removedPendingRibDump) {
       BgpStats::decrPendingRibDumpReqsCount(1);
     }
   }
@@ -1964,7 +2167,7 @@ folly::coro::Task<void> PeerManager::sessionEstablished(
             INFO,
             "Peer [{}] in DETACHED_INIT_DUMP state, buffering independent RibDumpReq",
             peerId.str());
-        maybeBufferRibDumpReq(adjRib);
+        maybeBufferRibDumpForDetachedPeer(adjRib);
       }
       // else: peer is in INIT state, group handles the initial dump
     }
@@ -2090,9 +2293,17 @@ folly::coro::Task<void> PeerManager::sessionTerminated(
   adjRib->resetInInitialAnnouncement();
   adjRib->deactivateChangeListConsumer();
 
-  // Remove peer's request from pendingRibDumpReqs_ if a RibDumpReq
-  // was made during initialization.
-  if (pendingRibDumpReqs_.erase(peerId) > 0) {
+  if (enableUpdateGroup_) {
+    /*
+     * Drop a buffered request and cancel any scheduled/in-flight rib dump for
+     * this peer (a RibDumpReq may have been made during initialization).
+     */
+    cancelRibDumpForAdjRib(adjRib);
+  } else if (pendingRibDumpReqs_.erase(peerId) > 0) {
+    /*
+     * Remove peer's request from the pending RibDumpReq collection if a
+     * RibDumpReq was made during initialization.
+     */
     BgpStats::decrPendingRibDumpReqsCount(1);
   }
 
@@ -2940,6 +3151,9 @@ bool PeerManager::isPeerDynamic(const folly::IPAddress& peerAddr) {
 }
 
 folly::coro::Task<void> PeerManager::updatePeerCounters() {
+  if (daemonShutdown_) {
+    co_return;
+  }
   auto sessions = co_await sessionMgr_->co_getAllEstablishedPeerDisplayInfo();
   uint32_t establishedNoRoutePeers = 0;
 
@@ -2987,55 +3201,58 @@ void PeerManager::updateEntryStats(TEntryStats& stats) const noexcept {
   stats.total_shadow_rib_entries() = shadowRibEntries_.size();
 }
 
-void PeerManager::saveGrState() noexcept {
-  std::ofstream grFile;
+void PeerManager::saveGrState() {
+  evb_.runImmediatelyOrRunInEventBaseThreadAndWait([this] {
+    std::ofstream grFile;
 
-  if (!configManager_->getConfig()->getBgpGlobalConfig()->supportStatefulGr) {
-    XLOG(INFO, "Stateful GR disabled");
-    return;
-  }
+    if (!configManager_->getConfig()->getBgpGlobalConfig()->supportStatefulGr) {
+      XLOG(INFO, "Stateful GR disabled");
+      return;
+    }
 
-  // We will save only once. We need to save before sessions are brought
-  // down, For SIGTERM (bgp updation) this method will be called only once.
-  // For call to restartSessionsAndExit (agent updation) this method will be
-  // called twice, once before sessions go down and once after SIGTERM is
-  // raised. Ignoring the 2nd call.
-  if (grStateSaved_) {
-    XLOG(INFO, "GR state file was already saved");
-    return;
-  }
-  grStateSaved_ = true;
-  // If we have not yet notified RIB about EOR and we are trying to
-  // terminate, there is no need to store GR state information.
-  if (!ribInitPathComputationNotified_) {
-    XLOG(
-        INFO,
-        "Daemon restarting before reaching stable state. Not saving GR state");
-    return;
-  }
+    // We will save only once. We need to save before sessions are brought down,
+    // For SIGTERM (bgp updation) this method will be called only once.
+    // For call to restartSessionsAndExit (agent updation) this method will be
+    // called twice, once before sessions go down and once after SIGTERM is
+    // raised. Ignoring the 2nd call.
+    if (grStateSaved_) {
+      XLOG(INFO, "GR state file was already saved");
+      return;
+    }
+    grStateSaved_ = true;
+    // If we have not yet notified RIB about EOR and we are trying to
+    // terminate, there is no need to store GR state information.
+    if (!ribInitPathComputationNotified_) {
+      XLOG(
+          INFO,
+          "Daemon restarting before reaching stable state. Not saving GR state");
+      return;
+    }
 
-  grFile.open(FLAGS_gr_state_file, std::ios::out | std::ios::trunc);
-  if (!grFile.is_open()) {
-    XLOG(ERR, "Could not open GR state file for writing");
-    return;
-  }
+    grFile.open(FLAGS_gr_state_file, std::ios::out | std::ios::trunc);
+    if (!grFile.is_open()) {
+      XLOG(ERR, "Could not open GR state file for writing");
+      return;
+    }
 
-  const auto nowInSec = std::chrono::duration_cast<std::chrono::seconds>(
-                            std::chrono::system_clock::now().time_since_epoch())
-                            .count();
+    const auto nowInSec =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
 
-  // Start with epoch time
-  grFile << nowInSec << "\n";
+    // Start with epoch time
+    grFile << nowInSec << "\n";
 
-  // All the established GR peers
-  for (const auto& peerId : establishedGrPeers_) {
-    grFile << peerId.peerAddr.str() << " " << peerId.remoteBgpId << "\n";
-  }
+    // All the established GR peers
+    for (const auto& peerId : establishedGrPeers_) {
+      grFile << peerId.peerAddr.str() << " " << peerId.remoteBgpId << "\n";
+    }
 
-  // Sign termination (signature) to indicate properly terminated.
-  grFile << kGrStateFileTermination;
-  grFile.close();
-  XLOGF(INFO, "Saved GR state to {}", FLAGS_gr_state_file);
+    // Sign termination (signature) to indicate properly terminated.
+    grFile << kGrStateFileTermination;
+    grFile.close();
+    XLOGF(INFO, "Saved GR state to {}", FLAGS_gr_state_file);
+  });
 }
 
 void PeerManager::logEoRPeers(const bool isIngressEoR) noexcept {
@@ -3197,13 +3414,16 @@ GrLoadResult PeerManager::readGrState() const noexcept {
 }
 
 void PeerManager::setRouteFilterPolicy(
-    std::unique_ptr<RouteFilterPolicy> policy) noexcept {
-  evb_.runInEventBaseThread([policy = std::move(policy), this]() mutable {
-    if (routeFilterPolicy_ && policy &&
-        routeFilterPolicy_->getVersion() >= policy->getVersion()) {
+    std::unique_ptr<RouteFilterPolicy> policy,
+    bool forceUpdate) noexcept {
+  evb_.runInEventBaseThread([policy = std::move(policy),
+                             forceUpdate,
+                             this]() mutable {
+    if (!forceUpdate && routeFilterPolicy_ && policy &&
+        routeFilterPolicy_->getVersion() > policy->getVersion()) {
       XLOGF(
           WARNING,
-          "Route filter policy update ignored: version {} <= {}",
+          "Route filter policy update ignored: version {} < {}",
           policy->getVersion(),
           routeFilterPolicy_->getVersion());
       return;
@@ -3233,8 +3453,12 @@ void PeerManager::setRouteFilterPolicy(
        * These flags will be cleared after policy re-evaluation:
        * - Ingress flag: cleared in processAdjRibReEvaluationTask() after
        *  calling adjRib->processAdjRibReEvaluation()
-       * - Egress flag: cleared in processRibDumpReqForEgressPolicyUpdate()
-       *  after processRibDumpReq() completes
+       * - Egress flag: for non-update-group, cleared in
+       *  processRibDumpReqForEgressPolicyUpdate() after the per-peer dump
+       *  completes. For update-group, cleared once the scheduled rib dump
+       *  completes in processRibDumpReqWithCancellationCoro(), and
+       *  processGroupEgressPolicyReEvaluation() additionally clears it for
+       *  in-sync peers served by the group walk rather than a per-peer dump.
        *
        */
 
@@ -3245,7 +3469,7 @@ void PeerManager::setRouteFilterPolicy(
       if (adjRib->isPendingIngressPolicyUpdate()) {
         ingressAffectedCount++;
       }
-      if (adjRib->isPendingEgressPolicyUpdate()) {
+      if (adjRib->isEgressPolicyUpdateRequired()) {
         egressAffectedCount++;
       }
       setGoldenPrefixPolicy(adjRib);
@@ -3347,7 +3571,7 @@ void PeerManager::updateIngressEgressPolicyNames(
       if (adjRib->isPendingIngressPolicyUpdate()) {
         ingressAffectedCount++;
       }
-      if (adjRib->isPendingEgressPolicyUpdate()) {
+      if (adjRib->isEgressPolicyUpdateRequired()) {
         egressAffectedCount++;
       }
     }
@@ -3606,6 +3830,16 @@ folly::coro::Task<void> PeerManager::startPeriodicUpdatePeerCountersRoutine() {
     co_await folly::coro::sleepReturnEarlyOnCancel(
         seconds(FLAGS_counter_update_time_s));
 
+    /*
+     * Skip cross-module call to SessionManager after daemon shutdown is
+     * marked. SessionManager's evb_ may already be stopped, and
+     * co_getAllEstablishedPeerDisplayInfo dispatches via co_withExecutor
+     * to that evb_, which would hang forever.
+     */
+    if (daemonShutdown_) {
+      break;
+    }
+
     co_await updatePeerCounters();
   }
 }
@@ -3662,22 +3896,70 @@ PeerManager::periodicEvictFromDeduplicatorLoop() noexcept {
   }
 }
 
-void PeerManager::sendRibDumpReqForEgressPolicyUpdate(PolicyChangeScope scope) {
-  XLOGF(
-      INFO, "sendRibDumpReqForEgressPolicyUpdate called with scope {}", scope);
-  // TODO(6.3): When enableUpdateGroup_, branch on scope:
-  //   PEER_GROUP → collect affected groups, schedule group re-evaluation
-  //   PEER → per-peer UpdateGroupKey rebuild + group migration
+folly::F14NodeSet<std::shared_ptr<AdjRibOutGroup>>
+PeerManager::getPolicyReEvalPendingGroups() {
+  folly::F14NodeSet<std::shared_ptr<AdjRibOutGroup>> affectedGroups;
   for (const auto& [peerId, adjRib] : adjRibs_) {
-    if (adjRib->isPendingEgressPolicyUpdate() &&
+    if (adjRib->isEgressPolicyUpdateRequired() &&
+        !adjRib->inInitialAnnouncement()) {
+      auto group = adjRib->getUpdateGroup();
+      if (group) {
+        affectedGroups.insert(group);
+      }
+    }
+  }
+  return affectedGroups;
+}
+
+void PeerManager::schedulePolicyReEvalForPendingGroups() {
+  for (const auto& group : getPolicyReEvalPendingGroups()) {
+    XLOGF(
+        INFO,
+        "Scheduling group egress policy re-evaluation for group {}",
+        group->getAdjRibGroupName());
+
+    asyncScope_.add(
+        co_withExecutor(&evb_, processGroupEgressPolicyReEvaluation(group)));
+  }
+}
+
+void PeerManager::schedulePolicyReEvalForGroupAdjRibs() {
+  // Per-peer: rebuild each affected peer's UpdateGroupKey, compare
+  // against current group. Peers whose key changed must move groups
+  // (Group1 != Group2 reconciliation path).
+  // TODO(6.6): Implement single peer re-evaluation.
+}
+
+void PeerManager::schedulePolicyReEvalForAdjRibs() {
+  for (const auto& [peerId, adjRib] : adjRibs_) {
+    if (adjRib->isEgressPolicyUpdateRequired() &&
         !adjRib->inInitialAnnouncement()) {
       XLOGF(
           INFO,
           "Sending RibDumpReq for egress affected adjrib {}",
           peerId.str());
+      /*
+       * Non-update-group path: schedule the per-peer egress dump on
+       * asyncScope_. processRibDumpReqForEgressPolicyUpdate clears the pending
+       * egress policy update flag once the dump completes.
+       */
       asyncScope_.add(co_withExecutor(
           &evb_, processRibDumpReqForEgressPolicyUpdate(peerId, adjRib)));
     }
+  }
+}
+
+void PeerManager::sendRibDumpReqForEgressPolicyUpdate(PolicyChangeScope scope) {
+  XLOGF(
+      INFO, "sendRibDumpReqForEgressPolicyUpdate called with scope {}", scope);
+  if (enableUpdateGroup_) {
+    if (scope == PolicyChangeScope::PEER_GROUP) {
+      schedulePolicyReEvalForPendingGroups();
+    } else if (scope == PolicyChangeScope::PEER) {
+      schedulePolicyReEvalForGroupAdjRibs();
+    }
+  } else {
+    schedulePolicyReEvalForAdjRibs();
   }
 }
 
@@ -3734,6 +4016,83 @@ folly::coro::Task<void> PeerManager::processRibDumpReqForEgressPolicyUpdate(
     std::shared_ptr<AdjRib> adjRib) {
   co_await processRibDumpReqCoro(RibDumpReq(peerId, adjRib->sendAddPath()));
   adjRib->clearPendingEgressPolicyUpdate(); // Clear flag after completion
+}
+
+/*
+ * Orchestrate egress policy re-evaluation for one update group.
+ *
+ * WARNING: This method performs heavy synchronous processing. Each step
+ * walks the full ShadowRib, which can be large. Steps 1 and 2 involve
+ * policy evaluation and RIB-OUT tree mutations for every prefix.
+ *
+ * Step 1: Group-level ShadowRib walk (serves all IN_SYNC members).
+ *   processRibAnnouncedEntryForGroup() deep compares with existing entries
+ *   and lazy clones for detached peers before mutating group entries.
+ *
+ * Step 2: Individual processRibDumpReq() for each detached peer.
+ *   Per-peer entries already exist (from prior detached processing or
+ *   lazy clone in Step 1). processRibDumpReq() re-processes all ShadowRib
+ *   entries through processRibAnnouncedEntry() with the new policy.
+ *
+ * Step 3: Clear pendingEgressPolicyUpdate for all IN_SYNC peers.
+ */
+folly::coro::Task<void> PeerManager::processGroupEgressPolicyReEvaluation(
+    std::shared_ptr<AdjRibOutGroup> group) {
+  [[maybe_unused]] ScopedProfile profile(
+      "PeerManager::processGroupEgressPolicyReEvaluation");
+  XLOGF(
+      INFO,
+      "Group {}: Starting group egress policy re-evaluation",
+      group->getAdjRibGroupName());
+
+  // Step 1: Group-level re-evaluation (serves all IN_SYNC members)
+  group->reEvaluateSyncPeersEgressPolicy();
+
+  // Step 2: Individual re-evaluation for each detached peer
+  // Step 3: Clear pendingEgressPolicyUpdate for all peers in the group
+  // We iterate all AdjRibs (not just detachedPeers) because IN_SYNC peers
+  // also need their pendingEgressPolicyUpdate flag cleared after step 1.
+  for (const auto& [_, adjRib] : group->getBitToAdjRibs()) {
+    if (!adjRib->isEgressPolicyUpdateRequired()) {
+      continue;
+    }
+
+    if (isRibDumpScheduledForAdjRib(adjRib)) {
+      /*
+       * Peer already has a rib walk scheduled or in progress (buffered or in
+       * flight). Leave pendingEgressPolicyUpdate set so it gets picked up
+       * after.
+       */
+      XLOGF(
+          DBG1,
+          "Group {}: Peer {} has a rib walk scheduled, "
+          "deferring egress policy re-evaluation",
+          group->getAdjRibGroupName(),
+          adjRib->getPeerName());
+      continue;
+    }
+
+    if (adjRib->isDetachedPeer()) {
+      // Detached peer: re-walk ShadowRib with new policy
+      XLOGF(
+          INFO,
+          "Group {}: Re-evaluating detached peer {}",
+          group->getAdjRibGroupName(),
+          adjRib->getPeerName());
+
+      processRibDumpReq(adjRib, adjRib->sendAddPath());
+    }
+
+    // Clear for all peers JOINED and DETACHED after RIB dump has been served.
+    adjRib->clearPendingEgressPolicyUpdate();
+  }
+
+  XLOGF(
+      INFO,
+      "Group {}: Group egress policy re-evaluation complete",
+      group->getAdjRibGroupName());
+
+  co_return;
 }
 
 folly::coro::Task<void> PeerManager::processIngressAndEgressRouteFilterUpdate(

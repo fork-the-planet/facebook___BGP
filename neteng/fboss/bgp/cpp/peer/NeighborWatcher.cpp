@@ -662,10 +662,71 @@ void NeighborWatcher::startFibWatcher(
     return;
   }
 
+  /*
+   * When next_hop_tracking_use_openr_igp_cost is enabled, the IGP cost is
+   * derived solely from the Open/R client's nexthops (no intersection with the
+   * resolved fwd nexthops); otherwise it is derived from the resolved fwd
+   * nexthops only.
+   */
+  const std::optional<fboss::ClientID> igpCostClientId =
+      FeatureFlags::getBgpBestpathFeatures().nextHopTrackingUseOpenrIgpCost
+      ? std::optional<fboss::ClientID>{fboss::ClientID::OPENR}
+      : std::nullopt;
+
   fsdbFibWatcher_ = std::make_shared<FsdbFibWatcher>(
-      nexthopCache, ribInQ, &evb_, sharedFsdbSubMgr_);
+      nexthopCache, ribInQ, &evb_, sharedFsdbSubMgr_, igpCostClientId);
 
   fsdbFibWatcher_->registerPeers(peerAddresses);
+}
+
+void NeighborWatcher::subscribeLocked() {
+  if (fsdbFibWatcher_) {
+    sharedFsdbSubMgr_->subscribe(
+        [this, nbrWatcher = fsdbNbrWatcher_, fibWatcher = fsdbFibWatcher_](
+            auto update) {
+          evb_.runInEventBaseThread([this,
+                                     nbrWatcher,
+                                     fibWatcher,
+                                     update = std::move(update)]() mutable {
+            nbrWatcher->handleCowUpdate(update);
+            asyncScope_.add(co_withExecutor(
+                &evb_, fibWatcher->co_processFibUpdate(std::move(update))));
+          });
+        },
+        [this, fibWatcher = fsdbFibWatcher_](
+            fboss::fsdb::SubscriptionState /* oldState */,
+            fboss::fsdb::SubscriptionState newState,
+            std::optional<bool> /* initialSyncHasData */) {
+          if (fboss::fsdb::isConnected(newState)) {
+            XLOG(INFO, "[SharedFsdbSub] FSDB connected (neighbor + FIB)");
+            evb_.runInEventBaseThread([this, fibWatcher]() {
+              asyncScope_.add(
+                  co_withExecutor(&evb_, fibWatcher->co_markNeedsReconcile()));
+            });
+          } else if (fboss::fsdb::isDisconnected(newState)) {
+            XLOG(WARNING, "[SharedFsdbSub] FSDB disconnected");
+          }
+        });
+  } else {
+    sharedFsdbSubMgr_->subscribe(
+        [nbrWatcher = fsdbNbrWatcher_, evb = &evb_](auto update) {
+          evb->runInEventBaseThread(
+              [nbrWatcher, update = std::move(update)]() mutable {
+                nbrWatcher->handleCowUpdate(update);
+              });
+        },
+        [](fboss::fsdb::SubscriptionState /* oldState */,
+           fboss::fsdb::SubscriptionState newState,
+           std::optional<bool> /* initialSyncHasData */) {
+          if (fboss::fsdb::isConnected(newState)) {
+            XLOG(INFO, "[SharedFsdbSub] FSDB connected (neighbor-only)");
+          } else if (fboss::fsdb::isDisconnected(newState)) {
+            XLOG(WARNING, "[SharedFsdbSub] FSDB disconnected");
+          }
+        });
+  }
+
+  XLOG(INFO, "[NeighborWatcher] Shared FSDB subscription started");
 }
 
 void NeighborWatcher::subscribe() {
@@ -673,54 +734,55 @@ void NeighborWatcher::subscribe() {
     return;
   }
 
-  evb_.runInEventBaseThread([this]() {
-    if (fsdbFibWatcher_) {
-      sharedFsdbSubMgr_->subscribe(
-          [this, nbrWatcher = fsdbNbrWatcher_, fibWatcher = fsdbFibWatcher_](
-              auto update) {
-            evb_.runInEventBaseThread([this,
-                                       nbrWatcher,
-                                       fibWatcher,
-                                       update = std::move(update)]() mutable {
-              nbrWatcher->handleCowUpdate(update);
-              asyncScope_.add(co_withExecutor(
-                  &evb_, fibWatcher->co_processFibUpdate(std::move(update))));
-            });
-          },
-          [this, fibWatcher = fsdbFibWatcher_](
-              fboss::fsdb::SubscriptionState /* oldState */,
-              fboss::fsdb::SubscriptionState newState,
-              std::optional<bool> /* initialSyncHasData */) {
-            if (fboss::fsdb::isConnected(newState)) {
-              XLOG(INFO, "[SharedFsdbSub] FSDB connected (neighbor + FIB)");
-              evb_.runInEventBaseThread([this, fibWatcher]() {
-                asyncScope_.add(co_withExecutor(
-                    &evb_, fibWatcher->co_markNeedsReconcile()));
-              });
-            } else if (fboss::fsdb::isDisconnected(newState)) {
-              XLOG(WARNING, "[SharedFsdbSub] FSDB disconnected");
-            }
-          });
-    } else {
-      sharedFsdbSubMgr_->subscribe(
-          [nbrWatcher = fsdbNbrWatcher_, evb = &evb_](auto update) {
-            evb->runInEventBaseThread(
-                [nbrWatcher, update = std::move(update)]() mutable {
-                  nbrWatcher->handleCowUpdate(update);
-                });
-          },
-          [](fboss::fsdb::SubscriptionState /* oldState */,
-             fboss::fsdb::SubscriptionState newState,
-             std::optional<bool> /* initialSyncHasData */) {
-            if (fboss::fsdb::isConnected(newState)) {
-              XLOG(INFO, "[SharedFsdbSub] FSDB connected (neighbor-only)");
-            } else if (fboss::fsdb::isDisconnected(newState)) {
-              XLOG(WARNING, "[SharedFsdbSub] FSDB disconnected");
-            }
-          });
-    }
+  evb_.runInEventBaseThread([this]() { subscribeLocked(); });
+}
 
-    XLOG(INFO, "[NeighborWatcher] Shared FSDB subscription started");
+void NeighborWatcher::requestNexthopSubscribe(
+    std::vector<folly::IPAddress> nexthops) {
+  if (!sharedFsdbSubMgr_ || !fsdbFibWatcher_) {
+    return;
+  }
+
+  evb_.runInEventBaseThread([this, nexthops = std::move(nexthops)]() mutable {
+    auto newNexthops = fsdbFibWatcher_->filterNewNexthops(nexthops);
+    if (newNexthops.empty()) {
+      // All already tracked — nothing to do, avoid a needless re-subscribe.
+      return;
+    }
+    XLOGF(
+        INFO,
+        "[NeighborWatcher] Re-subscribing shared FSDB sub to track {} new"
+        " nexthop(s) learned from RIB-IN",
+        newNexthops.size());
+    /**
+     * The patch sub manager's path set is immutable while subscribed: stop the
+     * subscription (resets the subscriber), add the new FIB paths (previously
+     * registered paths persist in the sub manager), then re-subscribe the
+     * entire set. On reconnect, FsdbFibWatcher rebuilds reachability from fresh
+     * notifications.
+     **/
+    /*
+     * Resilience: once we stop() the shared subscription we MUST re-subscribe,
+     * otherwise the subscription (also used by FsdbNeighborWatcher) is left
+     * stopped until process restart. addNexthopPaths is best-effort and does
+     * not throw, but guard defensively so no exception can escape this
+     * EventBase callback (which would crash the thread) and so
+     * subscribeLocked() always runs.
+     */
+    sharedFsdbSubMgr_->stop();
+    try {
+      fsdbFibWatcher_->addNexthopPaths(newNexthops);
+    } catch (const std::exception& ex) {
+      XLOGF(ERR, "[NeighborWatcher] addNexthopPaths failed: {}", ex.what());
+    }
+    try {
+      subscribeLocked();
+    } catch (const std::exception& ex) {
+      XLOGF(
+          ERR,
+          "[NeighborWatcher] re-subscribe after addNexthopPaths failed: {}",
+          ex.what());
+    }
   });
 }
 

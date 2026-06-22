@@ -20,6 +20,7 @@
 #include "neteng/fboss/bgp/cpp/adjrib/AdjRibCommon.h"
 #include "neteng/fboss/bgp/cpp/adjrib/AdjRibGroup.h"
 #include "neteng/fboss/bgp/cpp/adjrib/WellKnownCommunityFilter.h"
+#include "neteng/fboss/bgp/cpp/common/Consts.h"
 #include "neteng/fboss/bgp/cpp/stats/Stats.h"
 
 using namespace facebook::nettools::bgplib;
@@ -72,6 +73,7 @@ void AdjRib::processShadowRibEntryChange(ShadowRibEntry& srEntry) noexcept {
         entry.newlyInstalledInLocalRib = srEntry.newlyInstalledInLocalRib;
         entry.installTimeStamp = srEntry.installTimeStamp;
         entry.ribVersion = srEntry.ribVersion;
+        entry.isPartialDrain = multipath->isPartialDrain;
         handleRibAnnouncedEntry(entry, false);
       } else if (isShadowRibRouteInWithdraw(multipath->flags)) {
         /*
@@ -123,6 +125,7 @@ void AdjRib::processShadowRibEntryChange(ShadowRibEntry& srEntry) noexcept {
       entry.newlyInstalledInLocalRib = srEntry.newlyInstalledInLocalRib;
       entry.installTimeStamp = srEntry.installTimeStamp;
       entry.ribVersion = srEntry.ribVersion;
+      entry.isPartialDrain = srEntry.bestpath->isPartialDrain;
       handleRibAnnouncedEntry(entry, false);
     } else if (isShadowRibRouteInWithdraw(srEntry.bestpath->flags)) {
       /*
@@ -185,6 +188,68 @@ void AdjRib::scheduleSendBgpUpdates(bool tryPullNewChangeItems) noexcept {
     asyncScope_->add(
         co_withExecutor(&evb_, sendBgpUpdates(tryPullNewChangeItems)));
     sendCoroScheduled_ = true;
+    setAdjRibFlag(SCHEDULED_PUSH_TO_PEER);
+  }
+}
+
+bool AdjRib::scheduleDeferredPushToPeer(
+    nettools::bgplib::FiberBgpPeer::InputMessageT message) noexcept {
+  /*
+   * A null asyncScope_ is unexpected here — the scope should exist whenever a
+   * push can be scheduled. Log it as an error to surface the bug. A requested
+   * cancellation, by contrast, is a normal teardown condition (the peer is
+   * going down).
+   */
+  if (!asyncScope_) {
+    XLOGF(
+        ERR,
+        "Peer {}: Cannot schedule deferredPushToPeer, asyncScope_ is null",
+        getPeerName());
+    return false;
+  }
+  if (asyncScope_->isScopeCancellationRequested()) {
+    XLOGF(
+        DBG2,
+        "Peer {}: Not scheduling deferredPushToPeer, asyncScope_ cancellation requested",
+        getPeerName());
+    return false;
+  }
+  /* Capture shared_from_this() now and pass it into the coroutine.
+   * The coroutine's RAII guard needs a shared_ptr to pass to
+   * markPeerUnblocked. Calling shared_from_this() from the guard
+   * during teardown would throw bad_weak_ptr since the destructor
+   * has already zeroed the refcount. */
+  asyncScope_->add(co_withExecutor(
+      &evb_, deferredPushToPeer(std::move(message), shared_from_this())));
+  setAdjRibFlag(SCHEDULED_PUSH_TO_PEER);
+  return true;
+}
+
+folly::coro::Task<void> AdjRib::deferredPushToPeer(
+    nettools::bgplib::FiberBgpPeer::InputMessageT message,
+    std::shared_ptr<AdjRib> self) noexcept {
+  bool pushed = false;
+
+  /* RAII guard: Always clear blocked state and log when coroutine exits.
+   * Uses the captured `self` shared_ptr instead of shared_from_this()
+   * to avoid bad_weak_ptr during teardown when the refcount is 0. */
+  auto guard = folly::makeGuard([this, &pushed, self] {
+    if (adjRibOutGroup_) {
+      adjRibOutGroup_->markPeerUnblocked(self);
+      XLOGF(
+          DBG2,
+          "Group {} deferred push for peer {}: pushed={}",
+          adjRibOutGroup_->getGroupDescriptor(),
+          getPeerName(),
+          pushed);
+    }
+    clearAdjRibFlag(SCHEDULED_PUSH_TO_PEER);
+  });
+
+  co_await folly::coro::co_safe_point;
+
+  if (boundedAdjRibOutQueue_ && co_await boundedAdjRibOutQueue_->waitToPush()) {
+    pushed = boundedAdjRibOutQueue_->push(message);
   }
 }
 
@@ -277,6 +342,11 @@ void AdjRib::reschedulePackingTimers() noexcept {
 
 folly::coro::Task<void> AdjRib::sendBgpUpdates(
     bool tryPullNewChangeItems) noexcept {
+  SCOPE_EXIT {
+    sendCoroScheduled_ = false;
+    clearAdjRibFlag(SCHEDULED_PUSH_TO_PEER);
+  };
+
   uint64_t bgpMessageCnt = 0;
   uint64_t withdrawPrefixCnt = 0;
   uint64_t announcePrefixCnt = 0;
@@ -356,8 +426,6 @@ folly::coro::Task<void> AdjRib::sendBgpUpdates(
       eorCnt,
       bgpMessageCnt,
       backpressured);
-  sendCoroScheduled_ = false;
-
   if (enableUpdateGroup_) {
     maybeTransitionDetachedReadyToJoin();
   } else {
@@ -885,6 +953,9 @@ void AdjRib::processRibAnnouncedEntry(
   // lbw-policy is applied afterwards, which takes precedence over
   // per-peer-config
   auto prePolicyAttrs = update.attrs->clone();
+  if (update.isPartialDrain) {
+    applyPartialDrainCommunities(prePolicyAttrs);
+  }
   updateAdvertiseLbwExtCommunity(update, prePolicyAttrs);
 
   // Get post policy attributes
@@ -1019,8 +1090,9 @@ AdjRibEntry* FOLLY_NULLABLE AdjRib::tryInsertRibOutEntry(
       ? pathIdToSend
       : pathIdGenerator_->getPathId(prefix, nexthop);
 
-  auto [adjRibEntry, _] =
-      getRibOutEntry(prefix, pathId, true /* copyOnWriteIfShared */);
+  auto adjRibEntry = enableUpdateGroup_
+      ? getRibEntryWithUpdateGroup(prefix, pathId)
+      : getRibEntry(/*ingress=*/false, prefix, pathId);
   if (!adjRibEntry) {
     // Learning new route
     XLOGF(
@@ -1077,7 +1149,8 @@ AdjRib::getPostOutPolicyAttributesAndInfo(
             *egressPolicyName_,
             update.prefix,
             prePolicyAttrs,
-            policyActionData);
+            policyActionData,
+            update.isPartialDrain);
 
     policyResultAttrs = attrs;
     postPolicyResultInfo = postPolicyInfo;
@@ -1413,8 +1486,9 @@ void AdjRib::processRibWithdraw(
         getPeerName());
   }
 
-  auto [adjRibEntry, _] =
-      getRibOutEntry(prefix, pathId, true /* copyOnWriteIfShared */);
+  auto adjRibEntry = enableUpdateGroup_
+      ? getRibEntryWithUpdateGroup(prefix, pathId)
+      : getRibEntry(/*ingress=*/false, prefix, pathId);
   if (!adjRibEntry || !adjRibEntry->getPreOut()) {
     XLOGF(
         DBG3,

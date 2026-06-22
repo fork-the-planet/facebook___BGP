@@ -29,13 +29,6 @@
   FRIEND_TEST(RibPolicyRestoreTestFixture, RibPolicyRestoreTestMissingFile);   \
   FRIEND_TEST(                                                                 \
       RibPolicyRestoreTestFixture, RibPolicyRestoreTestBackwardCompatibility); \
-  FRIEND_TEST(RibPolicyRestoreTestFixture, RibPolicyStoreExistsTest);          \
-  FRIEND_TEST(                                                                 \
-      RibPolicyRestoreTestFixture, ReadTRibPolicyStoreTestBadFileTermination); \
-  FRIEND_TEST(                                                                 \
-      RibPolicyRestoreTestFixture, ReadTRibPolicyStoreTestSuccessfulRead);     \
-  FRIEND_TEST(                                                                 \
-      RibPolicyRestoreTestFixture, ReadTRibPolicyStoreTestMissingFile);        \
   FRIEND_TEST(                                                                 \
       RibPolicyRestoreTestFixture, ReadSaveRibPolicyStateTestEmptyPolicy);     \
   FRIEND_TEST(                                                                 \
@@ -50,7 +43,35 @@
   FRIEND_TEST(                                                                 \
       RibPolicyRestoreTestFixture, ReadSaveRibPolicyStateTestBadFileContent);  \
   FRIEND_TEST(RibPolicyRestoreTestFixture, ReadSaveRibPolicyStateTest);        \
-  FRIEND_TEST(RibPolicyRestoreTestFixture, SaveTRibPolicyStorePrettyPrintsJson);
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture, SaveTRibPolicyStorePrettyPrintsJson);       \
+  FRIEND_TEST(RibPolicyRestoreTestFixture, CrfFileModeToggle);                 \
+  FRIEND_TEST(RibPolicyRestoreTestFixture, ReadCrfPolicyFromArtifactNoFile);   \
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture, ReadCrfPolicyFromArtifactValidFile);        \
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture, ReadCrfPolicyFromArtifactMalformedJson);    \
+  FRIEND_TEST(RibPolicyRestoreTestFixture, ReadRibPolicyStateCrfDryrunFalse);  \
+  FRIEND_TEST(RibPolicyRestoreTestFixture, ReadRibPolicyStateCrfDryrunTrue);   \
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture,                                             \
+      ReadRibPolicyStateCrfArtifactNoPolicyStore);                             \
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture, ReadCrfPolicyFromArtifactEmptyFile);        \
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture, ReadRibPolicyStateCrfNoCachedPolicy);       \
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture, ReadCrfPolicyFromArtifactDryrunTrue);       \
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture, ReadRibPolicyStateCrfFullIntegration);
+
+/*
+ * pathSelectionPolicy_ moved from RibBase to RibDC in diff 9/10. Test that
+ * accesses the field directly needs RibDC friendship too.
+ */
+#define RibDC_TEST_FRIENDS \
+  FRIEND_TEST(             \
+      RibPolicyRestoreTestFixture, ReadSaveRibPolicyStateTestEmptyPolicy);
 
 #define RouteAttributePolicy_TEST_FRIENDS                                      \
   FRIEND_TEST(RibPolicyRestoreTestFixture, RibPolicyRestoreTest);              \
@@ -64,13 +85,6 @@
   FRIEND_TEST(RibPolicyRestoreTestFixture, RibPolicyRestoreTestMissingFile);   \
   FRIEND_TEST(                                                                 \
       RibPolicyRestoreTestFixture, RibPolicyRestoreTestBackwardCompatibility); \
-  FRIEND_TEST(RibPolicyRestoreTestFixture, RibPolicyStoreExistsTest);          \
-  FRIEND_TEST(                                                                 \
-      RibPolicyRestoreTestFixture, ReadTRibPolicyStoreTestBadFileTermination); \
-  FRIEND_TEST(                                                                 \
-      RibPolicyRestoreTestFixture, ReadTRibPolicyStoreTestSuccessfulRead);     \
-  FRIEND_TEST(                                                                 \
-      RibPolicyRestoreTestFixture, ReadTRibPolicyStoreTestMissingFile);        \
   FRIEND_TEST(                                                                 \
       RibPolicyRestoreTestFixture, ReadSaveRibPolicyStateTestEmptyPolicy);     \
   FRIEND_TEST(                                                                 \
@@ -85,14 +99,39 @@
   FRIEND_TEST(                                                                 \
       RibPolicyRestoreTestFixture, ReadSaveRibPolicyStateTestBadFileContent);  \
   FRIEND_TEST(RibPolicyRestoreTestFixture, ReadSaveRibPolicyStateTest);        \
-  FRIEND_TEST(RibPolicyRestoreTestFixture, SaveTRibPolicyStorePrettyPrintsJson);
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture, SaveTRibPolicyStorePrettyPrintsJson);       \
+  FRIEND_TEST(RibPolicyRestoreTestFixture, CrfFileModeToggle);                 \
+  FRIEND_TEST(RibPolicyRestoreTestFixture, ReadCrfPolicyFromArtifactNoFile);   \
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture, ReadCrfPolicyFromArtifactValidFile);        \
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture, ReadCrfPolicyFromArtifactMalformedJson);    \
+  FRIEND_TEST(RibPolicyRestoreTestFixture, ReadRibPolicyStateCrfDryrunFalse);  \
+  FRIEND_TEST(RibPolicyRestoreTestFixture, ReadRibPolicyStateCrfDryrunTrue);   \
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture,                                             \
+      ReadRibPolicyStateCrfArtifactNoPolicyStore);                             \
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture, ReadCrfPolicyFromArtifactEmptyFile);        \
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture, ReadRibPolicyStateCrfNoCachedPolicy);       \
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture, ReadCrfPolicyFromArtifactDryrunTrue);       \
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture, ReadRibPolicyStateCrfFullIntegration);
+
+#include <unistd.h>
 
 #include <boost/filesystem.hpp>
+#include <fb303/ServiceData.h>
+#include <fmt/format.h>
 
 #include <folly/FileUtil.h>
 #include <folly/IPAddress.h>
 #include <folly/json/json.h>
 
+#include "neteng/fboss/bgp/cpp/rib/RibFileUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/RibPolicyUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/RibUtils.h"
 
@@ -306,66 +345,6 @@ TEST_F(RibPolicyRestoreTestFixture, RibPolicyRestoreTestBackwardCompatibility) {
   }
   // clean up file during stress run
   boost::filesystem::remove(FLAGS_rp_state_file);
-}
-
-TEST_F(RibPolicyRestoreTestFixture, RibPolicyStoreExistsTest) {
-  // write a dummy file for testing
-  TPathSelectionPolicy tEmptyPolicy;
-  tEmptyPolicy.statements()->emplace("stmt1", TPathSelectionStatement{});
-  TRibPolicyStore tDummyPolicyStore;
-  tDummyPolicyStore.policy()->path_selection_policy() = tEmptyPolicy;
-
-  // write to the file
-  folly::writeFileAtomic(
-      FLAGS_rp_state_file,
-      apache::thrift::SimpleJSONSerializer::serialize<std::string>(
-          tDummyPolicyStore));
-  EXPECT_TRUE(rib_->ribPolicyStoreExists());
-
-  // remove file
-  boost::filesystem::remove(FLAGS_rp_state_file);
-  EXPECT_FALSE(rib_->ribPolicyStoreExists());
-}
-
-// bad fileTermination would fail
-TEST_F(RibPolicyRestoreTestFixture, ReadTRibPolicyStoreTestBadFileTermination) {
-  TRibPolicyStore tBadPolicyStore;
-  tBadPolicyStore.fileTermination() = "bad ending line";
-  // write to the file
-  folly::writeFileAtomic(
-      FLAGS_rp_state_file,
-      apache::thrift::SimpleJSONSerializer::serialize<std::string>(
-          tBadPolicyStore));
-
-  auto [readSuccess, tRibPolicyStore] = rib_->readTRibPolicyStore();
-  EXPECT_FALSE(readSuccess);
-}
-
-// Correct fileTermination and successful read
-TEST_F(RibPolicyRestoreTestFixture, ReadTRibPolicyStoreTestSuccessfulRead) {
-  // create path selector for a non-trivial read
-  auto tMatcher = createCommunityMatch(200, 666, bgp_policy::Origin::EGP);
-  auto tPathSelector = createTPathSlectorWithOneMatcher(tMatcher);
-
-  TRibPolicyStore tCorrectPolicyStore;
-
-  tCorrectPolicyStore.fileTermination() = kRibPolicyFileTermination;
-  tCorrectPolicyStore.policy()->path_selection_policy() =
-      createTPathSelectionPolicyWithPathSelector({kV4Prefix1}, tPathSelector);
-  // write to the file
-  folly::writeFileAtomic(
-      FLAGS_rp_state_file,
-      apache::thrift::SimpleJSONSerializer::serialize<std::string>(
-          tCorrectPolicyStore));
-  auto [readSuccess, tRibPolicyStore] = rib_->readTRibPolicyStore();
-  EXPECT_TRUE(readSuccess);
-  // the stored time might be different, but the policies should be the same
-  EXPECT_EQ(tCorrectPolicyStore.policy(), tRibPolicyStore.policy());
-}
-
-TEST_F(RibPolicyRestoreTestFixture, ReadTRibPolicyStoreTestMissingFile) {
-  auto [readSuccess, tRibPolicyStore] = rib_->readTRibPolicyStore();
-  EXPECT_FALSE(readSuccess);
 }
 
 // empty rib policy state would not result in file saved
@@ -602,8 +581,455 @@ TEST_F(RibPolicyRestoreTestFixture, SaveTRibPolicyStorePrettyPrintsJson) {
   EXPECT_TRUE(parsed.isObject());
 
   // Verify round-trip: deserialized content matches original
-  auto [readSuccess, readBack] = rib_->readTRibPolicyStore();
-  EXPECT_TRUE(readSuccess);
+  auto readBack =
+      apache::thrift::SimpleJSONSerializer::deserialize<TRibPolicyStore>(
+          fileContent);
   EXPECT_EQ(*tRibPolicyStore.fileTermination(), *readBack.fileTermination());
 }
+
+// Test isCrfFileModeEnabled / setCrfFileModeEnabled toggle
+TEST_F(RibPolicyRestoreTestFixture, CrfFileModeToggle) {
+  // default should be false (THRIFT_MODE)
+  EXPECT_FALSE(rib_->isCrfFileModeEnabled());
+
+  // set to FILE_MODE
+  rib_->setCrfFileModeEnabled(true);
+  EXPECT_TRUE(rib_->isCrfFileModeEnabled());
+
+  // set back to THRIFT_MODE
+  rib_->setCrfFileModeEnabled(false);
+  EXPECT_FALSE(rib_->isCrfFileModeEnabled());
+
+  // setting to same value should be a no-op (no crash)
+  rib_->setCrfFileModeEnabled(false);
+  EXPECT_FALSE(rib_->isCrfFileModeEnabled());
+}
+
+/*
+ * The fb303 gauge bgpd.crf.file_mode_enabled must track the real CRF mode so
+ * monitoring can distinguish FILE_MODE (1) from THRIFT_MODE (0). Regression
+ * test: the gauge previously was never updated off its init value (0) because
+ * the mode-flip path did not call BgpStats::setCrfFileModeEnabled.
+ */
+TEST_F(RibPolicyRestoreTestFixture, CrfFileModeGaugeFollowsMode) {
+  auto gauge = [] {
+    auto* serviceData = facebook::fb303::ServiceData::get();
+    return serviceData ? serviceData->getCounter("bgpd.crf.file_mode_enabled")
+                       : 0;
+  };
+
+  rib_->setCrfFileModeEnabled(true);
+  EXPECT_TRUE(rib_->isCrfFileModeEnabled());
+  EXPECT_EQ(1, gauge());
+
+  rib_->setCrfFileModeEnabled(false);
+  EXPECT_FALSE(rib_->isCrfFileModeEnabled());
+  EXPECT_EQ(0, gauge());
+
+  /*
+   * Re-setting the same value keeps the gauge consistent (the gauge is set
+   * unconditionally, not only on transition).
+   */
+  rib_->setCrfFileModeEnabled(false);
+  EXPECT_EQ(0, gauge());
+}
+
+/*
+ * readThriftArtifactFromFile reports the read outcome on the error side of
+ * folly::Expected so the bootstrap path can classify success/failure (an absent
+ * artifact vs. a genuine read error) from a single read.
+ */
+TEST_F(RibPolicyRestoreTestFixture, ReadCrfPolicyFromArtifactReportsStatus) {
+  // kAbsent: empty (unconfigured) path.
+  {
+    auto result = readThriftArtifactFromFile<rib_policy::CrfPolicyArtifact>("");
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(ArtifactReadError::kAbsent, result.error());
+  }
+
+  // kAbsent: configured path, but file does not exist.
+  {
+    auto tmpFile =
+        fmt::format("/tmp/crf_test_{}_status_absent.json", ::getpid());
+    boost::filesystem::remove(tmpFile);
+    auto result =
+        readThriftArtifactFromFile<rib_policy::CrfPolicyArtifact>(tmpFile);
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(ArtifactReadError::kAbsent, result.error());
+  }
+
+  // Success: file present and parseable.
+  {
+    auto tmpFile = fmt::format("/tmp/crf_test_{}_status_ok.json", ::getpid());
+    rib_policy::CrfPolicyArtifact artifact;
+    artifact.dryrun() = true;
+    rib_policy::TRouteFilterPolicy policy;
+    policy.version() = 7;
+    artifact.policy() = policy;
+    folly::writeFileAtomic(
+        tmpFile,
+        apache::thrift::SimpleJSONSerializer::serialize<std::string>(artifact));
+    auto result =
+        readThriftArtifactFromFile<rib_policy::CrfPolicyArtifact>(tmpFile);
+    EXPECT_TRUE(result.hasValue());
+    boost::filesystem::remove(tmpFile);
+  }
+
+  // kError: file present but corrupt (unparseable).
+  {
+    auto tmpFile =
+        fmt::format("/tmp/crf_test_{}_status_error.json", ::getpid());
+    folly::writeFileAtomic(tmpFile, "not valid json");
+    auto result =
+        readThriftArtifactFromFile<rib_policy::CrfPolicyArtifact>(tmpFile);
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(ArtifactReadError::kError, result.error());
+    boost::filesystem::remove(tmpFile);
+  }
+}
+
+// readCrfPolicyFromArtifact: file does not exist
+TEST_F(RibPolicyRestoreTestFixture, ReadCrfPolicyFromArtifactNoFile) {
+  auto tmpFile = fmt::format("/tmp/crf_test_{}_nonexistent.json", ::getpid());
+  boost::filesystem::remove(tmpFile);
+
+  auto result =
+      readThriftArtifactFromFile<rib_policy::CrfPolicyArtifact>(tmpFile);
+  EXPECT_FALSE(result.hasValue());
+}
+
+// readCrfPolicyFromArtifact: valid artifact file
+TEST_F(RibPolicyRestoreTestFixture, ReadCrfPolicyFromArtifactValidFile) {
+  auto tmpFile = fmt::format("/tmp/crf_test_{}_valid.json", ::getpid());
+
+  rib_policy::CrfPolicyArtifact artifact;
+  artifact.dryrun() = false;
+  rib_policy::TRouteFilterPolicy policy;
+  policy.version() = 42;
+  artifact.policy() = policy;
+
+  folly::writeFileAtomic(
+      tmpFile,
+      apache::thrift::SimpleJSONSerializer::serialize<std::string>(artifact));
+
+  auto result =
+      readThriftArtifactFromFile<rib_policy::CrfPolicyArtifact>(tmpFile);
+  ASSERT_TRUE(result.hasValue());
+  EXPECT_FALSE(*result->dryrun());
+  EXPECT_EQ(42, *result->policy()->version());
+
+  boost::filesystem::remove(tmpFile);
+}
+
+// readCrfPolicyFromArtifact: malformed JSON content
+TEST_F(RibPolicyRestoreTestFixture, ReadCrfPolicyFromArtifactMalformedJson) {
+  auto tmpFile = fmt::format("/tmp/crf_test_{}_malformed.json", ::getpid());
+
+  folly::writeFileAtomic(tmpFile, "this is not valid json");
+
+  auto result =
+      readThriftArtifactFromFile<rib_policy::CrfPolicyArtifact>(tmpFile);
+  EXPECT_FALSE(result.hasValue());
+
+  boost::filesystem::remove(tmpFile);
+}
+
+// readRibPolicyState with CRF artifact dryrun=false -> FILE_MODE
+TEST_F(RibPolicyRestoreTestFixture, ReadRibPolicyStateCrfDryrunFalse) {
+  // Write a valid RibPolicyStore with route_filter_policy
+  auto prefix = folly::IPAddress::createNetwork("::/0");
+  auto tRouteFilterPolicy =
+      createTRouteFilterPolicy({createTRouteFilterStatement({prefix})}, 100);
+
+  TRibPolicyStore tRibPolicyStore;
+  tRibPolicyStore.fileTermination() = kRibPolicyFileTermination;
+  tRibPolicyStore.policy()->route_filter_policy() = tRouteFilterPolicy;
+  rib_->saveTRibPolicyStore(tRibPolicyStore);
+
+  // Write CRF artifact with dryrun=false (FILE_MODE)
+  auto tmpFile = fmt::format("/tmp/crf_test_{}_dryrun_false.json", ::getpid());
+
+  rib_policy::CrfPolicyArtifact artifact;
+  artifact.dryrun() = false;
+  rib_policy::TRouteFilterPolicy crfPolicy;
+  crfPolicy.version() = 999;
+  artifact.policy() = crfPolicy;
+
+  folly::writeFileAtomic(
+      tmpFile,
+      apache::thrift::SimpleJSONSerializer::serialize<std::string>(artifact));
+
+  // Resolve CRF policy using production helper
+  auto crfRead =
+      readThriftArtifactFromFile<rib_policy::CrfPolicyArtifact>(tmpFile);
+  std::optional<rib_policy::CrfPolicyArtifact> tCrfArtifact;
+  if (crfRead.hasValue()) {
+    tCrfArtifact = std::move(crfRead.value());
+  }
+  auto [ribPolicy, crfFileMode] =
+      RibDC::resolveCrfPolicy(rib_->readRibPolicyState(), tCrfArtifact);
+  EXPECT_NE(nullptr, ribPolicy);
+
+  // Route filter policy should come from artifact (version 999), not cache
+  // (100)
+  EXPECT_EQ(999, ribPolicy->getRouteFilterPolicy()->getVersion());
+
+  rib_->setCrfFileModeEnabled(crfFileMode);
+  EXPECT_TRUE(rib_->isCrfFileModeEnabled());
+
+  boost::filesystem::remove(tmpFile);
+}
+
+// readRibPolicyState with CRF artifact dryrun=true -> THRIFT_MODE
+TEST_F(RibPolicyRestoreTestFixture, ReadRibPolicyStateCrfDryrunTrue) {
+  // Write a valid RibPolicyStore with route_filter_policy
+  auto prefix = folly::IPAddress::createNetwork("::/0");
+  auto tRouteFilterPolicy =
+      createTRouteFilterPolicy({createTRouteFilterStatement({prefix})}, 200);
+
+  TRibPolicyStore tRibPolicyStore;
+  tRibPolicyStore.fileTermination() = kRibPolicyFileTermination;
+  tRibPolicyStore.policy()->route_filter_policy() = tRouteFilterPolicy;
+  rib_->saveTRibPolicyStore(tRibPolicyStore);
+
+  // Write CRF artifact with dryrun=true (THRIFT_MODE)
+  auto tmpFile = fmt::format("/tmp/crf_test_{}_dryrun_true.json", ::getpid());
+
+  rib_policy::CrfPolicyArtifact artifact;
+  artifact.dryrun() = true;
+  rib_policy::TRouteFilterPolicy crfPolicy;
+  crfPolicy.version() = 888;
+  artifact.policy() = crfPolicy;
+
+  folly::writeFileAtomic(
+      tmpFile,
+      apache::thrift::SimpleJSONSerializer::serialize<std::string>(artifact));
+
+  // Resolve CRF policy using production helper
+  auto crfRead =
+      readThriftArtifactFromFile<rib_policy::CrfPolicyArtifact>(tmpFile);
+  std::optional<rib_policy::CrfPolicyArtifact> tCrfArtifact;
+  if (crfRead.hasValue()) {
+    tCrfArtifact = std::move(crfRead.value());
+  }
+  auto [ribPolicy, crfFileMode] =
+      RibDC::resolveCrfPolicy(rib_->readRibPolicyState(), tCrfArtifact);
+  EXPECT_NE(nullptr, ribPolicy);
+
+  // Route filter policy should come from cache (version 200), not artifact
+  EXPECT_EQ(200, ribPolicy->getRouteFilterPolicy()->getVersion());
+
+  rib_->setCrfFileModeEnabled(crfFileMode);
+  // CRF file mode should NOT be enabled (dryrun=true)
+  EXPECT_FALSE(rib_->isCrfFileModeEnabled());
+
+  boost::filesystem::remove(tmpFile);
+}
+
+// CRF artifact exists with dryrun=false but no rib policy store file.
+// readRibPolicyState should return nullptr, and crfFileModeEnabled should
+// remain false (not FILE_MODE with no active policy).
+TEST_F(
+    RibPolicyRestoreTestFixture,
+    ReadRibPolicyStateCrfArtifactNoPolicyStore) {
+  // Ensure no policy store file exists
+  boost::filesystem::remove(FLAGS_rp_state_file);
+
+  // Write CRF artifact with dryrun=false
+  auto tmpFile = fmt::format("/tmp/crf_test_{}_no_store.json", ::getpid());
+
+  rib_policy::CrfPolicyArtifact artifact;
+  artifact.dryrun() = false;
+  rib_policy::TRouteFilterPolicy crfPolicy;
+  crfPolicy.version() = 777;
+  artifact.policy() = crfPolicy;
+
+  folly::writeFileAtomic(
+      tmpFile,
+      apache::thrift::SimpleJSONSerializer::serialize<std::string>(artifact));
+
+  // Read artifact — should succeed
+  auto crfRead =
+      readThriftArtifactFromFile<rib_policy::CrfPolicyArtifact>(tmpFile);
+  ASSERT_TRUE(crfRead.hasValue());
+  std::optional<rib_policy::CrfPolicyArtifact> tCrfArtifact =
+      std::move(crfRead.value());
+  EXPECT_FALSE(*tCrfArtifact->dryrun());
+
+  // Resolve CRF policy using production helper
+  auto [ribPolicy, crfFileMode] =
+      RibDC::resolveCrfPolicy(rib_->readRibPolicyState(), tCrfArtifact);
+
+  ASSERT_NE(nullptr, ribPolicy);
+  EXPECT_TRUE(ribPolicy->hasRouteFilterPolicy());
+  EXPECT_EQ(777, ribPolicy->getRouteFilterPolicy()->getVersion());
+
+  rib_->setCrfFileModeEnabled(crfFileMode);
+  EXPECT_TRUE(rib_->isCrfFileModeEnabled());
+
+  boost::filesystem::remove(tmpFile);
+}
+
+// readCrfPolicyFromArtifact: empty artifact file (0 bytes)
+TEST_F(RibPolicyRestoreTestFixture, ReadCrfPolicyFromArtifactEmptyFile) {
+  auto tmpFile = fmt::format("/tmp/crf_test_{}_empty.json", ::getpid());
+
+  folly::writeFileAtomic(tmpFile, "");
+
+  auto result =
+      readThriftArtifactFromFile<rib_policy::CrfPolicyArtifact>(tmpFile);
+  EXPECT_FALSE(result.hasValue());
+
+  boost::filesystem::remove(tmpFile);
+}
+
+// readCrfPolicyFromArtifact: valid artifact with dryrun=true
+TEST_F(RibPolicyRestoreTestFixture, ReadCrfPolicyFromArtifactDryrunTrue) {
+  auto tmpFile =
+      fmt::format("/tmp/crf_test_{}_dryrun_true_standalone.json", ::getpid());
+
+  rib_policy::CrfPolicyArtifact artifact;
+  artifact.dryrun() = true;
+  rib_policy::TRouteFilterPolicy policy;
+  policy.version() = 55;
+  artifact.policy() = policy;
+
+  folly::writeFileAtomic(
+      tmpFile,
+      apache::thrift::SimpleJSONSerializer::serialize<std::string>(artifact));
+
+  auto result =
+      readThriftArtifactFromFile<rib_policy::CrfPolicyArtifact>(tmpFile);
+  ASSERT_TRUE(result.hasValue());
+  EXPECT_TRUE(*result->dryrun());
+  EXPECT_EQ(55, *result->policy()->version());
+
+  boost::filesystem::remove(tmpFile);
+}
+
+// readRibPolicyState with CRF artifact dryrun=false but policy store has no
+// route_filter_policy. The artifact's CRF should be injected into the policy.
+TEST_F(RibPolicyRestoreTestFixture, ReadRibPolicyStateCrfNoCachedPolicy) {
+  // Write a valid RibPolicyStore with only path_selection_policy (no CRF)
+  auto tPathSelectionPolicy =
+      createTPathSelectionPolicyWithPathSelector({kV4Prefix1}, TPathSelector());
+
+  TRibPolicyStore tRibPolicyStore;
+  tRibPolicyStore.fileTermination() = kRibPolicyFileTermination;
+  tRibPolicyStore.policy()->path_selection_policy() = tPathSelectionPolicy;
+  rib_->saveTRibPolicyStore(tRibPolicyStore);
+
+  // Write CRF artifact with dryrun=false
+  auto tmpFile = fmt::format("/tmp/crf_test_{}_no_cached_crf.json", ::getpid());
+
+  rib_policy::CrfPolicyArtifact artifact;
+  artifact.dryrun() = false;
+  rib_policy::TRouteFilterPolicy crfPolicy;
+  crfPolicy.version() = 500;
+  artifact.policy() = crfPolicy;
+
+  folly::writeFileAtomic(
+      tmpFile,
+      apache::thrift::SimpleJSONSerializer::serialize<std::string>(artifact));
+
+  // Resolve CRF policy using production helper
+  auto crfRead =
+      readThriftArtifactFromFile<rib_policy::CrfPolicyArtifact>(tmpFile);
+  std::optional<rib_policy::CrfPolicyArtifact> tCrfArtifact;
+  if (crfRead.hasValue()) {
+    tCrfArtifact = std::move(crfRead.value());
+  }
+  auto [ribPolicy, crfFileMode] =
+      RibDC::resolveCrfPolicy(rib_->readRibPolicyState(), tCrfArtifact);
+
+  // CRF should be injected from artifact (version 500) even though store
+  // had no route_filter_policy
+  EXPECT_TRUE(ribPolicy->hasRouteFilterPolicy());
+  EXPECT_EQ(500, ribPolicy->getRouteFilterPolicy()->getVersion());
+  // Path selection policy from store should still be present
+  EXPECT_TRUE(ribPolicy->hasPathSelectionPolicy());
+
+  rib_->setCrfFileModeEnabled(crfFileMode);
+  EXPECT_TRUE(rib_->isCrfFileModeEnabled());
+
+  boost::filesystem::remove(tmpFile);
+}
+
+// Full integration test replicating the Rib constructor's CRF startup sequence:
+// readCrfPolicyFromArtifact -> readRibPolicyState -> setCrfFileModeEnabled
+TEST_F(RibPolicyRestoreTestFixture, ReadRibPolicyStateCrfFullIntegration) {
+  // Set up policy store with a CRF (version 100)
+  auto prefix = folly::IPAddress::createNetwork("::/0");
+  auto tRouteFilterPolicy =
+      createTRouteFilterPolicy({createTRouteFilterStatement({prefix})}, 100);
+
+  TRibPolicyStore tRibPolicyStore;
+  tRibPolicyStore.fileTermination() = kRibPolicyFileTermination;
+  tRibPolicyStore.policy()->route_filter_policy() = tRouteFilterPolicy;
+  rib_->saveTRibPolicyStore(tRibPolicyStore);
+
+  // Set up CRF artifact with dryrun=false (version 300)
+  auto tmpFile = fmt::format("/tmp/crf_test_{}_integration.json", ::getpid());
+
+  rib_policy::CrfPolicyArtifact artifact;
+  artifact.dryrun() = false;
+  rib_policy::TRouteFilterPolicy crfPolicy;
+  crfPolicy.version() = 300;
+  artifact.policy() = crfPolicy;
+
+  folly::writeFileAtomic(
+      tmpFile,
+      apache::thrift::SimpleJSONSerializer::serialize<std::string>(artifact));
+
+  // Resolve CRF policy using production helper
+  auto crfRead =
+      readThriftArtifactFromFile<rib_policy::CrfPolicyArtifact>(tmpFile);
+  std::optional<rib_policy::CrfPolicyArtifact> tCrfArtifact;
+  if (crfRead.hasValue()) {
+    tCrfArtifact = std::move(crfRead.value());
+  }
+  auto [ribPolicy, crfFileMode] =
+      RibDC::resolveCrfPolicy(rib_->readRibPolicyState(), tCrfArtifact);
+
+  rib_->setCrfFileModeEnabled(crfFileMode);
+
+  // Verify final state
+  ASSERT_NE(nullptr, ribPolicy);
+  EXPECT_EQ(300, ribPolicy->getRouteFilterPolicy()->getVersion());
+  EXPECT_TRUE(rib_->isCrfFileModeEnabled());
+
+  boost::filesystem::remove(tmpFile);
+}
+
+// readThriftArtifactFromFile: empty file path -> kAbsent
+TEST_F(RibPolicyRestoreTestFixture, ReadCrfPolicyFromArtifactEmptyPath) {
+  auto result = readThriftArtifactFromFile<rib_policy::CrfPolicyArtifact>("");
+  ASSERT_TRUE(result.hasError());
+  EXPECT_EQ(ArtifactReadError::kAbsent, result.error());
+}
+
+// readCrfPolicyFromArtifact: file exists but is unreadable (permissions)
+TEST_F(RibPolicyRestoreTestFixture, ReadCrfPolicyFromArtifactUnreadableFile) {
+  if (::geteuid() == 0) {
+    GTEST_SKIP()
+        << "chmod-based permission test is bypassed when running as root";
+  }
+  auto tmpFile = fmt::format("/tmp/crf_test_{}_unreadable.json", ::getpid());
+
+  folly::writeFileAtomic(tmpFile, "valid content");
+  boost::filesystem::permissions(tmpFile, boost::filesystem::perms::no_perms);
+
+  /*
+   * File is present but unreadable -> kError (a genuine read failure), not
+   * kAbsent.
+   */
+  auto result =
+      readThriftArtifactFromFile<rib_policy::CrfPolicyArtifact>(tmpFile);
+  ASSERT_TRUE(result.hasError());
+  EXPECT_EQ(ArtifactReadError::kError, result.error());
+
+  boost::filesystem::permissions(tmpFile, boost::filesystem::perms::owner_all);
+  boost::filesystem::remove(tmpFile);
+}
+
 } // namespace facebook::bgp

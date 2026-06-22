@@ -91,7 +91,7 @@ class AdjRibOutGroup {
             fmt::format(
                 "{}({}/{})",
                 groupId,
-                groupKey.egressPolicyName,
+                groupKey.egressPolicyName.value_or(""),
                 buildAfiLabel(groupKey))),
         shadowRibEntries_(shadowRibEntries),
         policyManager_(std::move(policyManager)),
@@ -298,6 +298,7 @@ class AdjRibOutGroup {
    * Change list consumer activation/deactivation
    * Same pattern as AdjRib for consistency
    */
+  void scheduleConsumeTimer() noexcept;
   void activateChangeListConsumer() noexcept;
   void deactivateChangeListConsumer() noexcept;
 
@@ -378,12 +379,15 @@ class AdjRibOutGroup {
   uint64_t walkAndProcessShadowRib(bool sendWithEoR);
 
   /*
-   * Initial RIB dump - walks shadow RIB and processes announcements.
-   * This is called by PeerManager after group formation.
-   * Not interruptible -- runs synchronously in a single event loop turn
-   * with no co_await inside the body.
+   * Build initial RIB dump from shadow RIB. Returns lastSeenRibVersion_.
    */
-  folly::coro::Task<void> buildInitialDumpFromShadowRib();
+  uint64_t processRibDumpForGroup();
+
+  /*
+   * Build initial dump, transition INIT peers to JOINED_RUNNING,
+   * activate the change list consumer, and schedule the consume timer.
+   */
+  folly::coro::Task<void> buildAndScheduleSendInitialDumpFromShadowRib();
 
   /*
    * Re-evaluate all ShadowRib entries with the current egress policy.
@@ -531,7 +535,8 @@ class AdjRibOutGroup {
    */
   enum class PushResult {
     PUSH_OK, // Message pushed successfully
-    PUSH_PENDING // Queue blocked, deferred coro scheduled
+    PUSH_PENDING, // Queue blocked, deferred coro scheduled
+    PUSH_FAILED // Scheduling failed (asyncScope null or cancelled)
   };
 
   /*
@@ -555,13 +560,6 @@ class AdjRibOutGroup {
       const std::shared_ptr<AdjRib>& adjRib,
       uint64_t bitPos,
       bool sendWithEoR) noexcept;
-
-  /*
-   * Deferred push coroutine - waits for queue space then pushes
-   */
-  folly::coro::Task<void> deferredPushToPeer(
-      nettools::bgplib::FiberBgpPeer::InputMessageT message,
-      std::shared_ptr<AdjRib> adjRib) noexcept;
 
   /*
    * Wait for all pending pushes to complete (all bits clear)
@@ -656,9 +654,20 @@ class AdjRibOutGroup {
   bool hasBlockedPeers() const noexcept;
 
   /*
+   * Detach a peer from the group (core detachment logic).
+   * Copies egress prefix counts, clones packing list, marks detached,
+   * sets version fields, clears blocked bitmap, cancels slow peer timer,
+   * registers detached CL consumer, propagates EoR state.
+   * Does NOT handle slow-peer-specific logic (stats, last-synced guard,
+   * state transitions).
+   */
+  void detachPeer(const std::shared_ptr<AdjRib>& adjRib) noexcept;
+
+  /*
    * Detach a slow peer from the group.
-   * Clones packing list, marks diverged, sets version fields, clears bitmaps,
-   * transitions peer state JOINED_BLOCKED -> DETACHED_BLOCKED.
+   * Calls detachPeer for core logic (including blocked bitmap clear),
+   * then handles slow-peer-specific cleanup: stats, last-synced guard,
+   * EoR, state transition JOINED_BLOCKED -> DETACHED_BLOCKED.
    * Skips detachment if the peer is the last synced member.
    * @param adjRib - The peer to detach
    */
@@ -809,15 +818,16 @@ class AdjRibOutGroup {
   }
 
   /*
-   * Clone a group entry to a specific peer's own RIB-OUT slot.
-   * Creates a per-peer entry keyed by peer's owner key, shallow copying all
-   * relevant fields from the group entry.
+   * Clone a RIB-OUT entry for a specific peer.
+   * Creates an entry keyed by effectiveOwnerKey, shallow copying all
+   * relevant fields from the source entry.
    */
   AdjRibEntry* copyEntryForPeer(
       const folly::CIDRNetwork& prefix,
       uint32_t pathId,
       const std::shared_ptr<AdjRib>& peer,
-      const AdjRibEntry* groupEntry) noexcept;
+      const AdjRibOutOwnerKey& effectiveOwnerKey,
+      const AdjRibEntry* entryToCopy) noexcept;
 
  private:
   void setSyncBit(uint64_t bit) noexcept {
@@ -833,6 +843,14 @@ class AdjRibOutGroup {
     }
     BitmapUtils::clearBit(adjRibSyncBitmap_, bit);
   }
+
+  /*
+   * Common cleanup when removing a peer from this group.
+   * Resets timers, clears bitmaps, frees bit position, and removes
+   * from tracking maps. Does NOT handle per-peer RIB-OUT entries or
+   * peer state transitions — callers handle those separately.
+   */
+  void removePeer(const std::shared_ptr<AdjRib>& adjRib) noexcept;
 
   /*
    * Clone decision algorithm: determines if a group entry must be cloned
@@ -925,7 +943,7 @@ class AdjRibOutGroup {
    * Helper: check if egress policy is configured for this group
    */
   inline bool egressPolicyConfigured() const {
-    return !groupKey_.egressPolicyName.empty();
+    return groupKey_.egressPolicyName.has_value();
   }
 
   /*
@@ -952,7 +970,8 @@ class AdjRibOutGroup {
       const std::string& policyName,
       const folly::CIDRNetwork& prefix,
       const std::shared_ptr<const BgpPath>& prePolicyAttrs,
-      const std::shared_ptr<BgpPolicyActionData>& policyActionData) noexcept;
+      const std::shared_ptr<BgpPolicyActionData>& policyActionData,
+      bool isPartialDrain = false) noexcept;
 
   /*
    * EventBase reference for scheduling async operations.

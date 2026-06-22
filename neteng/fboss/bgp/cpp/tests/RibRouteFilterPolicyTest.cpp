@@ -21,10 +21,12 @@
 #define RibBase_TEST_FRIENDS                                                 \
   friend class RibFsdbFixture;                                               \
   FRIEND_TEST(RibFixtureAddPathTestSuite, SetGetClearRouteFilterPolicyTest); \
-  FRIEND_TEST(RibFsdbAddPathTestSuite, ReplaceRouteFilterPolicyTest);
+  FRIEND_TEST(RibFsdbAddPathTestSuite, ReplaceRouteFilterPolicyTest);        \
+  FRIEND_TEST(RibFsdbAddPathTestSuite, ReplaceRouteFilterPolicyForceUpdateTest);
 
-#define MockRib_TEST_FRIENDS \
-  FRIEND_TEST(RibFsdbAddPathTestSuite, ReplaceRouteFilterPolicyTest);
+#define MockRib_TEST_FRIENDS                                          \
+  FRIEND_TEST(RibFsdbAddPathTestSuite, ReplaceRouteFilterPolicyTest); \
+  FRIEND_TEST(RibFsdbAddPathTestSuite, ReplaceRouteFilterPolicyForceUpdateTest);
 
 #include "configerator/structs/neteng/bgp_policy/thrift/gen-cpp2/rib_policy_types.h"
 #include "fboss/lib/CommonUtils.h"
@@ -239,6 +241,102 @@ TEST_P(RibFsdbAddPathTestSuite, ReplaceRouteFilterPolicyTest) {
         [&]() { rib_->replaceRouteFilterPolicy(nullptr); });
     EXPECT_EQ(rib_->routeFilterPolicy_, nullptr);
   }
+}
+
+/*
+ * This test verifies that replaceRouteFilterPolicy() with forceUpdate=true
+ * bypasses the version check and applies the policy even when the version
+ * is the same. This is used by FILE_MODE (setCrfPolicyFromFile) where the
+ * version may not increment across daemon restarts.
+ */
+TEST_P(RibFsdbAddPathTestSuite, ReplaceRouteFilterPolicyForceUpdateTest) {
+  rib_->setFibBatchTime(std::chrono::milliseconds(2));
+
+  TRouteFilterPolicy tRouteFilterPolicy = createTRouteFilterPolicy(
+      {createTRouteFilterStatement({kV4Prefix1})}, 12345);
+
+  sendInitialPathComputation();
+
+  // Set initial policy with version 12345
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    rib_->replaceRouteFilterPolicy(
+        std::make_unique<RouteFilterPolicy>(tRouteFilterPolicy));
+  });
+  EXPECT_NE(rib_->routeFilterPolicy_, nullptr);
+  EXPECT_EQ(12345, rib_->routeFilterPolicy_->getVersion());
+
+  // Same policy without forceUpdate - should NOT update (hasUpdate=false)
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto hasUpdate = rib_->replaceRouteFilterPolicy(
+        std::make_unique<RouteFilterPolicy>(tRouteFilterPolicy));
+    EXPECT_FALSE(hasUpdate);
+  });
+
+  // Different content, same version, without forceUpdate - should update
+  // (Rib accepts same version if content differs)
+  TRouteFilterPolicy differentPolicy = createTRouteFilterPolicy(
+      {createTRouteFilterStatement({kV4Prefix2})}, 12345);
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto hasUpdate = rib_->replaceRouteFilterPolicy(
+        std::make_unique<RouteFilterPolicy>(differentPolicy));
+    EXPECT_TRUE(hasUpdate);
+  });
+
+  // Same content, lower version, without forceUpdate - should NOT update
+  TRouteFilterPolicy lowerVersionPolicy = createTRouteFilterPolicy(
+      {createTRouteFilterStatement({kV4Prefix2})}, 100);
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto hasUpdate = rib_->replaceRouteFilterPolicy(
+        std::make_unique<RouteFilterPolicy>(lowerVersionPolicy));
+    EXPECT_FALSE(hasUpdate);
+    EXPECT_EQ(12345, rib_->routeFilterPolicy_->getVersion());
+  });
+
+  // Different content, lower version, with forceUpdate=true - should update
+  // (forceUpdate bypasses version check, content differs so hasUpdate=true)
+  TRouteFilterPolicy forcePolicy = createTRouteFilterPolicy(
+      {createTRouteFilterStatement({kV4Prefix1})}, 100);
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto hasUpdate = rib_->replaceRouteFilterPolicy(
+        std::make_unique<RouteFilterPolicy>(forcePolicy),
+        /*isBootstrap=*/false,
+        /*forceUpdate=*/true);
+    EXPECT_TRUE(hasUpdate);
+    EXPECT_EQ(100, rib_->routeFilterPolicy_->getVersion());
+  });
+
+  // Same content, same version, with forceUpdate=true - should NOT update
+  // (forceUpdate only bypasses version check, not content check)
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto hasUpdate = rib_->replaceRouteFilterPolicy(
+        std::make_unique<RouteFilterPolicy>(forcePolicy),
+        /*isBootstrap=*/false,
+        /*forceUpdate=*/true);
+    EXPECT_FALSE(hasUpdate);
+  });
+
+  // Same statements, different version, with forceUpdate=true - should update
+  // (operator!= includes version in comparison, so policies are "different")
+  TRouteFilterPolicy sameStmtsDiffVersion =
+      createTRouteFilterPolicy({createTRouteFilterStatement({kV4Prefix1})}, 50);
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto hasUpdate = rib_->replaceRouteFilterPolicy(
+        std::make_unique<RouteFilterPolicy>(sameStmtsDiffVersion),
+        /*isBootstrap=*/false,
+        /*forceUpdate=*/true);
+    EXPECT_TRUE(hasUpdate);
+    EXPECT_EQ(50, rib_->routeFilterPolicy_->getVersion());
+  });
+
+  // nullptr with forceUpdate=true - clearing should always work
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto hasUpdate = rib_->replaceRouteFilterPolicy(
+        nullptr,
+        /*isBootstrap=*/false,
+        /*forceUpdate=*/true);
+    EXPECT_TRUE(hasUpdate);
+    EXPECT_EQ(rib_->routeFilterPolicy_, nullptr);
+  });
 }
 
 } // namespace bgp

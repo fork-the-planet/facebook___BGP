@@ -34,6 +34,7 @@
 #include "neteng/fboss/bgp/cpp/common/RibMessage.h"
 #include "neteng/fboss/bgp/cpp/policy/PolicyManager.h"
 #include "neteng/fboss/bgp/cpp/tests/AdjRibInUtils.h"
+#include "neteng/fboss/bgp/cpp/tests/BoundedWaitUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/PolicyUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/Utils.h"
 
@@ -61,7 +62,7 @@ TEST_F(AdjRibInboundFixture, V4GetNetworks) {
   });
 
   fm_->addTask([&] {
-    folly::coro::blockingWait(ribInQ_.pop());
+    facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
 
     std::map<TIpPrefix, TBgpPath> prefixToPath;
     adjRib_->getNetworks(prefixToPath, RouteFilterType::PRE_FILTER_RECEIVED);
@@ -167,8 +168,8 @@ TEST_F(AdjRibInboundFixture, V4GetNetworks2_ReceivedNonAddPath) {
 
   fm_->addTask([&] {
     // wait for two mesages.
-    folly::coro::blockingWait(ribInQ_.pop());
-    folly::coro::blockingWait(ribInQ_.pop());
+    facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
+    facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     std::map<TIpPrefix, std::vector<TBgpPath>> prefixToPath;
 
     adjRib_->getNetworks2(prefixToPath, RouteFilterType::PRE_FILTER_RECEIVED);
@@ -287,8 +288,8 @@ TEST_F(AdjRibInboundFixture, V4GetNetworks2_Received) {
 
   fm_->addTask([&] {
     // wait for two mesages.
-    folly::coro::blockingWait(ribInQ_.pop());
-    folly::coro::blockingWait(ribInQ_.pop());
+    facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
+    facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     std::map<TIpPrefix, std::vector<TBgpPath>> prefixToPath;
 
     adjRib_->getNetworks2(prefixToPath, RouteFilterType::PRE_FILTER_RECEIVED);
@@ -408,8 +409,8 @@ TEST_F(AdjRibInboundFixture, V4GetNetworks2_AdvertisedNonAddPath) {
 
   fm_->addTask([&] {
     // wait for two mesages.
-    folly::coro::blockingWait(ribInQ_.pop());
-    folly::coro::blockingWait(ribInQ_.pop());
+    facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
+    facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
     std::map<TIpPrefix, std::vector<TBgpPath>> prefixToPath;
 
     adjRib_->getNetworks2(prefixToPath, RouteFilterType::POST_FILTER_RECEIVED);
@@ -512,7 +513,7 @@ TEST_F(AdjRibInboundFixture, V4GetNetworks2_Advertised) {
   });
 
   fm_->addTask([&] {
-    folly::coro::blockingWait(ribInQ_.pop());
+    facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
 
     std::map<TIpPrefix, std::vector<TBgpPath>> prefixToPath;
     uint32_t pathId = 123;
@@ -555,7 +556,7 @@ TEST_F(AdjRibInboundFixture, V6GetNetworks) {
   });
 
   fm_->addTask([&] {
-    auto msg = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
 
     std::map<TIpPrefix, TBgpPath> prefixToPath;
     adjRib_->getNetworks(prefixToPath, RouteFilterType::PRE_FILTER_RECEIVED);
@@ -620,8 +621,8 @@ TEST_F(AdjRibInboundFixture, V6GetNetworks2) {
   });
 
   fm_->addTask([&] {
-    auto msg = folly::coro::blockingWait(ribInQ_.pop());
-    auto msg2 = folly::coro::blockingWait(ribInQ_.pop());
+    auto msg = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
+    auto msg2 = facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
 
     std::map<TIpPrefix, std::vector<TBgpPath>> prefixToPath;
     adjRib_->getNetworks2(prefixToPath, RouteFilterType::PRE_FILTER_RECEIVED);
@@ -690,7 +691,7 @@ TEST_F(AdjRibInboundFixture, getDryRunNetworks) {
   });
 
   fm_->addTask([&] {
-    folly::coro::blockingWait(ribInQ_.pop());
+    facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
 
     std::map<TIpPrefix, TBgpPath> prefixToPath;
     adjRib_->getNetworks(prefixToPath, RouteFilterType::POST_FILTER_RECEIVED);
@@ -782,7 +783,7 @@ TEST_F(AdjRibInboundFixture, ConvertEntryToPathTest) {
   });
 
   fm_->addTask([&] {
-    folly::coro::blockingWait(ribInQ_.pop());
+    facebook::bgp::test::boundedBlockingPop(ribInQ_, "ribInQ_");
 
     std::map<TIpPrefix, TBgpPath> prefixToPath;
     adjRib_->getNetworks(prefixToPath, RouteFilterType::PRE_FILTER_RECEIVED);

@@ -17,9 +17,9 @@
 #pragma once
 
 #include <folly/IPAddress.h>
-#include <folly/Optional.h>
 #include <folly/io/Cursor.h>
 #include <folly/logging/xlog.h>
+#include <optional>
 
 #include "neteng/fboss/bgp/cpp/lib/BgpException.h"
 #include "neteng/fboss/bgp/cpp/lib/BgpStructs.h"
@@ -62,13 +62,13 @@ struct BgpPrefix {
   const std::vector<int32_t> labels;
 
   // path id used by ADD_PATH feature.
-  const folly::Optional<int32_t> pathId;
+  const std::optional<int32_t> pathId;
 
   // Constructor
   BgpPrefix(
       const folly::CIDRNetwork& prefix,
       const std::vector<int32_t>& labels,
-      const folly::Optional<int32_t>& pathId = folly::none)
+      const std::optional<int32_t>& pathId = std::nullopt)
       : prefix(prefix), labels(labels), pathId(pathId) {}
 };
 
@@ -134,7 +134,7 @@ struct UpdateMsgParsingState {
   uint16_t paLen{0};
 
   // this is set if message is End Of Rib
-  folly::Optional<BgpEndOfRib> eor;
+  std::optional<BgpEndOfRib> eor;
 
   //
   // Bgp Nexthops in update message are parsed into following variable
@@ -208,7 +208,7 @@ struct UpdateMsgParsingState {
  */
 BgpMessageHeader parseBgpMsgHdr(
     folly::io::Cursor curosr,
-    folly::Optional<BgpMessageType> msgType = folly::none);
+    std::optional<BgpMessageType> msgType = std::nullopt);
 
 /**
  * Parse BGP Open message optional parameter Capabilities and populates

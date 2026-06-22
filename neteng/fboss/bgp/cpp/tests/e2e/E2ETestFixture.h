@@ -1012,6 +1012,17 @@ class E2ETestFixture : public ::testing::Test {
   }
 
   /*
+   * Override eor_time_s (the initialization EoR convergence timer) in the
+   * BgpConfig. Call before getConfig() runs (i.e. before the peer manager is
+   * created). Tests that bring a peer down before it ever sends an EoR
+   * otherwise block for the full default timer waiting for initialization to
+   * complete.
+   */
+  void setEorTimeSeconds(uint32_t seconds) {
+    eorTimeSecondsOverride_ = seconds;
+  }
+
+  /*
    * Sets the peer's negotiated GR capability and remote restart time used
    * when establishing sessions. Call before bringUpPeer().
    */
@@ -1057,6 +1068,9 @@ class E2ETestFixture : public ::testing::Test {
 
   // GR convergence override
   std::optional<uint32_t> grConvergenceSecondsOverride_;
+
+  // Initialization EoR convergence timer (eor_time_s) override
+  std::optional<uint32_t> eorTimeSecondsOverride_;
 
   // Per-peer GR restart time advertised in negotiated capabilities
   std::optional<uint16_t> peerGrRestartTimeSeconds_;

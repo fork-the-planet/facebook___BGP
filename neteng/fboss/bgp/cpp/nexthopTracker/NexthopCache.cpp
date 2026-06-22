@@ -154,25 +154,32 @@ NexthopStatus NexthopCache::registerAndGetNexthopStatus(
       "Getting nexthop status for {} and registering from RIB",
       nexthopIp.str());
 
-  return nexthopStatusMap_.withWLock(
+  // Whether to fire the registration hook after releasing the lock: true when
+  // the registered nexthop has no reachable answer yet (new entry, or an
+  // existing entry that is currently unreachable), so the on-demand resolver
+  // gets a chance to look it up.
+  bool needsResolution = false;
+
+  auto status = nexthopStatusMap_.withWLock(
       [&](folly::F14NodeMap<folly::IPAddress, NexthopStatusWithRegistration>&
               statusMap) -> NexthopStatus {
         auto it = statusMap.find(nexthopIp);
         // Return the entry if it exists
         if (it != statusMap.end()) {
           // Mark this nexthop as registered from RIB
-          auto& [status, isRegisteredFromRib] = it->second;
+          auto& [entryStatus, isRegisteredFromRib] = it->second;
           isRegisteredFromRib = true;
+          needsResolution = !entryStatus.isReachable();
 
           XLOGF(
               DBG2,
               "Found nexthop status for {}, reachable: {}, igpCost: {}, registeredFromRib: true",
               nexthopIp.str(),
-              status.isReachable(),
-              status.getIgpCost().has_value()
-                  ? std::to_string(status.getIgpCost().value())
+              entryStatus.isReachable(),
+              entryStatus.getIgpCost().has_value()
+                  ? std::to_string(entryStatus.getIgpCost().value())
                   : "unset");
-          return status;
+          return entryStatus;
         }
 
         // Create a new entry with default values (unreachable, no IGP cost)
@@ -188,9 +195,89 @@ NexthopStatus NexthopCache::registerAndGetNexthopStatus(
         // Insert the new entry with registration flag set to true
         statusMap.emplace(nexthopIp, std::make_tuple(defaultStatus, true));
         RibStats::incrNexthopStatusMapCount();
+        needsResolution = true;
 
         return defaultStatus;
       });
+
+  // Fire the on-demand resolution hook OUTSIDE the lock (the hook is
+  // non-blocking and may, in turn, call back into the cache). It is only set
+  // when the neighbor-event resolution flag is on.
+  if (needsResolution && onNexthopRegistered_) {
+    onNexthopRegistered_(nexthopIp);
+  }
+
+  return status;
+}
+
+bool NexthopCache::isRegistered(const folly::IPAddress& nexthopIp) const {
+  return nexthopStatusMap_.withRLock(
+      [&](const folly::F14NodeMap<
+          folly::IPAddress,
+          NexthopStatusWithRegistration>& statusMap) -> bool {
+        auto it = statusMap.find(nexthopIp);
+        return it != statusMap.end() && std::get<1>(it->second);
+      });
+}
+
+std::vector<folly::IPAddress> NexthopCache::getRegisteredNexthopsInSubnet(
+    const folly::CIDRNetwork& prefix) const {
+  const auto& [subnet, prefixLen] = prefix;
+  return nexthopStatusMap_.withRLock(
+      [&](const folly::
+              F14NodeMap<folly::IPAddress, NexthopStatusWithRegistration>&
+                  statusMap) -> std::vector<folly::IPAddress> {
+        std::vector<folly::IPAddress> result;
+        for (const auto& [ip, statusWithReg] : statusMap) {
+          if (std::get<1>(statusWithReg) && ip.isV4() == subnet.isV4() &&
+              ip.inSubnet(subnet, prefixLen)) {
+            result.push_back(ip);
+          }
+        }
+        return result;
+      });
+}
+
+std::optional<NexthopStatus> NexthopCache::clearConnectedStatus(
+    const folly::IPAddress& nexthopIp) {
+  return nexthopStatusMap_.withWLock(
+      [&](folly::F14NodeMap<folly::IPAddress, NexthopStatusWithRegistration>&
+              statusMap) -> std::optional<NexthopStatus> {
+        auto it = statusMap.find(nexthopIp);
+        if (it == statusMap.end()) {
+          return std::nullopt;
+        }
+        auto& [status, isRegisteredFromRib] = it->second;
+        // Only act on entries we currently own as directly connected.
+        if (status.isConnected() != true) {
+          return std::nullopt;
+        }
+
+        XLOGF(
+            DBG2,
+            "Clearing connected status for {} (no longer directly connected); was reachable: {}",
+            nexthopIp.str(),
+            status.isReachable());
+
+        bool wasReachable = status.isReachable();
+        // Reset to unreachable with isConnected unset so a non-connected source
+        // (e.g. FsdbFibWatcher) can take over authority again.
+        status = NexthopStatus(
+            nexthopIp, /*isReachable*/ false, std::nullopt, std::nullopt);
+        if (wasReachable) {
+          RibStats::incrNhtCacheNexthopUnreachable();
+        }
+
+        if (isRegisteredFromRib) {
+          return status;
+        }
+        return std::nullopt;
+      });
+}
+
+void NexthopCache::setOnNexthopRegistered(
+    std::function<void(folly::IPAddress)> callback) {
+  onNexthopRegistered_ = std::move(callback);
 }
 
 bool NexthopCache::unregisterAndRemoveNexthopStatus(

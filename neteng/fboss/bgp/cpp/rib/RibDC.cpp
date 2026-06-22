@@ -16,14 +16,61 @@
 
 #include <folly/logging/xlog.h>
 
+#include "fboss/agent/AddressUtil.h"
+#include "neteng/fboss/bgp/cpp/BgpServiceUtil.h"
+#include "neteng/fboss/bgp/cpp/common/BgpError.h"
 #include "neteng/fboss/bgp/cpp/common/Consts.h"
 #include "neteng/fboss/bgp/cpp/facebook/ScubaLoggerFactory.h"
 #include "neteng/fboss/bgp/cpp/fsdb/FsdbSyncer.h"
+#include "neteng/fboss/bgp/cpp/peer/NeighborWatcher.h"
 #include "neteng/fboss/bgp/cpp/rib/FibDev.h"
 #include "neteng/fboss/bgp/cpp/rib/FibFboss.h"
 #include "neteng/fboss/bgp/cpp/rib/RibDC.h"
+#include "neteng/fboss/bgp/cpp/rib/RibFileUtils.h"
+#include "neteng/fboss/bgp/cpp/rib/RibPolicy.h"
+#include "neteng/fboss/bgp/cpp/rib/Utils.h"
+#include "neteng/fboss/bgp/cpp/stats/Stats.h"
+#include "neteng/fboss/bgp/if/gen-cpp2/bgp_thrift_types.h"
+
+DEFINE_string(
+    crf_policy_file,
+    "",
+    "Path to the CRF Policy artifact file for file-based CRF delivery");
+
+using namespace facebook::neteng::fboss::bgp_attr;
+using namespace facebook::neteng::fboss::bgp::thrift;
 
 namespace facebook::bgp {
+
+RibDC::CrfResolution RibDC::resolveCrfPolicy(
+    std::unique_ptr<RibPolicy> cachedPolicy,
+    const std::optional<rib_policy::CrfPolicyArtifact>& artifact) {
+  if (!artifact.has_value()) {
+    return {std::move(cachedPolicy), false};
+  }
+
+  bool crfFileMode = !*artifact->dryrun();
+
+  if (crfFileMode && cachedPolicy) {
+    auto tRibPolicy = cachedPolicy->toThrift();
+    tRibPolicy.route_filter_policy() = *artifact->policy();
+    cachedPolicy = std::make_unique<RibPolicy>(tRibPolicy);
+    XLOGF(
+        INFO,
+        "CRF FILE_MODE: replaced cached CRF with artifact policy (version={})",
+        *artifact->policy()->version());
+  } else if (crfFileMode) {
+    rib_policy::TRibPolicy tRibPolicy;
+    tRibPolicy.route_filter_policy() = *artifact->policy();
+    cachedPolicy = std::make_unique<RibPolicy>(tRibPolicy);
+    XLOGF(
+        INFO,
+        "CRF FILE_MODE: no cached policy, creating new with artifact (version={})",
+        *artifact->policy()->version());
+  }
+
+  return {std::move(cachedPolicy), crfFileMode};
+}
 
 RibDC::RibDC(
     const std::unordered_map<folly::CIDRNetwork, thrift::BgpNetwork>&
@@ -36,7 +83,8 @@ RibDC::RibDC(
     FsdbSyncer* fsdbSyncer,
     std::shared_ptr<NexthopCache> nexthopCache,
     uint16_t fibAgentPort,
-    uint32_t fibAgentRecvTimeout)
+    uint32_t fibAgentRecvTimeout,
+    std::shared_ptr<NeighborWatcher> neighborWatcher)
     : RibBase(
           localRoutes,
           globalConfig,
@@ -48,6 +96,19 @@ RibDC::RibDC(
           fibAgentPort,
           fibAgentRecvTimeout) {
   fsdbSyncer_ = fsdbSyncer;
+
+  /*
+   * Wire RIB-IN-learned nexthops to the FIB watcher for FSDB tracking. Done in
+   * the constructor (before the RIB thread starts) so no learned nexthop is
+   * missed. nexthopCache_ is non-null exactly when nexthop tracking is enabled;
+   * DC-only — EBB constructs RibBB and has no NeighborWatcher.
+   */
+  if (nexthopCache_ && neighborWatcher) {
+    setNexthopSubscribeRequester(
+        [neighborWatcher](std::vector<folly::IPAddress> nexthops) {
+          neighborWatcher->requestNexthopSubscribe(std::move(nexthops));
+        });
+  }
 
   routeAttributePolicyTimer_ =
       folly::AsyncTimeout::make(evb_, [this]() noexcept {
@@ -74,7 +135,58 @@ RibDC::RibDC(
    * programming. This must happen in the subclass constructor since
    * replaceRibPolicy() is pure virtual in RibBase.
    */
-  replaceRibPolicy(readRibPolicyState(), /*isBootstrap=*/true);
+  auto crfRead = readThriftArtifactFromFile<rib_policy::CrfPolicyArtifact>(
+      FLAGS_crf_policy_file);
+  /*
+   * Instrument the startup CRF artifact read so a restart-time read is
+   * observable. The on-demand Thrift path (setCrfPolicyFromFile) increments
+   * these counters, but the bootstrap path historically did not, leaving no
+   * fb303/log signal for "did bgpd pick up the artifact on restart?".
+   *
+   * Count kError (file present but unreadable/corrupt) as a failure. kAbsent
+   * (no path configured or file not present) is the expected state on devices
+   * not yet onboarded to file-mode; counting it would swamp the failure counter
+   * and make the success/failure ratio meaningless, so it is not counted.
+   */
+  std::optional<rib_policy::CrfPolicyArtifact> tCrfArtifact;
+  if (crfRead.hasValue()) {
+    BgpStats::incrCrfArtifactReadSuccess();
+    tCrfArtifact = std::move(crfRead.value());
+  } else if (crfRead.error() == ArtifactReadError::kError) {
+    BgpStats::incrCrfArtifactReadFailure();
+  }
+  auto [ribPolicy, crfFileMode] =
+      resolveCrfPolicy(readRibPolicyState(), tCrfArtifact);
+  XLOGF(
+      INFO,
+      "CRF startup read: artifact={}, dryrun={}, mode={}",
+      tCrfArtifact.has_value() ? "present" : "absent",
+      tCrfArtifact.has_value() ? (*tCrfArtifact->dryrun() ? "true" : "false")
+                               : "n/a",
+      crfFileMode ? "FILE_MODE" : "THRIFT_MODE");
+  replaceRibPolicy(std::move(ribPolicy), /*isBootstrap=*/true);
+  setCrfFileModeEnabled(crfFileMode);
+}
+
+bool RibDC::isCrfFileModeEnabled() const {
+  return crfFileModeEnabled_;
+}
+
+void RibDC::setCrfFileModeEnabled(bool fileModeActive) {
+  if (crfFileModeEnabled_.exchange(fileModeActive) != fileModeActive) {
+    XLOGF(
+        INFO,
+        "CRF Policy mode changed: {}",
+        fileModeActive ? "FILE_MODE" : "THRIFT_MODE");
+  }
+  /*
+   * Keep the fb303 gauge in sync with the real mode so monitoring can
+   * distinguish FILE_MODE (1) from THRIFT_MODE (0). Set unconditionally (not
+   * only on transition) so the gauge is also correct after the initial
+   * bootstrap call. Without this the gauge stays at its init value (0) and can
+   * never reflect FILE_MODE.
+   */
+  BgpStats::setCrfFileModeEnabled(fileModeActive);
 }
 
 void RibDC::createFib() {
@@ -110,12 +222,12 @@ void RibDC::enqueueRibUpdateToFsdb() {
       const auto& routePrefix = updatedRoute.getPrefix();
       auto prefix = folly::IPAddress::networkToString(routePrefix);
       auto ribEntry = ribEntries_.find(routePrefix);
-      if (ribEntry != ribEntries_.end() && updatedRoute.getBestPath()) {
-        ribUpdateToFsdb.emplace(
-            std::move(prefix), std::make_optional(createTRibEntry(*ribEntry)));
-      } else {
-        ribUpdateToFsdb.emplace(std::move(prefix), std::nullopt);
+      std::optional<bgp_thrift::TRibEntry> tRibEntry;
+      if (ribEntry != ribEntries_.end()) {
+        tRibEntry = createBestPathOnlyTRibEntry(*ribEntry);
       }
+      // nullopt (prefix gone, or no publishable best path) -> withdraw.
+      ribUpdateToFsdb.emplace(std::move(prefix), std::move(tRibEntry));
     }
 
     fsdbSyncer_->updateRibMap(std::move(ribUpdateToFsdb));
@@ -164,6 +276,24 @@ void RibDC::processNexthopResolutionUpdate(
         "signaling PeerManager via RibOutNexthopResolutionReceived");
     ribOutQ_.push(RibOutNexthopResolutionReceived{});
   }
+}
+
+void RibDC::publishPartialDrainState() {
+  if (!fsdbSyncer_) {
+    return;
+  }
+  if (!isDevicePartiallyDrained()) {
+    fsdbSyncer_->setPartialDrainState(std::nullopt);
+    return;
+  }
+  /*
+   * Build the snapshot here (device summary + per-prefix drained set) rather
+   * than in RibBase::prepareFibProgramming, keeping all drain-domain logic on
+   * the DC side. getPartialDrainState() scans ribEntries_ for drained prefixes
+   * — O(n_ribEntries) — but this path is gated on an actual transition, so the
+   * scan runs only on drain-change passes, not every FIB programming pass.
+   */
+  fsdbSyncer_->setPartialDrainState(std::make_optional(getPartialDrainState()));
 }
 
 /*
@@ -705,6 +835,523 @@ void RibDC::overwriteRouteAttributes(
     RibStats::STATS_ribFullSyncRouteAttributeOverwriteTimeMs.addValue(
         routeAttributeOverwriteTimeMs.count());
   }
+}
+
+std::pair<bool, bool> RibDC::runBestPathSelection(RibEntry& entry) noexcept {
+  // Capture before selectBestPath() — it is the sole producer of
+  // isPartialDrain_ and may flip it on the entry. Recording the transition
+  // here (rather than in RibBase::prepareFibProgramming) keeps all
+  // partial-drain bookkeeping inside RibDC so RibBase stays platform-agnostic.
+  const bool oldIsPartialDrain = entry.getIsPartialDrain();
+
+  auto result = RibDC::selectBestPath(
+      entry,
+      multipathSelector_,
+      bestpathSelector_,
+      globalConfig_.computeUcmpFromLbwComm,
+      globalConfig_.ucmpWidth,
+      std::optional<BgpUcmpQuantizer>(globalConfig_.ucmpQuantizer),
+      pathSelectionPolicy_,
+      enableRibAllocatedPathId_);
+
+  // Accumulate across the pass; onPrepareFibProgrammingComplete() consumes the
+  // flag to drive a single end-of-pass state publish.
+  if (recordPartialDrainTransition(
+          oldIsPartialDrain, entry.getIsPartialDrain())) {
+    partialDrainStateChanged_ = true;
+  }
+
+  return result;
+}
+
+void RibDC::onPrepareFibProgrammingComplete() noexcept {
+  /*
+   * Partial-drain publish is independent of FIB programming — a drain
+   * transition that doesn't change FIB state still needs to be published so
+   * downstream subscribers can react. Runs once per pass, gated on an actual
+   * transition so the snapshot scan in publishPartialDrainState() runs only on
+   * drain-change passes.
+   */
+  if (partialDrainStateChanged_) {
+    publishPartialDrainState();
+    partialDrainStateChanged_ = false;
+  }
+}
+
+/*
+ * DC-only path selection orchestrator. Same 7-phase pipeline as the
+ * RibBase native orchestrator, except the multipath phase consults
+ * the Centralized Path Selection (CPS) policy when one is passed in.
+ */
+std::pair<bool, bool> RibDC::selectBestPath(
+    RibEntry& entry,
+    const std::unique_ptr<RouteInfoSelector>& multipathSelector,
+    const std::unique_ptr<RouteInfoSelector>& bestpathSelector,
+    bool computeUcmp,
+    uint32_t ucmpWidth,
+    const std::optional<BgpUcmpQuantizer>& quantizer,
+    const std::unique_ptr<PathSelectionPolicy>& pathSelectionPolicy,
+    bool enableRibAllocatedPathId) noexcept {
+  const auto input = snapshotAndResetForPathSelection(entry);
+  /*
+   * Partial-drain state is DC-only — RibBase's snapshot/orchestrator is
+   * intentionally CPS-free. Capture and reset it here so selectBestPath() is
+   * the authoritative producer of isPartialDrain_: it is recomputed below from
+   * the policy outcome, and leaving the previous value would persist drain
+   * state across passes when the outcome no longer warrants it.
+   */
+  const auto oldIsPartialDrain = entry.isPartialDrain_;
+  entry.isPartialDrain_ = false;
+  entry.mnhThreshold_ = 0;
+  entry.aggLbwBpsThreshold_ = 0;
+  auto routes = prePathSelectionFiltering(entry);
+
+  if (routes.empty()) {
+    entry.bestpath_ = nullptr;
+    if (enableRibAllocatedPathId) {
+      entry.multipaths_ = {};
+    }
+    entry.installToFib_ = true;
+    entry.weightedNexthops_ = nullptr;
+    return std::make_pair(
+        (entry.bestpath_ != input.oldBestpath) ||
+            (entry.isPartialDrain_ != oldIsPartialDrain),
+        entry.weightedNexthops_ != input.oldMultipathWeightedNexthops);
+  }
+
+  /*
+   * CPS-aware multipath selection. When a policy is installed it may
+   * override the multipath set or reject the prefix entirely. An empty
+   * selectedPaths after CPS is a legitimate rejection signal — we
+   * clear bestpath/multipaths and early-return like the no-routes
+   * fast-path above.
+   */
+  MultiPathSelectionResult mp;
+  bool failedCpsNativeCriteria = false;
+  if (pathSelectionPolicy) {
+    mp.selectedPaths = pathSelectionPolicy->overrideMultipathSelection(
+        entry, routes, multipathSelector);
+    if (mp.selectedPaths.empty()) {
+      entry.bestpath_ = nullptr;
+      entry.multipaths_ = {};
+      entry.installToFib_ = true;
+      entry.weightedNexthops_ = nullptr;
+      return std::make_pair(
+          (entry.bestpath_ != input.oldBestpath) ||
+              (entry.isPartialDrain_ != oldIsPartialDrain),
+          entry.weightedNexthops_ != input.oldMultipathWeightedNexthops);
+    }
+    const auto& policyResult =
+        pathSelectionPolicy->getPathSelectionPolicyResult(entry.getPrefix());
+    if (policyResult && policyResult->isCapacityThresholdViolation()) {
+      if (policyResult->drainOnMinCapacityThresholdViolation) {
+        /*
+         * MNH/LBW capacity threshold violated but
+         * drain_on_min_nexthop_violation is set: retain the bestpath and keep
+         * FIB warm instead of withdrawing the prefix. The drain community is
+         * attached downstream in AdjRibOut (MNH 3/N).
+         */
+        entry.isPartialDrain_ = true;
+        entry.mnhThreshold_ = policyResult->mnhThreshold;
+        entry.aggLbwBpsThreshold_ = policyResult->aggLbwBpsThreshold;
+        XLOGF(
+            DBG2,
+            "Partial drain engaged for prefix {}",
+            folly::IPAddress::networkToString(entry.getPrefix()));
+      } else {
+        entry.bestpath_ = nullptr;
+        entry.installToFib_ = true;
+        failedCpsNativeCriteria = true;
+      }
+    }
+  } else {
+    mp = multiPathSelection(entry, routes, multipathSelector);
+  }
+
+  accumulateAggregateWeightsAndTopoInfo(
+      entry, mp, input.oldNexthopAndTopoInfo, quantizer);
+
+  if (!failedCpsNativeCriteria) {
+    bestPathSelection(entry, mp.selectedPaths, bestpathSelector);
+  }
+
+  auto newNhWtMap = buildAndNormalizeWeightedNexthops(
+      entry, mp.selectedPaths, computeUcmp, ucmpWidth, mp.lbwMultiplier);
+
+  auto changePair = computeChangePair(
+      entry, input, mp.topoInfoChanged, std::move(newNhWtMap));
+  /*
+   * Fold the drain transition into bestpathChanged so the RibOut announcement
+   * machinery re-advertises on drain rollout/rollback even when the bestpath
+   * pointer itself is unchanged.
+   */
+  changePair.first =
+      changePair.first || (entry.isPartialDrain_ != oldIsPartialDrain);
+  return changePair;
+}
+
+/*
+ * DC-only CPS thrift surfaces. Moved verbatim from RibBase as part of
+ * the DC-vs-BB split so the BB binary's RibBase translation unit has
+ * zero references to PathSelectionPolicy.
+ */
+neteng::fboss::bgp::thrift::TResult RibDC::setPathSelectionPolicy(
+    std::unique_ptr<rib_policy::TPathSelectionPolicy> policy) {
+  neteng::fboss::bgp::thrift::TResult result;
+  try {
+    PathSelectionPolicy psPolicy{*policy};
+  } catch (const BgpError& ex) {
+    auto errorMsg = folly::exceptionStr(ex);
+    XLOGF(ERR, "{}", errorMsg);
+    result.success() = false;
+    result.err() = errorMsg;
+    return result;
+  }
+
+  // push rib policy set message to policy queue
+  evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
+    ribPolicyMsgQ_.push(PathSelectionPolicySetMsg{std::move(*policy)});
+  });
+  result.success() = true;
+  return result;
+}
+
+rib_policy::TPathSelectionPolicy RibDC::getPathSelectionPolicy() {
+  rib_policy::TPathSelectionPolicy result;
+  evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
+    if (pathSelectionPolicy_ != nullptr) {
+      result = pathSelectionPolicy_->toThrift();
+    }
+  });
+  return result;
+}
+
+int64_t RibDC::getPathSelectionPolicyVersion() const {
+  return pathSelectionPolicy_ ? pathSelectionPolicy_->getVersion() : -1;
+}
+
+void RibDC::clearPathSelectionPolicy() {
+  // push clear message to policy queue
+  evb_.runImmediatelyOrRunInEventBaseThreadAndWait(
+      [&]() { ribPolicyMsgQ_.push(PathSelectionPolicyClearMsg{}); });
+}
+
+std::vector<rib_policy::TPathSelector> RibDC::getActivePathSelectionCriteria(
+    std::unique_ptr<std::vector<std::string>> prefixes) {
+  std::vector<rib_policy::TPathSelector> result;
+  evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
+    if (pathSelectionPolicy_) {
+      result = pathSelectionPolicy_->getActivePathSelectionCriteria(*prefixes);
+    }
+  });
+  return result;
+}
+
+/*
+ * DC-only override. Calls the base implementation (which fills the
+ * non-CPS sub-policies) and then layers in path_selection_policy on
+ * its own evb hop.
+ */
+rib_policy::TRibPolicy RibDC::getRibPolicy() {
+  auto result = RibBase::getRibPolicy();
+  evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
+    if (pathSelectionPolicy_) {
+      result.path_selection_policy() = pathSelectionPolicy_->toThrift();
+    }
+  });
+  return result;
+}
+
+bool RibDC::computeFailedCpsNativeCriteria(
+    const facebook::bgp::RibEntry& ribEntry) const {
+  if (!pathSelectionPolicy_) {
+    return false;
+  }
+  auto psPolicyRes =
+      pathSelectionPolicy_->getPathSelectionPolicyResult(ribEntry.getPrefix());
+  return psPolicyRes && psPolicyRes->isFailedCpsNativeCriteria();
+}
+
+/*
+ * DC-only override. Duplicates the base body (rather than calling it)
+ * because the CPS-rejection bit gates the per-path loop's tBestPaths-
+ * vs-tDefaultPaths branching — there's no way to layer that in after
+ * the loop runs.
+ */
+std::optional<neteng::fboss::bgp::thrift::TRibEntry>
+RibDC::createTRibEntryWithFilter(
+    const std::pair<const folly::CIDRNetwork, facebook::bgp::RibEntry>& entry,
+    const std::function<bool(const RouteInfo&)>& pathFilter) {
+  TRibEntry tRibEntry;
+  tRibEntry.prefix() = buildTPrefix(entry.first);
+
+  const auto& ribEntry = entry.second;
+
+  /*
+   * CPS-specific: populate active_cps_criteria.
+   */
+  if (pathSelectionPolicy_) {
+    std::vector<std::string> prefixVector = {
+        folly::IPAddress::networkToString(ribEntry.getPrefix())};
+    auto activeCriteriaVector =
+        pathSelectionPolicy_->getActivePathSelectionCriteria(prefixVector);
+    XCHECK_EQ(activeCriteriaVector.size(), 1);
+    const auto& activeCriteria = activeCriteriaVector.at(0);
+    if (activeCriteria != rib_policy::TPathSelector()) {
+      tRibEntry.active_cps_criteria() = activeCriteria;
+    }
+  }
+  /*
+   * If failedCpsNativeCriteria is true, no path is "best path", unless
+   * drain_on_min_nexthop_violation is true, in which case we retain the best
+   * path and advertise it with the drain community attached.
+   */
+  const bool failedCpsNativeCriteria = computeFailedCpsNativeCriteria(ribEntry);
+
+  // CTE — same as RibBase's version.
+  if (routeAttributePolicy_) {
+    auto activeCteUcmpAction =
+        routeAttributePolicy_->getActiveCteUcmpAction(ribEntry.getPrefix());
+    if (activeCteUcmpAction) {
+      tRibEntry.active_cte_ucmp_action() = std::move(*activeCteUcmpAction);
+    }
+  }
+
+  const auto& bestpath = ribEntry.getBestPath();
+  if (bestpath) {
+    auto bestNexthop = bestpath->attrs->getNexthop();
+    tRibEntry.best_next_hop() = createTIpPrefix(bestNexthop);
+  }
+
+  std::vector<TBgpPath> tDefaultPaths{};
+  std::vector<TBgpPath> tBestPaths{};
+  const auto& routeinfos = ribEntry.getAllPaths();
+  const auto& multipath_routeinfos = ribEntry.getMultipaths();
+  auto weightedNexthops = ribEntry.getMultipathWeightedNexthops();
+  for (const auto& routeinfo : routeinfos) {
+    if (!pathFilter(*routeinfo)) {
+      continue;
+    }
+    auto tPath = toTBgpPath(routeinfo, weightedNexthops);
+    if (routeinfo->pathIdToSend.has_value() &&
+        multipath_routeinfos.contains(routeinfo->pathIdToSend.value()) &&
+        !failedCpsNativeCriteria) {
+      if (bestpath && routeinfo == bestpath) {
+        tPath.is_best_path() = true;
+        tRibEntry.best_path() = tPath;
+      }
+      tBestPaths.emplace_back(tPath);
+    } else {
+      tDefaultPaths.emplace_back(tPath);
+    }
+  }
+  std::map<std::string, std::vector<TBgpPath>> pathGrps;
+  if (tBestPaths.size()) {
+    pathGrps.emplace(facebook::bgp::kBestPathGroup, tBestPaths);
+  }
+  if (tDefaultPaths.size()) {
+    pathGrps.emplace(facebook::bgp::kDefaultPathGroup, tDefaultPaths);
+  }
+  tRibEntry.paths() = pathGrps;
+  tRibEntry.best_group() = facebook::bgp::kBestPathGroup;
+
+  if (ribEntry.needPathSelection()) {
+    tRibEntry.path_selection_pending() = true;
+  }
+  tRibEntry.rib_version() = ribEntry.getRibVersion();
+
+  return tRibEntry;
+}
+
+std::optional<TRibEntry> RibDC::createBestPathOnlyTRibEntry(
+    const std::pair<const folly::CIDRNetwork, facebook::bgp::RibEntry>& entry) {
+  const auto& ribEntry = entry.second;
+
+  /*
+   * Publish best_path iff the best path exists, is in the selected multipath
+   * set, and CPS native criteria are not violated -- matching exactly when the
+   * full builder sets best_path in createTRibEntryWithFilter. Otherwise return
+   * nullopt so the caller withdraws the prefix rather than publishing a
+   * prefix-only entry the FSDB best-path consumer would treat as a withdraw.
+   */
+  const auto& bestpath = ribEntry.getBestPath();
+  if (!bestpath || !bestpath->pathIdToSend.has_value() ||
+      !ribEntry.getMultipaths().contains(bestpath->pathIdToSend.value()) ||
+      computeFailedCpsNativeCriteria(ribEntry)) {
+    return std::nullopt;
+  }
+
+  TRibEntry tRibEntry;
+  tRibEntry.prefix() = buildTPrefix(entry.first);
+  auto tPath = toTBgpPath(bestpath, ribEntry.getMultipathWeightedNexthops());
+  tPath.is_best_path() = true;
+  tRibEntry.best_path() = std::move(tPath);
+  return tRibEntry;
+}
+
+/*
+ * DC-only override. Same shape as the base saveRibPolicyState but
+ * also serializes path_selection_policy when present. We can't call
+ * the base + amend because saveTRibPolicyStore writes the file in
+ * one shot, so we re-implement the small body with CPS included.
+ */
+void RibDC::saveRibPolicyState() noexcept {
+  if (!pathSelectionPolicy_ && !routeAttributePolicy_ && !routeFilterPolicy_) {
+    XLOG(INFO, "rib policy empty, remove previously saved rib policy if any");
+    removeExistingRibPolicyStore();
+    return;
+  }
+  XLOG(INFO, "rib policy file save start");
+
+  TRibPolicyStore tRibPolicyStore;
+  tRibPolicyStore.storedTime() =
+      std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count();
+  tRibPolicyStore.fileTermination() = kRibPolicyFileTermination;
+
+  if (pathSelectionPolicy_) {
+    tRibPolicyStore.policy()->path_selection_policy() =
+        pathSelectionPolicy_->toThrift();
+  }
+  if (routeAttributePolicy_) {
+    tRibPolicyStore.policy()->route_attribute_policy() =
+        routeAttributePolicy_->toThrift();
+  }
+  if (routeFilterPolicy_) {
+    tRibPolicyStore.policy()->route_filter_policy() =
+        routeFilterPolicy_->toThrift();
+  }
+
+  XLOGF(
+      INFO,
+      "Saving rib policy: {}",
+      apache::thrift::SimpleJSONSerializer::serialize<std::string>(
+          *tRibPolicyStore.policy()));
+
+  saveTRibPolicyStore(tRibPolicyStore);
+}
+
+bool RibDC::isDevicePartiallyDrained() const {
+  return drainedPrefixCount_ > 0;
+}
+
+TPartialDrainStatus RibDC::getPartialDrainStatus() const {
+  TPartialDrainStatus status;
+  status.is_partially_drained() = isDevicePartiallyDrained();
+  status.num_affected_prefixes() = static_cast<int32_t>(
+      std::min(drainedPrefixCount_, static_cast<int64_t>(INT32_MAX)));
+  status.partial_drain_transition_count() = partialDrainTransitionCount_;
+  return status;
+}
+
+/*
+ * Current aggregate link bandwidth (bps) across a prefix's multipaths.
+ * Mirrors the aggregation in PathSelector::overrideMultipathSelection
+ * (RibPolicy.cpp): sum of each path's non-transitive LBW (bytes/sec) * 8 —
+ * the same value that was compared against the configured threshold when the
+ * drain engaged. Computed on demand here (no per-RibEntry storage, mirroring
+ * the on-demand path_count) since the publish path is gated on a drain
+ * transition rather than run every FIB pass.
+ */
+static int64_t currentAggLbwBps(const RibEntry& ribEntry) {
+  int64_t aggLbwBps = 0;
+  for (const auto& [_, routeInfo] : ribEntry.getMultipaths()) {
+    const auto lbwBytesPerSecond = routeInfo->attrs->getNonTransitiveLbw();
+    if (lbwBytesPerSecond) {
+      aggLbwBps += static_cast<int64_t>(lbwBytesPerSecond->second * 8);
+    }
+  }
+  return aggLbwBps;
+}
+
+TPartiallyDrainedPrefix RibDC::buildPartialDrainPrefixEntry(
+    const folly::CIDRNetwork& prefix,
+    const RibEntry& ribEntry) const {
+  TPartiallyDrainedPrefix entry;
+  entry.prefix() = createTIpPrefix(prefix);
+  const auto pathCount = static_cast<int32_t>(ribEntry.getMultipaths().size());
+  /*
+   * min_capacity (the violated threshold) and current_capacity (the current
+   * observed value) both use the TCapacity union, on the same criterion arm as
+   * the drain trigger. These are the canonical fields. The deprecated fields
+   * (path_count, mnh_threshold, min_capacity_threshold) are left unset — they
+   * have no readers (the publish and consume sides land together in this
+   * stack) and are retained in the schema only for compatibility.
+   */
+  TCapacity current, threshold;
+  if (ribEntry.getMnhThreshold() != 0) {
+    threshold.next_hop_count() = ribEntry.getMnhThreshold();
+    // For the current value, the next_hop_count arm holds the live count.
+    current.next_hop_count() = pathCount;
+  } else if (ribEntry.getAggLbwBpsThreshold() != 0) {
+    threshold.agg_lbw_bps() = ribEntry.getAggLbwBpsThreshold();
+    current.agg_lbw_bps() = currentAggLbwBps(ribEntry);
+  }
+  entry.min_capacity() = std::move(threshold);
+  entry.current_capacity() = std::move(current);
+  return entry;
+}
+
+std::vector<TPartiallyDrainedPrefix> RibDC::getPartiallyDrainedPrefixes()
+    const {
+  std::vector<TPartiallyDrainedPrefix> result;
+  result.reserve(
+      static_cast<size_t>(std::max<int64_t>(0, drainedPrefixCount_)));
+  for (const auto& [prefix, ribEntry] : ribEntries_) {
+    if (!ribEntry.getIsPartialDrain()) {
+      continue;
+    }
+    result.emplace_back(buildPartialDrainPrefixEntry(prefix, ribEntry));
+  }
+  return result;
+}
+
+TPartialDrainState RibDC::getPartialDrainState() const {
+  TPartialDrainState state;
+  state.partial_drain_state() = getPartialDrainStatus();
+  state.drained_prefixes() = getPartiallyDrainedPrefixes();
+  return state;
+}
+
+bool RibDC::recordPartialDrainTransition(
+    bool oldIsPartialDrain,
+    bool newIsPartialDrain) {
+  if (oldIsPartialDrain == newIsPartialDrain) {
+    return false;
+  }
+
+  const auto prevCount = drainedPrefixCount_;
+
+  if (newIsPartialDrain) {
+    ++drainedPrefixCount_;
+  } else {
+    if (drainedPrefixCount_ <= 0) {
+      /*
+       * Under correct bookkeeping, every false->true transition increments
+       * drainedPrefixCount_, so any true->false transition is expected to
+       * find a positive count. Reaching here means a caller passed a stale
+       * oldIsPartialDrain or a prior increment was missed at startup.
+       * Skip the decrement to keep the counter non-negative — a negative
+       * int64_t silently converts to a huge size_t at the reserve() call
+       * in getPartiallyDrainedPrefixes() (clamped there as a backstop).
+       */
+      XLOGF(
+          ERR,
+          "drainedPrefixCount_ underflow guard: count={}, oldIsPartialDrain={}, newIsPartialDrain={}",
+          drainedPrefixCount_,
+          oldIsPartialDrain,
+          newIsPartialDrain);
+      return false;
+    }
+    --drainedPrefixCount_;
+  }
+
+  /* Edge trigger: count crossed the zero boundary in either direction. */
+  if (prevCount == 0 || drainedPrefixCount_ == 0) {
+    ++partialDrainTransitionCount_;
+  }
+  return true;
 }
 
 } // namespace facebook::bgp

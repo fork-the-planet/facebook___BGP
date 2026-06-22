@@ -82,6 +82,7 @@
 
 #include "neteng/fboss/bgp/cpp/adjrib/AdjRibCommon.h"
 #include "neteng/fboss/bgp/cpp/tests/AdjRibOutUtils.h"
+#include "neteng/fboss/bgp/cpp/tests/BoundedWaitUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/RibPolicyUtils.h"
 #include "rfe/scubadata/ScubaData.h"
 
@@ -205,20 +206,20 @@ TEST_F(AdjRibOutboundFixture, V4LocalRouteIBgpPeerAddPath) {
   std::array<folly::fibers::Baton, 4> syncBaton;
 
   fm_->addTask([&] {
-    syncBaton[0].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[0], "syncBaton[0]");
     auto ribMsg = createRibSingleAnnounce(
         kV4Prefix1, kV4Nexthop1, localPeerV4_, true, true, kPlaceholderPathID);
     pushRibOutMsgToAdjRib(ribMsg);
-    syncBaton[1].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[1], "syncBaton[1]");
     ribMsg = createRibSingleAnnounce(
         kV4Prefix1, kV4Nexthop2, localPeerV4_, false, true, kPlaceholderPathID);
     pushRibOutMsgToAdjRib(ribMsg);
-    syncBaton[2].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[2], "syncBaton[2]");
     ribMsg = createRibSingleWithdrawalForAddPath(
         kV4Prefix1, kV4Nexthop1, kPlaceholderPathID);
     pushRibOutMsgToAdjRib(ribMsg);
 
-    syncBaton[3].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[3], "syncBaton[3]");
     ribMsg = createRibSingleWithdrawalForAddPath(
         kV4Prefix1, kV4Nexthop2, kPlaceholderPathID);
     pushRibOutMsgToAdjRib(ribMsg);
@@ -459,7 +460,7 @@ TEST_F(AdjRibOutboundFixture, V6LocalRouteIBgpPeerAddPath) {
   std::array<folly::fibers::Baton, 4> syncBaton;
 
   fm_->addTask([&] {
-    syncBaton[0].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[0], "syncBaton[0]");
     auto ribMsg = createRibSingleAnnounce(
         kV6Prefix1,
         kV6Nexthop1,
@@ -474,7 +475,7 @@ TEST_F(AdjRibOutboundFixture, V6LocalRouteIBgpPeerAddPath) {
         kPlaceholderPathID);
     pushRibOutMsgToAdjRib(ribMsg);
 
-    syncBaton[1].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[1], "syncBaton[1]");
     ribMsg = createRibSingleAnnounce(
         kV6Prefix1,
         kV6Nexthop2,
@@ -489,12 +490,12 @@ TEST_F(AdjRibOutboundFixture, V6LocalRouteIBgpPeerAddPath) {
         kPlaceholderPathID);
     pushRibOutMsgToAdjRib(ribMsg);
 
-    syncBaton[2].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[2], "syncBaton[2]");
     ribMsg = createRibSingleWithdrawalForAddPath(
         kV6Prefix1, kV6Nexthop1, kPlaceholderPathID);
     pushRibOutMsgToAdjRib(ribMsg);
 
-    syncBaton[3].wait();
+    facebook::bgp::test::boundedBatonWait(syncBaton[3], "syncBaton[3]");
     ribMsg = createRibSingleWithdrawalForAddPath(
         kV6Prefix1, kV6Nexthop2, kPlaceholderPathID);
     pushRibOutMsgToAdjRib(ribMsg);

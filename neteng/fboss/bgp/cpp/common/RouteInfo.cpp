@@ -299,6 +299,14 @@ bool RouteInfo::isNextHopReachable() const {
   return getIgpCostValue() != std::numeric_limits<uint32_t>::max();
 }
 
+bool RouteInfo::isResolvedForSelection() const {
+  // Local routes are always considered resolved
+  if (getIsRouteLocal()) {
+    return true;
+  }
+  return nexthopInfo_ != nullptr && nexthopInfo_->isResolvedForSelection();
+}
+
 RibEntry& RouteInfo::getRibEntry() const {
   return ribEntry;
 }

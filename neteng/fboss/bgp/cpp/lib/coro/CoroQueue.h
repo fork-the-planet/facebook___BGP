@@ -17,6 +17,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <queue>
 #include <utility>
 
@@ -25,7 +26,6 @@
 #include <folly/coro/Task.h>
 
 #include <folly/Function.h>
-#include <folly/Optional.h>
 
 namespace facebook {
 namespace nettools {
@@ -39,7 +39,7 @@ class CoroQueue {
   template <typename T>
   folly::coro::Task<folly::Expected<size_t, QueueClosed>> push(
       T&& data) noexcept {
-    folly::Optional<std::reference_wrapper<folly::coro::Baton>> baton;
+    std::optional<std::reference_wrapper<folly::coro::Baton>> baton;
     size_t size;
     {
       std::unique_lock<folly::coro::Mutex> lock{
@@ -54,7 +54,7 @@ class CoroQueue {
       }
       size = queue_.size();
     }
-    if (baton.hasValue()) {
+    if (baton.has_value()) {
       baton->get().post();
     }
     co_return size;
@@ -75,14 +75,14 @@ class CoroQueue {
     co_return queue_.size();
   }
 
-  folly::coro::Task<folly::Expected<folly::Optional<ElemT>, QueueClosed>>
+  folly::coro::Task<folly::Expected<std::optional<ElemT>, QueueClosed>>
   try_pop() noexcept(std::is_nothrow_move_constructible<ElemT>::value) {
     std::unique_lock<folly::coro::Mutex> lock{co_await mutex_.co_scoped_lock()};
     if (closed_ && queue_.empty()) {
       co_return folly::makeUnexpected(QueueClosed{});
     }
     if (queue_.empty()) {
-      co_return folly::none;
+      co_return std::nullopt;
     }
     auto front = std::move(queue_.front());
     queue_.pop();

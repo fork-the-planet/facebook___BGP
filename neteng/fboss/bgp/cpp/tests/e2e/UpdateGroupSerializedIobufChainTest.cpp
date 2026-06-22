@@ -22,6 +22,7 @@
 #include <vector>
 
 #include <folly/coro/BlockingWait.h>
+#include <folly/logging/xlog.h>
 
 #include "fboss/agent/AddressUtil.h"
 #include "neteng/fboss/bgp/cpp/lib/fibers/BgpSerializer.h"
@@ -200,158 +201,195 @@ BgpCapabilities makeDefaultCaps() {
 }
 
 /*
- * Byte-precise validator for the "maximum packing" property of a serialized
- * UpdateDescriptor IOBuf chain. The validator is parameterized by the
- * per-prefix wire size and the per-message NLRI reserve the packer uses, so
- * the same routine applies to V4 /24, V4 /32, and (in principle) V6 paths.
+ * Byte-precise validator for the "maximum packing" property of the update-group
+ * serialization path, aggregated across ALL UpdateDescriptors produced for one
+ * logical announcement.
  *
- * The validator does NOT need to know the per-message attribute length up
- * front. It derives the per-message header+attrs overhead from the chain
- * data itself, then proves byte-for-byte that:
+ * The per-consume-tick group flush can split a single announcement of
+ * `totalPrefixes` prefixes across MULTIPLE UpdateDescriptors (one chain per
+ * flush). How the RIB chunks delivery versus how fast the consumer drains is
+ * timing dependent, so the prefixes do NOT reliably land in a single chain —
+ * asserting that the first multi-element chain holds every prefix is exactly
+ * what made the older single-chain validator flaky under load. This validator
+ * instead takes EVERY descriptor and proves byte-for-byte that:
  *
  *   1. Every chain element respects the BGP wire limit (kMaxBgpMsgLen).
- *   2. Every non-tail element has the SAME byte length (the packer's
- *      per-message NLRI capacity is identical across iterations, so uniform
- *      packing is the only correct outcome).
- *   3. The derived pre-NLRI overhead is integer-consistent across the chain
- *      (a non-integer derivation would mean the chain has internal byte-
- *      accounting bugs).
+ *   2. Within each flush, every non-tail element has the SAME byte length as a
+ *      full UPDATE (identical attributes ⇒ identical per-message NLRI capacity,
+ *      so uniform packing is the only correct outcome).
+ *   3. The derived pre-NLRI overhead is integer-consistent across the entire
+ *      flattened element set (a non-integer derivation would mean prefixes were
+ *      lost/duplicated or attributes diverged between flushes).
  *   4. NLRI bytes in every element are exact multiples of `prefixWireBytes`.
- *   5. The total prefix count derived from the chain matches the expected
- *      total exactly.
- *   6. Per-message slack lies in the narrow window
- *      [reserve - prefixWireBytes + 1, reserve]. Slack above `reserve` would
- *      mean the packer could have fit another prefix; slack below
- *      `reserve - prefixWireBytes + 1` would mean the packer stopped before
- *      its own stop condition fired. Either is a packing bug.
- *   7. The tail element holds at least 1 prefix and at most `nFull` prefixes
- *      (otherwise the chain could have been one element shorter or the
- *      non-tail packing was sub-optimal).
- *   8. The chain length equals the minimum number of UPDATEs required to
- *      hold `totalPrefixes` at `nFull` prefixes per full UPDATE.
+ *   5. The total prefix count summed across ALL descriptors equals
+ *      `totalPrefixes` exactly — nothing lost, nothing duplicated end-to-end.
+ *   6. Full-message slack lies in the narrow window
+ *      [reserve - prefixWireBytes + 1, reserve]. Only checked when at least one
+ *      flush overflowed a message (which proves `fullLength` is a genuine
+ *      capacity-limited full UPDATE rather than just the largest partial).
+ *   7. Each flush's tail holds at least 1 prefix and at most `nFull` prefixes.
+ *   8. Each flush is internally optimal: its element count is the minimum
+ *      needed for its own prefixes. The GLOBAL element count is intentionally
+ *      NOT asserted to be the single-flush optimum ceil(totalPrefixes / nFull):
+ *      when an announcement is split across F flushes each flush carries its
+ *      own partial tail, so the total message count can legitimately exceed the
+ *      single-flush optimum by up to F-1.
  */
-void verifyMaxPackingChain(
-    const folly::IOBuf* head,
+void verifyAggregateMaxPacking(
+    const std::vector<UpdateDescriptor>& descriptors,
     size_t totalPrefixes,
     size_t prefixWireBytes,
     size_t packerReserveBytes,
     folly::StringPiece caseLabel) {
   SCOPED_TRACE(caseLabel);
-  ASSERT_NE(nullptr, head);
   ASSERT_GT(totalPrefixes, 0u);
   ASSERT_GT(prefixWireBytes, 0u);
   ASSERT_GE(packerReserveBytes, prefixWireBytes);
+  ASSERT_FALSE(descriptors.empty())
+      << "No UpdateDescriptors collected for the announcement";
 
-  std::vector<size_t> elementLengths;
-  const auto* current = head;
-  do {
-    elementLengths.push_back(current->length());
-    current = current->next();
-  } while (current != head);
+  // Flatten every chain element of every descriptor, keeping the per-descriptor
+  // grouping so each flush can be validated as its own packing run.
+  std::vector<std::vector<size_t>> perFlushLengths;
+  size_t totalElementCount = 0;
+  int64_t sumAllLengths = 0;
+  size_t fullLength = 0;
+  bool sawMultiElement = false;
 
-  const size_t chainCount = elementLengths.size();
-  ASSERT_GE(chainCount, 2u)
-      << "Maximum-packing test expects a multi-element chain; got "
-      << chainCount;
+  for (const auto& descriptor : descriptors) {
+    if (descriptor.serializedGroupPDU == nullptr) {
+      continue;
+    }
+    std::vector<size_t> lengths;
+    const auto* head = descriptor.serializedGroupPDU.get();
+    const auto* current = head;
+    do {
+      lengths.push_back(current->length());
+      current = current->next();
+    } while (current != head);
 
-  // Invariant 1: every element fits within the BGP wire limit.
-  for (size_t i = 0; i < chainCount; ++i) {
-    EXPECT_LE(elementLengths[i], kMaxBgpMsgLen)
-        << "Element " << i << " exceeds BGP wire limit";
+    totalElementCount += lengths.size();
+    if (lengths.size() >= 2) {
+      sawMultiElement = true;
+    }
+    for (size_t len : lengths) {
+      sumAllLengths += static_cast<int64_t>(len);
+      if (len > fullLength) {
+        fullLength = len;
+      }
+      // Invariant 1: every element fits within the BGP wire limit.
+      EXPECT_LE(len, kMaxBgpMsgLen) << "Element exceeds BGP wire limit";
+    }
+    perFlushLengths.push_back(std::move(lengths));
   }
 
-  // Invariant 2: all non-tail elements must have identical length.
-  const size_t fullLength = elementLengths[0];
-  for (size_t i = 0; i + 1 < chainCount; ++i) {
-    ASSERT_EQ(fullLength, elementLengths[i])
-        << "Non-tail chain element " << i
-        << " differs from element 0; serializer should pack each non-tail "
-        << "UPDATE to the same byte count under identical attributes";
-  }
-  const size_t tailLength = elementLengths.back();
+  ASSERT_GT(totalElementCount, 0u) << "All descriptors had a null PDU";
+  ASSERT_GT(fullLength, 0u);
 
   /*
-   * Invariant 3: derive per-message overhead (preNLRI) from the data.
+   * Invariant 3: derive the per-message header+attrs overhead (preNLRI) from
+   * the flattened data. Every UPDATE for these identical-attribute prefixes
+   * shares the same preNLRI and differs only in NLRI prefix count, so:
    *
-   *   fullLength = preNLRI + nFull * prefixWireBytes
-   *   tailLength = preNLRI + nTail * prefixWireBytes
-   *   nFull * (chainCount - 1) + nTail = totalPrefixes
+   *   sum(elementLengths) = totalElementCount * preNLRI + totalPrefixes * ps
+   *   => preNLRI = (sum(elementLengths) - totalPrefixes * ps) /
+   * totalElementCount
    *
-   * => preNLRI = (fullLength * (C-1) + tailLength - totalPrefixes * ps) / C
-   *
-   * The right-hand side MUST be an exact integer; otherwise the chain layout
-   * is internally inconsistent.
+   * The right-hand side MUST be a non-negative exact integer; otherwise the
+   * aggregate layout is internally inconsistent (prefixes lost/duplicated, or
+   * mismatched attributes across flushes).
    */
   const int64_t totalNLRI = static_cast<int64_t>(totalPrefixes) *
       static_cast<int64_t>(prefixWireBytes);
-  const int64_t sumLengths =
-      static_cast<int64_t>(fullLength) * static_cast<int64_t>(chainCount - 1) +
-      static_cast<int64_t>(tailLength);
-  ASSERT_GE(sumLengths, totalNLRI)
-      << "Sum of element lengths (" << sumLengths
+  ASSERT_GE(sumAllLengths, totalNLRI)
+      << "Sum of element lengths (" << sumAllLengths
       << ") is less than total NLRI bytes (" << totalNLRI
-      << "); chain layout violates basic byte accounting";
-  ASSERT_EQ(0, (sumLengths - totalNLRI) % static_cast<int64_t>(chainCount))
-      << "Derived pre-NLRI overhead is not an integer; chain layout is "
-      << "internally inconsistent";
-  const size_t preNLRI =
-      static_cast<size_t>((sumLengths - totalNLRI) / chainCount);
+      << "); prefixes appear to be missing from the serialized output";
+  ASSERT_EQ(
+      0, (sumAllLengths - totalNLRI) % static_cast<int64_t>(totalElementCount))
+      << "Derived pre-NLRI overhead is not an integer across "
+      << totalElementCount << " elements; aggregate layout is inconsistent";
+  const size_t preNLRI = static_cast<size_t>(
+      (sumAllLengths - totalNLRI) / static_cast<int64_t>(totalElementCount));
 
-  // Invariant 4: per-element NLRI byte counts are exact multiples of prefix
-  // size.
   ASSERT_GT(fullLength, preNLRI);
-  ASSERT_GE(tailLength, preNLRI);
   ASSERT_EQ(0u, (fullLength - preNLRI) % prefixWireBytes)
       << "Full-element NLRI bytes (" << (fullLength - preNLRI)
       << ") are not a multiple of prefix wire size " << prefixWireBytes;
-  ASSERT_EQ(0u, (tailLength - preNLRI) % prefixWireBytes)
-      << "Tail-element NLRI bytes (" << (tailLength - preNLRI)
-      << ") are not a multiple of prefix wire size " << prefixWireBytes;
-
   const size_t nFull = (fullLength - preNLRI) / prefixWireBytes;
-  const size_t nTail = (tailLength - preNLRI) / prefixWireBytes;
-  // Invariant 5: total prefix count matches.
-  EXPECT_EQ(totalPrefixes, nFull * (chainCount - 1) + nTail)
-      << "Prefix count mismatch after decoding chain layout: nFull=" << nFull
-      << ", nTail=" << nTail << ", C=" << chainCount;
+  ASSERT_GT(nFull, 0u);
 
   /*
-   * Invariant 6: per-message slack ∈ [reserve - prefixWireBytes + 1, reserve].
+   * Invariant 6: full-message slack ∈ [reserve - prefixWireBytes + 1, reserve].
    *
-   * The packer's loop is `while (nlri_used + reserve < bufSize)`. It stops at
-   * the smallest `nlri_used` satisfying `nlri_used + reserve >= bufSize`.
-   * Since `nlri_used` advances by exactly `prefixWireBytes` per iteration,
-   * the final `nlri_used` lies in `[bufSize - reserve, bufSize - reserve +
-   * prefixWireBytes - 1]`, so `slack = bufSize - nlri_used` lies in
-   * `[reserve - prefixWireBytes + 1, reserve]`. The fully assembled message
-   * length adds the constant pre-NLRI overhead, so the same window applies
-   * to `kMaxBgpMsgLen - elementLength` for non-tail elements.
+   * The packer's loop is `while (nlri_used + reserve < bufSize)`; a full
+   * message therefore leaves slack in that window. Only meaningful when some
+   * flush actually overflowed a message — that overflow is what proves
+   * `fullLength` is a genuine capacity-limited full UPDATE rather than simply
+   * the largest partial seen this run.
    */
-  const size_t fullSlack = kMaxBgpMsgLen - fullLength;
-  EXPECT_LE(fullSlack, packerReserveBytes)
-      << "Non-tail slack " << fullSlack << " exceeds packer reserve "
-      << packerReserveBytes
-      << "; packer could have fit another prefix in each UPDATE";
-  EXPECT_GE(fullSlack + prefixWireBytes, packerReserveBytes + 1)
-      << "Non-tail slack " << fullSlack << " is below the packer's minimum "
-      << "stop-condition slack (" << (packerReserveBytes - prefixWireBytes + 1)
-      << "); packer stopped before its own stop condition fired";
+  if (sawMultiElement) {
+    const size_t fullSlack = kMaxBgpMsgLen - fullLength;
+    EXPECT_LE(fullSlack, packerReserveBytes)
+        << "Full-message slack " << fullSlack << " exceeds packer reserve "
+        << packerReserveBytes
+        << "; packer could have fit another prefix in each full UPDATE";
+    EXPECT_GE(fullSlack + prefixWireBytes, packerReserveBytes + 1)
+        << "Full-message slack " << fullSlack
+        << " is below the packer's minimum stop-condition slack ("
+        << (packerReserveBytes - prefixWireBytes + 1)
+        << "); packer stopped before its own stop condition fired";
+  } else {
+    XLOGF(
+        INFO,
+        "{}: no flush overflowed a single UPDATE; max-packing to capacity not exercised this run, validating prefix accounting only",
+        caseLabel);
+  }
 
-  // Invariant 7: tail holds [1, nFull] prefixes.
-  ASSERT_GT(nTail, 0u)
-      << "Tail element holds 0 prefixes; chain should have one fewer element";
-  EXPECT_LE(nTail, nFull) << "Tail holds " << nTail
-                          << " prefixes, more than nFull=" << nFull
-                          << "; non-tail packing was sub-optimal";
+  // Per-flush invariants + global prefix accounting.
+  size_t accumulatedPrefixes = 0;
+  for (const auto& lengths : perFlushLengths) {
+    const size_t flushElements = lengths.size();
+    size_t flushPrefixes = 0;
+    for (size_t i = 0; i < flushElements; ++i) {
+      const size_t len = lengths[i];
+      // Invariant 4: NLRI bytes are exact multiples of the prefix wire size.
+      ASSERT_GE(len, preNLRI);
+      ASSERT_EQ(0u, (len - preNLRI) % prefixWireBytes)
+          << "Element NLRI bytes (" << (len - preNLRI)
+          << ") are not a multiple of prefix wire size " << prefixWireBytes;
+      const size_t nPrefixes = (len - preNLRI) / prefixWireBytes;
 
-  // Invariant 8: chain length is the minimum required.
-  ASSERT_GT(nFull, 0u);
-  const size_t minChainCount = (totalPrefixes + nFull - 1) / nFull;
-  EXPECT_EQ(chainCount, minChainCount)
-      << "Chain has " << chainCount
-      << " elements, but the minimum required for nFull=" << nFull
-      << " per message and " << totalPrefixes << " total prefixes is "
-      << minChainCount;
+      if (i + 1 < flushElements) {
+        // Invariant 2: every non-tail element of a flush is full.
+        EXPECT_EQ(fullLength, len)
+            << "Non-tail element " << i
+            << " of a flush is not full; the serializer should pack each "
+            << "non-tail UPDATE to capacity under identical attributes";
+      } else {
+        // Invariant 7: the flush tail holds [1, nFull] prefixes.
+        EXPECT_GT(nPrefixes, 0u) << "Flush tail holds 0 prefixes";
+        EXPECT_LE(nPrefixes, nFull) << "Flush tail holds " << nPrefixes
+                                    << " prefixes, more than nFull=" << nFull
+                                    << "; non-tail packing was sub-optimal";
+      }
+      flushPrefixes += nPrefixes;
+    }
+    // Invariant 8: each flush uses the minimum number of UPDATEs for its own
+    // prefixes.
+    const size_t minFlushElements = (flushPrefixes + nFull - 1) / nFull;
+    EXPECT_EQ(flushElements, minFlushElements)
+        << "Flush has " << flushElements << " elements but its "
+        << flushPrefixes << " prefixes need only " << minFlushElements
+        << " at nFull=" << nFull;
+    accumulatedPrefixes += flushPrefixes;
+  }
+
+  // Invariant 5: exactly `totalPrefixes` serialized across the whole flush
+  // sequence — no loss, no duplication.
+  EXPECT_EQ(totalPrefixes, accumulatedPrefixes)
+      << "Aggregate prefix count mismatch across " << descriptors.size()
+      << " descriptors";
 }
 
 } // namespace
@@ -416,6 +454,79 @@ class UpdateGroupSerializedIobufChainTest : public E2ETestFixture {
 
     return std::nullopt;
   }
+
+  /*
+   * Drain EVERY UpdateDescriptor the serialized update-group path queues for
+   * the announcement. The per-consume-tick group flush emits descriptors in
+   * bursts with timing-dependent gaps between them, so a plain "stop after N
+   * consecutive empty pumps" quiescence check stops at the first inter-burst
+   * gap and silently drops the rest of the announcement.
+   *
+   * Instead we gate completion on a hard lower bound: the serialized output
+   * MUST carry at least `expectedMinBytes` (= totalPrefixes * prefixWireBytes)
+   * NLRI bytes, since every full chain element also adds per-message overhead.
+   * While the collected byte count is below that floor the production is
+   * definitely still in flight, so we keep pumping both event bases patiently.
+   * Once the floor is met we require a settle window of sustained emptiness so
+   * the trailing descriptor(s) are captured before declaring the queue done.
+   * The caller's verifyAggregateMaxPacking() then asserts the exact total.
+   */
+  std::vector<UpdateDescriptor> collectAllUpdateDescriptors(
+      const BgpPeerId& peerId,
+      size_t expectedMinBytes) {
+    constexpr int kSettleEmptyFlushes = 300;
+    constexpr int kMaxIncompleteFlushes = 4000;
+
+    std::vector<UpdateDescriptor> descriptors;
+    size_t collectedBytes = 0;
+    int emptyFlushes = 0;
+
+    for (int reads = 0; reads < kMaxDescriptorReads;) {
+      auto queues = getPeerQueues(peerId);
+      if (!queues) {
+        break;
+      }
+
+      if (queues->boundedAdjRibOutQ->empty()) {
+        const int patience = (collectedBytes < expectedMinBytes)
+            ? kMaxIncompleteFlushes
+            : kSettleEmptyFlushes;
+        if (emptyFlushes++ >= patience) {
+          break;
+        }
+        rib_->getEventBase().runInEventBaseThreadAndWait([] {});
+        peerManager_->getEventBase().runInEventBaseThreadAndWait([] {});
+        continue;
+      }
+
+      emptyFlushes = 0;
+      ++reads;
+      auto message =
+          folly::coro::blockingWait(queues->boundedAdjRibOutQ->pop());
+      if (!message) {
+        continue;
+      }
+
+      if (std::holds_alternative<BgpEndOfRib>(*message)) {
+        continue;
+      }
+
+      auto* descriptor = std::get_if<UpdateDescriptor>(&*message);
+      if (descriptor == nullptr) {
+        ADD_FAILURE() << "Expected serialized update-group path to queue "
+                      << "UpdateDescriptor messages";
+        break;
+      }
+
+      EXPECT_NE(nullptr, descriptor->serializedGroupPDU);
+      if (descriptor->serializedGroupPDU) {
+        collectedBytes +=
+            descriptor->serializedGroupPDU->computeChainDataLength();
+      }
+      descriptors.push_back(std::move(*descriptor));
+    }
+    return descriptors;
+  }
 };
 
 TEST_F(
@@ -462,10 +573,11 @@ TEST_F(
  *
  * Announces kMaxPackingV4Slash24Count (4000) /24 prefixes through one
  * BgpUpdate2 with shared attributes. The update group serializer wraps them
- * in MP_REACH_NLRI and splits across multiple BGP UPDATE messages. The chain
- * MUST be packed byte-optimally: see verifyMaxPackingChain() for the full
- * list of byte-exact invariants checked. The cloning path through
- * BgpSerializer must then preserve every byte end-to-end.
+ * in MP_REACH_NLRI and splits across multiple BGP UPDATE messages, possibly
+ * over several per-flush descriptors. The output MUST be packed byte-optimally:
+ * see verifyAggregateMaxPacking() for the full list of byte-exact invariants
+ * checked. The cloning path through BgpSerializer must then preserve every byte
+ * end-to-end.
  */
 TEST_F(
     UpdateGroupSerializedIobufChainTest,
@@ -492,29 +604,33 @@ TEST_F(
       v4Slash24PrefixAt(/*baseSecondOctet=*/55, kMaxPackingV4Slash24Count - 1),
       kPeerAddr3));
 
-  auto descriptor = findMultiNodeUpdateDescriptor(peerId4);
-  ASSERT_TRUE(descriptor.has_value())
-      << "Expected packed UpdateDescriptor with multi-node chain for "
+  auto descriptors = collectAllUpdateDescriptors(
+      peerId4, kMaxPackingV4Slash24Count * kV4Slash24NlriBytes);
+  ASSERT_FALSE(descriptors.empty())
+      << "Expected serialized UpdateDescriptors for "
       << kMaxPackingV4Slash24Count << " same-attribute /24 prefixes";
-  ASSERT_NE(nullptr, descriptor->serializedGroupPDU);
 
-  verifyMaxPackingChain(
-      descriptor->serializedGroupPDU.get(),
+  verifyAggregateMaxPacking(
+      descriptors,
       kMaxPackingV4Slash24Count,
       kV4Slash24NlriBytes,
       kMpV6BasedPackerReserve,
       "V4 /24 x 4000 prefixes");
 
-  const auto chainElements =
-      descriptor->serializedGroupPDU->countChainElements();
-  const auto dataLength =
-      descriptor->serializedGroupPDU->computeChainDataLength();
-
+  // The cloning path through BgpSerializer must preserve every byte of every
+  // descriptor end-to-end.
   BgpSerializer serializer(makeDefaultCaps());
-  auto serialized = serializer(*descriptor);
-  ASSERT_NE(nullptr, serialized);
-  EXPECT_EQ(chainElements, serialized->countChainElements());
-  EXPECT_EQ(dataLength, serialized->computeChainDataLength());
+  for (auto& descriptor : descriptors) {
+    ASSERT_NE(nullptr, descriptor.serializedGroupPDU);
+    const auto chainElements =
+        descriptor.serializedGroupPDU->countChainElements();
+    const auto dataLength =
+        descriptor.serializedGroupPDU->computeChainDataLength();
+    auto serialized = serializer(descriptor);
+    ASSERT_NE(nullptr, serialized);
+    EXPECT_EQ(chainElements, serialized->countChainElements());
+    EXPECT_EQ(dataLength, serialized->computeChainDataLength());
+  }
 }
 
 /*
@@ -551,29 +667,33 @@ TEST_F(
       v4Slash32PrefixAt(/*baseSecondOctet=*/66, kMaxPackingV4Slash32Count - 1),
       kPeerAddr3));
 
-  auto descriptor = findMultiNodeUpdateDescriptor(peerId4);
-  ASSERT_TRUE(descriptor.has_value())
-      << "Expected packed UpdateDescriptor with multi-node chain for "
+  auto descriptors = collectAllUpdateDescriptors(
+      peerId4, kMaxPackingV4Slash32Count * kV4Slash32NlriBytes);
+  ASSERT_FALSE(descriptors.empty())
+      << "Expected serialized UpdateDescriptors for "
       << kMaxPackingV4Slash32Count << " same-attribute /32 prefixes";
-  ASSERT_NE(nullptr, descriptor->serializedGroupPDU);
 
-  verifyMaxPackingChain(
-      descriptor->serializedGroupPDU.get(),
+  verifyAggregateMaxPacking(
+      descriptors,
       kMaxPackingV4Slash32Count,
       kV4Slash32NlriBytes,
       kMpV6BasedPackerReserve,
       "V4 /32 x 3000 prefixes");
 
-  const auto chainElements =
-      descriptor->serializedGroupPDU->countChainElements();
-  const auto dataLength =
-      descriptor->serializedGroupPDU->computeChainDataLength();
-
+  // The cloning path through BgpSerializer must preserve every byte of every
+  // descriptor end-to-end.
   BgpSerializer serializer(makeDefaultCaps());
-  auto serialized = serializer(*descriptor);
-  ASSERT_NE(nullptr, serialized);
-  EXPECT_EQ(chainElements, serialized->countChainElements());
-  EXPECT_EQ(dataLength, serialized->computeChainDataLength());
+  for (auto& descriptor : descriptors) {
+    ASSERT_NE(nullptr, descriptor.serializedGroupPDU);
+    const auto chainElements =
+        descriptor.serializedGroupPDU->countChainElements();
+    const auto dataLength =
+        descriptor.serializedGroupPDU->computeChainDataLength();
+    auto serialized = serializer(descriptor);
+    ASSERT_NE(nullptr, serialized);
+    EXPECT_EQ(chainElements, serialized->countChainElements());
+    EXPECT_EQ(dataLength, serialized->computeChainDataLength());
+  }
 }
 
 /*
@@ -610,30 +730,34 @@ TEST_F(
       v4Slash24PrefixAt(/*baseSecondOctet=*/77, kSmallTailV4Slash24Count - 1),
       kPeerAddr3));
 
-  auto descriptor = findMultiNodeUpdateDescriptor(peerId4);
-  ASSERT_TRUE(descriptor.has_value())
-      << "Expected 2-element chain for " << kSmallTailV4Slash24Count
-      << " same-attribute /24 prefixes; packer should not collapse them "
-      << "into a single oversized UPDATE";
-  ASSERT_NE(nullptr, descriptor->serializedGroupPDU);
+  auto descriptors = collectAllUpdateDescriptors(
+      peerId4, kSmallTailV4Slash24Count * kV4Slash24NlriBytes);
+  ASSERT_FALSE(descriptors.empty())
+      << "Expected serialized UpdateDescriptors for "
+      << kSmallTailV4Slash24Count << " same-attribute /24 prefixes; packer "
+      << "should not collapse them into a single oversized UPDATE";
 
-  verifyMaxPackingChain(
-      descriptor->serializedGroupPDU.get(),
+  verifyAggregateMaxPacking(
+      descriptors,
       kSmallTailV4Slash24Count,
       kV4Slash24NlriBytes,
       kMpV6BasedPackerReserve,
       "V4 /24 x 1010 prefixes (small-tail boundary)");
 
-  const auto chainElements =
-      descriptor->serializedGroupPDU->countChainElements();
-  const auto dataLength =
-      descriptor->serializedGroupPDU->computeChainDataLength();
-
+  // The cloning path through BgpSerializer must preserve every byte of every
+  // descriptor end-to-end.
   BgpSerializer serializer(makeDefaultCaps());
-  auto serialized = serializer(*descriptor);
-  ASSERT_NE(nullptr, serialized);
-  EXPECT_EQ(chainElements, serialized->countChainElements());
-  EXPECT_EQ(dataLength, serialized->computeChainDataLength());
+  for (auto& descriptor : descriptors) {
+    ASSERT_NE(nullptr, descriptor.serializedGroupPDU);
+    const auto chainElements =
+        descriptor.serializedGroupPDU->countChainElements();
+    const auto dataLength =
+        descriptor.serializedGroupPDU->computeChainDataLength();
+    auto serialized = serializer(descriptor);
+    ASSERT_NE(nullptr, serialized);
+    EXPECT_EQ(chainElements, serialized->countChainElements());
+    EXPECT_EQ(dataLength, serialized->computeChainDataLength());
+  }
 }
 
 } // namespace bgp

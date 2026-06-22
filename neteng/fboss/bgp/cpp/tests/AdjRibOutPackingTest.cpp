@@ -17,28 +17,34 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
-#define AdjRib_TEST_FRIENDS                                   \
-  FRIEND_TEST(                                                \
-      AdjRibOutboundPackingFixture,                           \
-      TryUpdateAttrToPrefixMapTest_InitialAdvertisement);     \
-  FRIEND_TEST(                                                \
-      AdjRibOutboundPackingFixture,                           \
-      TryUpdateAttrToPrefixMapTest_PrefixNotFound);           \
-  FRIEND_TEST(                                                \
-      AdjRibOutboundPackingFixture,                           \
-      TryUpdateAttrToPrefixMapTest_DuplicateWithdrawal);      \
-  FRIEND_TEST(                                                \
-      AdjRibOutboundPackingFixture,                           \
-      TryUpdateAttrToPrefixMapTest_DuplicateAnnouncement);    \
-  FRIEND_TEST(                                                \
-      AdjRibOutboundPackingFixture,                           \
-      TryUpdateAttrToPrefixMapTest_WithdrawalToAnnouncement); \
-  FRIEND_TEST(                                                \
-      AdjRibOutboundPackingFixture,                           \
-      TryUpdateAttrToPrefixMapTest_AnnouncementToWithdrawal); \
-  FRIEND_TEST(                                                \
-      AdjRibOutboundPackingFixture,                           \
-      TryUpdateAttrToPrefixMapTest_ReannounceWithNewPath);
+#define AdjRib_TEST_FRIENDS                                        \
+  FRIEND_TEST(                                                     \
+      AdjRibOutboundPackingFixture,                                \
+      TryUpdateAttrToPrefixMapTest_InitialAdvertisement);          \
+  FRIEND_TEST(                                                     \
+      AdjRibOutboundPackingFixture,                                \
+      TryUpdateAttrToPrefixMapTest_PrefixNotFound);                \
+  FRIEND_TEST(                                                     \
+      AdjRibOutboundPackingFixture,                                \
+      TryUpdateAttrToPrefixMapTest_DuplicateWithdrawal);           \
+  FRIEND_TEST(                                                     \
+      AdjRibOutboundPackingFixture,                                \
+      TryUpdateAttrToPrefixMapTest_DuplicateAnnouncement);         \
+  FRIEND_TEST(                                                     \
+      AdjRibOutboundPackingFixture,                                \
+      TryUpdateAttrToPrefixMapTest_WithdrawalToAnnouncement);      \
+  FRIEND_TEST(                                                     \
+      AdjRibOutboundPackingFixture,                                \
+      TryUpdateAttrToPrefixMapTest_AnnouncementToWithdrawal);      \
+  FRIEND_TEST(                                                     \
+      AdjRibOutboundPackingFixture,                                \
+      TryUpdateAttrToPrefixMapTest_ReannounceWithNewPath);         \
+  FRIEND_TEST(                                                     \
+      AdjRibOutboundPackingFixture,                                \
+      TryUpdateAttrToPrefixMapTest_NexthopPolicyFlagFlipWithdraw); \
+  FRIEND_TEST(                                                     \
+      AdjRibOutboundPackingFixture,                                \
+      TryUpdateAttrToPrefixMapTest_NexthopPolicyFlagFlipReannounce);
 
 #include <folly/coro/BlockingWait.h>
 #include <folly/logging/xlog.h>
@@ -47,6 +53,25 @@
 
 namespace facebook::bgp {
 using namespace facebook::nettools::bgplib;
+
+namespace {
+/*
+ * Count how many packing-list buckets currently hold prefixPathId. The core
+ * invariant is that a prefix is associated to at most one path (bucket) at a
+ * time, so this must never exceed 1.
+ */
+size_t countBucketsContaining(
+    const AttrToPrefixMap& attrToPrefixMap,
+    const std::pair<folly::CIDRNetwork, uint32_t>& prefixPathId) {
+  size_t count = 0;
+  for (const auto& [key, pfxSet] : attrToPrefixMap) {
+    if (pfxSet.contains(prefixPathId)) {
+      ++count;
+    }
+  }
+  return count;
+}
+} // namespace
 
 /*
  * This section covers unit tests for tryUpdateAttrToPrefixMap.
@@ -154,11 +179,16 @@ TEST_F(
   EXPECT_TRUE(attrToPrefixMap.empty());
 
   {
-    // Case 1: Withdrawing an unseen prefix.
-    // Set the initial state as kV4Prefix1,0 being withdrawn.
+    // Case 1: Withdrawing a never-announced prefix.
+    // tryUpdateAttrToPrefixMap applies the requested mutation unconditionally
+    // and does NOT dedup: suppressing withdrawals for prefixes that were never
+    // advertised is the caller's responsibility (tryInsertWithdrawal only fires
+    // when postAttr is non-null). So the helper stages the withdrawal entry
+    // here rather than treating it as a no-op.
     adjRib_->tryUpdateAttrToPrefixMap(
         prefixPathId_, withdrawalAttrs_, withdrawalAttrs_);
-    EXPECT_EQ(0, attrToPrefixMap.size());
+    EXPECT_EQ(1, attrToPrefixMap.size());
+    EXPECT_EQ(withdrawalAttrs_, attrToPrefixMap.begin()->first.attrs);
   }
 
   {
@@ -315,4 +345,85 @@ TEST_F(
     EXPECT_EQ(prefixPathId_, *pfxSet.begin());
   }
 }
+
+/*
+ * Regression for the isNexthopSetByPolicy packing-list key bug.
+ *
+ * isNexthopSetByPolicy is part of the packing-list key, so the same
+ * (path, AFI) can be staged under either flag value. Announce call sites pass
+ * the real flag (which can be true when a SetNexthop policy action ran), but
+ * every withdraw/collapse call site defaults the flag to false.
+ *
+ * If cleanup only probes the caller-supplied flag, withdrawing a prefix that
+ * was staged under flag = true misses the stale true-keyed announcement bucket,
+ * leaving the prefix in two buckets at once: a withdrawal AND a positive
+ * advertisement. Cleanup must probe both flag states so the prefix stays
+ * associated to exactly one path.
+ */
+TEST_F(
+    AdjRibOutboundPackingFixture,
+    TryUpdateAttrToPrefixMapTest_NexthopPolicyFlagFlipWithdraw) {
+  auto& attrToPrefixMap = adjRib_->attrToPrefixMap_;
+  EXPECT_TRUE(attrToPrefixMap.empty());
+
+  // Stage an announcement whose nexthop was set by policy (flag = true). This
+  // keys the prefix under {announcementAttrs_, AFI_IPv4, true}.
+  adjRib_->tryUpdateAttrToPrefixMap(
+      prefixPathId_,
+      withdrawalAttrs_,
+      announcementAttrs_,
+      /*isNexthopSetByPolicy=*/true);
+  EXPECT_EQ(1, attrToPrefixMap.size());
+  EXPECT_TRUE(attrToPrefixMap.begin()->first.isNexthopSetByPolicy);
+
+  // Withdraw the prefix with the default flag (false), mirroring the prod
+  // withdraw call sites.
+  adjRib_->tryUpdateAttrToPrefixMap(
+      prefixPathId_,
+      announcementAttrs_,
+      withdrawalAttrs_,
+      /*isNexthopSetByPolicy=*/false);
+
+  // The prefix must be associated to exactly one path, and that path must be
+  // the withdrawal (nullptr attrs), not the leaked announcement.
+  EXPECT_EQ(1, countBucketsContaining(attrToPrefixMap, prefixPathId_));
+  EXPECT_EQ(1, attrToPrefixMap.size());
+  EXPECT_EQ(withdrawalAttrs_, attrToPrefixMap.begin()->first.attrs);
+}
+
+/*
+ * Regression: re-announcing a prefix with a new path flagged as policy-set
+ * nexthop (flag = true) while the previous path was staged under flag = false.
+ * Cleanup of the old association must probe both flag states; otherwise the
+ * prefix ends up in two positive-advertisement buckets at once.
+ */
+TEST_F(
+    AdjRibOutboundPackingFixture,
+    TryUpdateAttrToPrefixMapTest_NexthopPolicyFlagFlipReannounce) {
+  auto attrs1 = announcementAttrs_;
+  auto attrs2Mutable = announcementAttrs_->clone();
+  attrs2Mutable->setLocalPref(10000);
+  std::shared_ptr<const BgpPath> attrs2 = attrs2Mutable;
+
+  auto& attrToPrefixMap = adjRib_->attrToPrefixMap_;
+  EXPECT_TRUE(attrToPrefixMap.empty());
+
+  // Stage announcement of the prefix under {attrs1, AFI_IPv4, false}.
+  adjRib_->tryUpdateAttrToPrefixMap(
+      prefixPathId_, withdrawalAttrs_, attrs1, /*isNexthopSetByPolicy=*/false);
+  EXPECT_EQ(1, attrToPrefixMap.size());
+  EXPECT_FALSE(attrToPrefixMap.begin()->first.isNexthopSetByPolicy);
+
+  // Re-announce with a different path, now flagged as policy-set nexthop
+  // (flag = true). oldPath (attrs1) is keyed under flag = false.
+  adjRib_->tryUpdateAttrToPrefixMap(
+      prefixPathId_, attrs1, attrs2, /*isNexthopSetByPolicy=*/true);
+
+  // Exactly one bucket, holding the new path with flag = true.
+  EXPECT_EQ(1, countBucketsContaining(attrToPrefixMap, prefixPathId_));
+  EXPECT_EQ(1, attrToPrefixMap.size());
+  EXPECT_EQ(attrs2, attrToPrefixMap.begin()->first.attrs);
+  EXPECT_TRUE(attrToPrefixMap.begin()->first.isNexthopSetByPolicy);
+}
+
 } // namespace facebook::bgp

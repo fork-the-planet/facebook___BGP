@@ -61,10 +61,11 @@ TEST_P(RibFixtureAddPathTestSuite, FromFibMessageLoop) {
   // populate ribEntries_ with non-local routes
   RibEntry entry(kV4Prefix1);
   entry.updatePath(eBgpPeer1_, attr_, false);
-  entry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(entry, multipathSelector, bestpathSelector, false, 0);
   RibEntry entry2(kV6Prefix1);
   entry2.updatePath(eBgpPeer1_, attr_, false);
-  entry2.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      entry2, multipathSelector, bestpathSelector, false, 0);
   {
     // initialise a FibProgrammedMessage with same route in ribEntries
     // positive test case, adding an announcement after fib is programmed
@@ -178,7 +179,8 @@ TEST_P(RibFixtureAddPathTestSuite, FromFibMessageLoop) {
     newAttr->setNexthop(kV4Nexthop2);
     newAttr->publish();
     entry.updatePath(eBgpPeer2_, newAttr, false);
-    entry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+    RibBase::selectBestPath(
+        entry, multipathSelector, bestpathSelector, false, 0);
     // initialise a FibProgrammedMessage without EoR
     // positive test case, adding an announcement after fib is programmed
     folly::F14NodeMap<
@@ -229,8 +231,12 @@ TEST_P(RibFixtureAddPathTestSuite, FromFibMessageLoop) {
     newAttr2->publish();
     rib_->ribEntries_.find(kV4Prefix1)
         ->second.updatePath(eBgpPeer2_, newAttr2, false);
-    rib_->ribEntries_.find(kV4Prefix1)
-        ->second.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+    RibBase::selectBestPath(
+        rib_->ribEntries_.find(kV4Prefix1)->second,
+        multipathSelector,
+        bestpathSelector,
+        false,
+        0);
 
     prefixToNexthops = {
         {kV4Prefix1,
@@ -719,7 +725,8 @@ TEST_F(RibFixture, FibFlushedCounterTest) {
     // Add one rib entry for the local route
     RibEntry localEntry(localPrefix);
     localEntry.updatePath(eBgpPeer1_, attr_, false);
-    localEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+    RibBase::selectBestPath(
+        localEntry, multipathSelector, bestpathSelector, false, 0);
     rib_->ribEntries_.emplace(localPrefix, localEntry);
 
     // Add a non-local rib entry WITHOUT a path (getAllPathsCnt() == 0)

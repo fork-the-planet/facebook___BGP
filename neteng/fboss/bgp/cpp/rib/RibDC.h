@@ -16,18 +16,24 @@
 
 #pragma once
 
+#include <atomic>
+#include <optional>
+
 #include <folly/logging/xlog.h>
 #include <gflags/gflags.h>
 
+#include "configerator/structs/neteng/bgp_policy/thrift/gen-cpp2/rib_policy_types.h"
 #include "neteng/fboss/bgp/cpp/common/platform/dc/PlatformConstant.h"
 #include "neteng/fboss/bgp/cpp/rib/RibBase.h"
 #include "neteng/fboss/bgp/cpp/rib/RibPolicyLogger.h"
 
 DECLARE_bool(publish_rib_to_fsdb);
+DECLARE_string(crf_policy_file);
 
 namespace facebook::bgp {
 
 class FsdbSyncer;
+class NeighborWatcher;
 
 class RibDC : public RibBase {
  public:
@@ -42,12 +48,103 @@ class RibDC : public RibBase {
       FsdbSyncer* fsdbSyncer,
       std::shared_ptr<NexthopCache> nextHopCache = nullptr,
       uint16_t fibAgentPort = kPlatformFibAgentPort,
-      uint32_t fibAgentRecvTimeout = kPlatformFibAgentRecvTimeout);
+      uint32_t fibAgentRecvTimeout = kPlatformFibAgentRecvTimeout,
+      /*
+       * DC-only. When set together with nexthop tracking, the constructor wires
+       * RIB-IN-learned nexthops to the FIB watcher for FSDB tracking. EBB
+       * (RibBB) has no NeighborWatcher and leaves this null.
+       */
+      std::shared_ptr<NeighborWatcher> neighborWatcher = nullptr);
   ~RibDC() override = default;
+
+  /*
+   * DC-only thrift surfaces for CPS. These do not exist on RibBase —
+   * callers must hold a RibDC& (BgpServiceDC has one) to reach them.
+   * `virtual` here is for test fixtures (MockRib) that need to wrap
+   * set/clear, not for any DC-vs-BB dispatch — RibBB does not derive
+   * from RibDC.
+   */
+  virtual neteng::fboss::bgp::thrift::TResult setPathSelectionPolicy(
+      std::unique_ptr<rib_policy::TPathSelectionPolicy> policy);
+  rib_policy::TPathSelectionPolicy getPathSelectionPolicy();
+  int64_t getPathSelectionPolicyVersion() const;
+  virtual void clearPathSelectionPolicy();
+  std::vector<rib_policy::TPathSelector> getActivePathSelectionCriteria(
+      std::unique_ptr<std::vector<std::string>> prefixes);
+
+  bool isCrfFileModeEnabled() const;
+  void setCrfFileModeEnabled(bool fileModeActive);
+
+  /*
+   * Result of resolving the file-based CRF artifact against the cached
+   * RibPolicy at startup, returned by resolveCrfPolicy(). Bundles the two
+   * outputs the bootstrap path needs together:
+   *   - ribPolicy: the RibPolicy to install. Either the cached policy with
+   *     its route_filter_policy replaced by the artifact's, or (when no
+   *     cached policy exists) a fresh RibPolicy holding only the artifact
+   *     policy. Never null when the artifact applies; falls back to the
+   *     cached policy unchanged when the artifact is absent/dryrun/invalid.
+   *   - crfFileMode: whether FILE_MODE should be enabled, i.e. the artifact
+   *     was present with dryrun=false and was successfully applied. Used to
+   *     gate out Thrift-based CRF updates once file-mode is active.
+   */
+  struct CrfResolution {
+    std::unique_ptr<RibPolicy> ribPolicy;
+    bool crfFileMode;
+  };
+  static CrfResolution resolveCrfPolicy(
+      std::unique_ptr<RibPolicy> cachedPolicy,
+      const std::optional<rib_policy::CrfPolicyArtifact>& artifact);
+
+  /**
+   * [Partial Drain] DC-only device-level accessors.
+   * Surfaced via TBgpService thrift; BgpService dispatches through
+   * `RibBase&` and BB inherits the empty defaults from RibBase.
+   */
+  neteng::fboss::bgp::thrift::TPartialDrainStatus getPartialDrainStatus()
+      const override;
+  neteng::fboss::bgp::thrift::TPartialDrainState getPartialDrainState()
+      const override;
+  std::vector<neteng::fboss::bgp::thrift::TPartiallyDrainedPrefix>
+  getPartiallyDrainedPrefixes() const override;
 
  protected:
   void createFib() override;
+
+  /**
+   * Record a per-prefix partial-drain transition. DC-only; called from
+   * RibDC::runBestPathSelection immediately after the CPS-aware
+   * selectBestPath() (which is the sole producer of isPartialDrain_), so
+   * all partial-drain bookkeeping stays inside RibDC and RibBase remains
+   * platform-agnostic.
+   *
+   * Updates `drainedPrefixCount_` (per-prefix population) and bumps
+   * `partialDrainTransitionCount_` only when the device-level drain state
+   * crosses zero (no prefix drained <-> at least one prefix drained),
+   * matching the IDL contract on `partial_drain_transition_count`.
+   *
+   * @return true if a transition occurred (newIsPartialDrain !=
+   * oldIsPartialDrain), so callers can decide whether to publish the
+   * updated state.
+   */
+  bool recordPartialDrainTransition(
+      bool oldIsPartialDrain,
+      bool newIsPartialDrain);
+
   void enqueueRibUpdateToFsdb() override;
+  /*
+   * DC-only end-of-pass hook. Overrides the generic
+   * RibBase::onPrepareFibProgrammingComplete; publishes the partial-drain
+   * state once per pass when a transition was recorded this pass
+   * (gated on partialDrainStateChanged_), then clears the flag.
+   */
+  void onPrepareFibProgrammingComplete() noexcept override;
+  /*
+   * Publish the current partial-drain state. DC-only, called only
+   * from onPrepareFibProgrammingComplete() — never via RibBase&, so it is
+   * not a RibBase virtual.
+   */
+  void publishPartialDrainState();
   void postRouteFilterPolicyReplaced() override;
   void processNexthopResolutionUpdate(
       const NexthopResolutionUpdate& nexthopResolutionUpdate) noexcept override;
@@ -60,9 +157,12 @@ class RibDC : public RibBase {
       bool fullRibWalk = false) override;
 
   folly::coro::Task<void> processRibPolicyMsgLoop() noexcept override;
+  /* CPS message handlers — DC-only. No virtuals on RibBase; RibDC's
+   * processRibPolicyMsgLoop dispatches PathSelectionPolicy{Set,Clear}Msg
+   * to these directly. */
   void handlePathSelectionPolicySetMsg(
-      const PathSelectionPolicySetMsg& msg) noexcept override;
-  void handlePathSelectionPolicyClearMsg() noexcept override;
+      const PathSelectionPolicySetMsg& msg) noexcept;
+  void handlePathSelectionPolicyClearMsg() noexcept;
 
   /**
    * Result of single-pass cache migration that combines policy comparison
@@ -115,10 +215,76 @@ class RibDC : public RibBase {
       std::unique_ptr<PathSelectionPolicy> newPolicy,
       bool isBootstrap = false);
 
+ public:
+  /*
+   * Instance entry point. Runs the CPS-aware orchestrator using the
+   * RibDC instance's owned pathSelectionPolicy_.
+   */
+  std::pair<bool, bool> runBestPathSelection(RibEntry& entry) noexcept override;
+
+  /*
+   * Static orchestrator with an explicit policy parameter. Used by
+   * tests that drive a bare RibEntry without constructing a Rib
+   * instance and want to evaluate a particular policy against it.
+   * Runs the same 7-phase pipeline as RibBase::selectBestPath but
+   * uses the policy (when non-null) to override the multipath phase.
+   */
+  static std::pair<bool, bool> selectBestPath(
+      RibEntry& entry,
+      const std::unique_ptr<RouteInfoSelector>& multipathSelector,
+      const std::unique_ptr<RouteInfoSelector>& bestpathSelector,
+      bool computeUcmp,
+      uint32_t ucmpWidth,
+      const std::optional<BgpUcmpQuantizer>& quantizer = std::nullopt,
+      const std::unique_ptr<PathSelectionPolicy>& pathSelectionPolicy = nullptr,
+      bool enableRibAllocatedPathId = false) noexcept;
+
+  /*
+   * DC-only overrides of the mixed-content methods that RibBase keeps
+   * native-only. Each override adds the CPS-specific fields the DC
+   * binary needs (path_selection_policy on thrift, active_cps_criteria
+   * on TRibEntry, persisted CPS policy on disk). Public to match
+   * RibBase's public signatures and let tests / thrift handlers call
+   * them directly.
+   */
+  rib_policy::TRibPolicy getRibPolicy() override;
+  void saveRibPolicyState() noexcept override;
+
  protected:
+  std::optional<neteng::fboss::bgp::thrift::TRibEntry>
+  createTRibEntryWithFilter(
+      const std::pair<const folly::CIDRNetwork, facebook::bgp::RibEntry>& entry,
+      const std::function<bool(const RouteInfo&)>& pathFilter) override;
+
+  /*
+   * Whether CPS native criteria (e.g. bgp_native_path_selection_min_nexthop /
+   * min_agg_lbw) are violated for this prefix -- when true, no path is "best
+   * path". Shared by createTRibEntryWithFilter and createBestPathOnlyTRibEntry.
+   */
+  bool computeFailedCpsNativeCriteria(
+      const facebook::bgp::RibEntry& ribEntry) const;
+
+  /*
+   * Minimal TRibEntry builder for the FSDB publish path: returns an entry with
+   * only prefix + best_path when a publishable best path exists (in the
+   * selected multipath set and CPS native criteria not violated), or
+   * std::nullopt otherwise so the caller withdraws the prefix instead of
+   * publishing a prefix-only entry the FSDB best-path consumer would ignore.
+   */
+  std::optional<neteng::fboss::bgp::thrift::TRibEntry>
+  createBestPathOnlyTRibEntry(
+      const std::pair<const folly::CIDRNetwork, facebook::bgp::RibEntry>&
+          entry);
   // scuba logger for rib policy
   std::shared_ptr<rfe::ScubaData> scubaLogger_{nullptr};
   std::unique_ptr<RibPolicyLogger> ribPolicyLogger_{nullptr};
+
+  /*
+   * Centralized Path Selection (CPS) policy — DC-only. Owned by RibDC
+   * so the BB binary never compiles in CPS data or its
+   * PathSelectionPolicy reads.
+   */
+  std::unique_ptr<PathSelectionPolicy> pathSelectionPolicy_{nullptr};
 
   void maybeStartFsdbSyncer();
 
@@ -156,9 +322,54 @@ class RibDC : public RibBase {
    */
   bool firstNdpSignalSent_{false};
 
+  /*
+   * Whether CRF FILE_MODE is active. Atomic because it is accessed from two
+   * threads: written on the Rib/startup thread (via setCrfFileModeEnabled()
+   * during bootstrap) and read on the BgpService Thrift-handler thread (via
+   * isCrfFileModeEnabled()) to gate out Thrift-based CRF updates while
+   * file-mode owns the policy. The atomic prevents a data race between those
+   * accesses; no stronger ordering is required since the flag is independent
+   * of other state.
+   */
+  std::atomic<bool> crfFileModeEnabled_{false};
+
   friend class RibFixture;
   friend class RibFsdbFixture;
   friend class MockRib;
+
+  /*
+   * Build a single TPartiallyDrainedPrefix from a (prefix, ribEntry) pair.
+   * Reads only RibEntry/CIDRNetwork state. Used by the on-demand Thrift RPC
+   * path getPartiallyDrainedPrefixes() and (transitively) by the
+   * publish path publishPartialDrainState(). DC-only: partial drain is a
+   * device concept, so this helper lives here rather than in RibBase.
+   */
+  neteng::fboss::bgp::thrift::TPartiallyDrainedPrefix
+  buildPartialDrainPrefixEntry(
+      const folly::CIDRNetwork& prefix,
+      const RibEntry& ribEntry) const;
+
+  bool isDevicePartiallyDrained() const;
+
+  int64_t drainedPrefixCount_{0};
+  int64_t partialDrainTransitionCount_{0};
+
+  /*
+   * Set in runBestPathSelection() when recordPartialDrainTransition() reports
+   * a per-prefix transition this pass; consumed and cleared in
+   * onPrepareFibProgrammingComplete() to gate a single end-of-pass
+   * publish (a burst of N transitions produces one publish, not N).
+   */
+  bool partialDrainStateChanged_{false};
+
+/*
+ * Per-class placeholder for test code injection. Test files that need to
+ * reach DC-only members (e.g. pathSelectionPolicy_) #define this macro
+ * with the appropriate FRIEND_TEST entries before including this header.
+ */
+#ifdef RibDC_TEST_FRIENDS
+  RibDC_TEST_FRIENDS
+#endif
 };
 
 template <typename MessageProcessor>

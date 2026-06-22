@@ -75,7 +75,7 @@ struct PeeringState {
   int64_t lastSentKeepAlive;
 
   // Set only when session goes down from ESTABLISHED state
-  folly::Optional<ResetReason> resetReason;
+  std::optional<ResetReason> resetReason;
 
   // Captured from BgpSessionStop and read at the IDLE emission below.
   bool peerDelete{false};
@@ -151,7 +151,7 @@ class FiberBgpPeer : public std::enable_shared_from_this<FiberBgpPeer>,
     BgpPeerId peerId;
     BgpSessionState state;
     uint64_t versionNumber;
-    folly::Optional<ResetReason> lastResetReason{folly::none};
+    std::optional<ResetReason> lastResetReason{std::nullopt};
     std::shared_ptr<ObservableSessionInfo> sessionInfo{nullptr};
     // tells sessionTerminated to schedule cleanupPeerState.
     bool peerDelete{false};
@@ -194,8 +194,8 @@ class FiberBgpPeer : public std::enable_shared_from_this<FiberBgpPeer>,
    * peerDelete is forwarded onto BgpSessionStop for the IDLE event.
    */
   void stop(
-      const folly::Optional<BgpNotifCeaseErrSubCode>& ceaseErrSubCode =
-          folly::none,
+      const std::optional<BgpNotifCeaseErrSubCode>& ceaseErrSubCode =
+          std::nullopt,
       const bool gracefulRestart = true,
       const bool peerDelete = false) noexcept;
 
@@ -241,25 +241,25 @@ class FiberBgpPeer : public std::enable_shared_from_this<FiberBgpPeer>,
     return peeringParams_.localBgpId.toLongHBO();
   }
 
-  folly::Optional<uint16_t> getRemoteGrRestartTime() const {
+  std::optional<uint16_t> getRemoteGrRestartTime() const {
     const auto isGrCapabilityReceived =
         *peeringState_.remoteCapabilities.gracefulRestart();
     return (
         isGrCapabilityReceived &&
                 *peeringState_.remoteCapabilities.restartTime()
-            ? folly::Optional<uint16_t>(
+            ? std::optional<uint16_t>(
                   *peeringState_.remoteCapabilities.restartTime())
-            : folly::none);
+            : std::nullopt);
   }
 
   BgpCapabilities getNegotiatedCapabilities() const {
     return peeringState_.negotiatedCapabilities;
   }
 
-  folly::Optional<std::chrono::seconds> getNegotiatedHoldTime() const {
+  std::optional<std::chrono::seconds> getNegotiatedHoldTime() const {
     return (peeringState_.state >= BgpSessionState::OPEN_CONFIRM)
-        ? folly::Optional<std::chrono::seconds>(peeringState_.holdTime)
-        : folly::none;
+        ? std::optional<std::chrono::seconds>(peeringState_.holdTime)
+        : std::nullopt;
   }
 
   int64_t getLastResetHoldTimer() const {
@@ -278,7 +278,7 @@ class FiberBgpPeer : public std::enable_shared_from_this<FiberBgpPeer>,
     return peeringState_.lastSentKeepAlive;
   }
 
-  folly::Optional<ResetReason> getResetReason() const {
+  std::optional<ResetReason> getResetReason() const {
     return peeringState_.resetReason;
   }
 

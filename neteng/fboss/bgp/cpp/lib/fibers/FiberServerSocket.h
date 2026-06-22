@@ -42,7 +42,7 @@ class FiberServerSocket {
   // to accept connections; if the bind address is omitted, listen
   // on any address with random port (useful for testing)
   explicit FiberServerSocket(
-      folly::Optional<folly::SocketAddress> bindAddr,
+      std::optional<folly::SocketAddress> bindAddr,
       uint32_t listenQueueDepth = 256);
 
   // we need to shutdown the accepting socket when cleaning, so

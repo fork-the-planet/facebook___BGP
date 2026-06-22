@@ -82,9 +82,3 @@ commands:
     outputSchema:
       "$schema": "http://json-schema.org/draft-07/schema"
       type: object
-
-  showBgpcppDrainState:
-    syntax: show bgpcpp drain-state
-    mode: Unprivileged
-    data:
-      drain-state: { keyword: { help: Show current drain state of all peer groups } }

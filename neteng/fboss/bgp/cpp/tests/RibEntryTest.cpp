@@ -30,6 +30,7 @@
 #include "neteng/fboss/bgp/cpp/common/FeatureFlags.h"
 #include "neteng/fboss/bgp/cpp/common/RouteInfo.h"
 #include "neteng/fboss/bgp/cpp/nexthopTracker/NexthopInfo.h"
+#include "neteng/fboss/bgp/cpp/rib/RibBase.h"
 #include "neteng/fboss/bgp/cpp/rib/RibEntry.h"
 #include "neteng/fboss/bgp/cpp/rib/RibPolicy.h"
 #include "neteng/fboss/bgp/cpp/rib/Utils.h"
@@ -80,7 +81,8 @@ TEST(RibEntryTest, SelectBestPathNexthopTest) {
 
   // Now, trigger the bestpath selection
   bool bestpathChanged, nexthopChanged;
-  std::tie(bestpathChanged, nexthopChanged) = ribEntry.selectBestPath(
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry,
       multipathSelector,
       bestpathSelector,
       false /* compute ucmp */,
@@ -122,16 +124,16 @@ TEST(RibEntryTest, SelectBestPathTest) {
   // Now, trigger the bestpath selection
   // Case 1: bestpathChanged == true and nexthopChanged == true
   bool bestpathChanged, nexthopChanged;
-  std::tie(bestpathChanged, nexthopChanged) =
-      ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   auto allocatedPathIds = getAndCheckAllocatedPathIds({}, ribEntry);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_TRUE(nexthopChanged);
 
   // Doing bestpath selection again shall not change anything
   // Case 2: bestpathChanged == false and nexthopChanged == false
-  std::tie(bestpathChanged, nexthopChanged) =
-      ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
   EXPECT_FALSE(bestpathChanged);
   EXPECT_FALSE(nexthopChanged);
@@ -155,8 +157,8 @@ TEST(RibEntryTest, SelectBestPathTest) {
 
   EXPECT_TRUE(ribEntry.updatePath(peer2, attrs2));
 
-  std::tie(bestpathChanged, nexthopChanged) =
-      ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
   EXPECT_FALSE(bestpathChanged);
   EXPECT_TRUE(nexthopChanged);
@@ -173,8 +175,8 @@ TEST(RibEntryTest, SelectBestPathTest) {
   EXPECT_TRUE(ribEntry.updatePath(peer2, attrs));
 
   // trigger the bestpath selection
-  std::tie(bestpathChanged, nexthopChanged) =
-      ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
   EXPECT_FALSE(bestpathChanged);
   EXPECT_TRUE(nexthopChanged);
@@ -194,8 +196,8 @@ TEST(RibEntryTest, SelectBestPathTest) {
   // update peer 1 path
   EXPECT_TRUE(ribEntry.updatePath(peer1, attrs1));
 
-  std::tie(bestpathChanged, nexthopChanged) =
-      ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_FALSE(nexthopChanged);
@@ -246,8 +248,8 @@ TEST(RibEntryTest, SelectBestPathEncodedLbwTest) {
   // Now, trigger the bestpath selection
   // bestpathChanged == true and nexthopChanged == true
   bool bestpathChanged, nexthopChanged;
-  std::tie(bestpathChanged, nexthopChanged) =
-      ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   auto allocatedPathIds = getAndCheckAllocatedPathIds({}, ribEntry);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_TRUE(nexthopChanged);
@@ -261,8 +263,8 @@ TEST(RibEntryTest, SelectBestPathEncodedLbwTest) {
   EXPECT_TRUE(ribEntry.updatePath(peer1, attrs3, false));
 
   // try bestpath selection again
-  std::tie(bestpathChanged, nexthopChanged) =
-      ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
 
   // weighted nexthops did not change because we didn't specify
@@ -289,8 +291,8 @@ TEST(RibEntryTest, SelectBestPathEncodedLbwTest) {
   EXPECT_TRUE(ribEntry.updatePath(peer2, attrs5, false));
 
   // try bestpath selection again
-  std::tie(bestpathChanged, nexthopChanged) =
-      ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
 
   // this time nexthop changed because topology info changed
@@ -353,8 +355,8 @@ TEST(RibEntryTest, SelectBestPathTestConfedPeer) {
     // with default best path selector, confeds are ignored in as path length
     // calcuation, both will be chosen as multipath
     bool bestpathChanged, nexthopChanged;
-    std::tie(bestpathChanged, nexthopChanged) =
-        ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+    std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+        ribEntry, multipathSelector, bestpathSelector, false, 0);
     allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
 
     EXPECT_TRUE(bestpathChanged);
@@ -380,8 +382,8 @@ TEST(RibEntryTest, SelectBestPathTestConfedPeer) {
     // peer 1 is chosen as best path in last run, so bestpathChanged should be
     // false
     bool bestpathChanged, nexthopChanged;
-    std::tie(bestpathChanged, nexthopChanged) = ribEntry.selectBestPath(
-        multipathSelectorCountConfeds, bestpathSelector, false, 0);
+    std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+        ribEntry, multipathSelectorCountConfeds, bestpathSelector, false, 0);
     allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
     EXPECT_FALSE(bestpathChanged);
     EXPECT_TRUE(nexthopChanged);
@@ -426,8 +428,12 @@ TEST(RibEntryTest, UcmpWeightComputation) {
     attrs2->publish();
     EXPECT_TRUE(ribEntry.updatePath(peer2, attrs2, false));
 
-    ribEntry.selectBestPath(
-        multipathSelector, bestpathSelector, true, 1024 /* ucmp-width */);
+    RibBase::selectBestPath(
+        ribEntry,
+        multipathSelector,
+        bestpathSelector,
+        true,
+        1024 /* ucmp-width */);
     allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
     WeightedNexthopMap nhWts = {{kPeerAddr1, 2}, {kPeerAddr2, 3}};
     EXPECT_EQ(nhWts, *ribEntry.getMultipathWeightedNexthops());
@@ -449,8 +455,12 @@ TEST(RibEntryTest, UcmpWeightComputation) {
     attrs2->publish();
     EXPECT_TRUE(ribEntry.updatePath(peer2, attrs2, false));
 
-    ribEntry.selectBestPath(
-        multipathSelector, bestpathSelector, true, 1024 /* ucmp-width */);
+    RibBase::selectBestPath(
+        ribEntry,
+        multipathSelector,
+        bestpathSelector,
+        true,
+        1024 /* ucmp-width */);
     allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
     WeightedNexthopMap nhWts = {{kPeerAddr1, 2}, {kPeerAddr2, 3}};
     EXPECT_EQ(nhWts, *ribEntry.getMultipathWeightedNexthops());
@@ -472,8 +482,12 @@ TEST(RibEntryTest, UcmpWeightComputation) {
     attrs2->publish();
     EXPECT_TRUE(ribEntry.updatePath(peer2, attrs2, false));
 
-    ribEntry.selectBestPath(
-        multipathSelector, bestpathSelector, true, 1024 /* ucmp-width */);
+    RibBase::selectBestPath(
+        ribEntry,
+        multipathSelector,
+        bestpathSelector,
+        true,
+        1024 /* ucmp-width */);
     allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
     WeightedNexthopMap nhWts = {{kPeerAddr1, 1}, {kPeerAddr2, 9}};
     EXPECT_EQ(nhWts, *ribEntry.getMultipathWeightedNexthops());
@@ -497,8 +511,12 @@ TEST(RibEntryTest, UcmpWeightComputation) {
     attrs2->publish();
     EXPECT_TRUE(ribEntry.updatePath(peer2, attrs2, false));
 
-    ribEntry.selectBestPath(
-        multipathSelector, bestpathSelector, true, 1024 /* ucmp-width */);
+    RibBase::selectBestPath(
+        ribEntry,
+        multipathSelector,
+        bestpathSelector,
+        true,
+        1024 /* ucmp-width */);
     allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
     WeightedNexthopMap nhWts = {{kPeerAddr1, 1024}};
     EXPECT_EQ(nhWts, *ribEntry.getMultipathWeightedNexthops());
@@ -521,8 +539,12 @@ TEST(RibEntryTest, UcmpWeightComputation) {
     attrs2->publish();
     EXPECT_TRUE(ribEntry.updatePath(peer2, attrs2, false));
 
-    ribEntry.selectBestPath(
-        multipathSelector, bestpathSelector, true, 1024 /* ucmp-width */);
+    RibBase::selectBestPath(
+        ribEntry,
+        multipathSelector,
+        bestpathSelector,
+        true,
+        1024 /* ucmp-width */);
     allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
     WeightedNexthopMap nhWts = {{kPeerAddr1, 511}, {kPeerAddr2, 513}};
     EXPECT_EQ(nhWts, *ribEntry.getMultipathWeightedNexthops());
@@ -578,8 +600,8 @@ TEST(RibEntryTest, AggregateLocalUcmpWeight) {
   // Case 1: both paths have link-bandwidth-bps
   EXPECT_TRUE(ribEntry.updatePath(peer1, attrs, false));
   EXPECT_TRUE(ribEntry.updatePath(peer2, attrs, false));
-  std::tie(bestpathChanged, nexthopChanged) =
-      ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   auto allocatedPathIds = getAndCheckAllocatedPathIds({}, ribEntry);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_TRUE(nexthopChanged);
@@ -590,8 +612,8 @@ TEST(RibEntryTest, AggregateLocalUcmpWeight) {
   // Case 2: No change
   EXPECT_FALSE(ribEntry.updatePath(peer1, attrs, false));
   EXPECT_FALSE(ribEntry.updatePath(peer2, attrs, false));
-  std::tie(bestpathChanged, nexthopChanged) =
-      ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
   EXPECT_FALSE(bestpathChanged);
   EXPECT_FALSE(nexthopChanged);
@@ -601,8 +623,8 @@ TEST(RibEntryTest, AggregateLocalUcmpWeight) {
 
   // Case 3: Update link-bandwidth-bps of peer1 to another value
   EXPECT_TRUE(ribEntry.updatePath(peer1Updated, attrs, false));
-  std::tie(bestpathChanged, nexthopChanged) =
-      ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_FALSE(nexthopChanged);
@@ -612,8 +634,8 @@ TEST(RibEntryTest, AggregateLocalUcmpWeight) {
 
   // Case 4: Set link-bandwidth-bps of peer2 to none
   EXPECT_TRUE(ribEntry.updatePath(peer2Updated, attrs, false));
-  std::tie(bestpathChanged, nexthopChanged) =
-      ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_FALSE(nexthopChanged);
@@ -673,8 +695,8 @@ TEST(RibEntryTest, AggregateLocalUcmpWeightWithQuantizer) {
   // new weight announced 3600
   EXPECT_TRUE(ribEntry.updatePath(peer1, attrs, false));
   EXPECT_TRUE(ribEntry.updatePath(peer2, attrs, false));
-  std::tie(bestpathChanged, nexthopChanged) = ribEntry.selectBestPath(
-      multipathSelector, bestpathSelector, false, 0, quantizer);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0, quantizer);
   auto allocatedPathIds = getAndCheckAllocatedPathIds({}, ribEntry);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_TRUE(nexthopChanged);
@@ -686,8 +708,8 @@ TEST(RibEntryTest, AggregateLocalUcmpWeightWithQuantizer) {
   // selectBestPath: no change
   // weight: no change
   EXPECT_TRUE(ribEntry.updatePath(peer2MinorLoss, attrs, false));
-  std::tie(bestpathChanged, nexthopChanged) = ribEntry.selectBestPath(
-      multipathSelector, bestpathSelector, false, 0, quantizer);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0, quantizer);
   allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
   EXPECT_FALSE(bestpathChanged);
   EXPECT_FALSE(nexthopChanged);
@@ -699,8 +721,8 @@ TEST(RibEntryTest, AggregateLocalUcmpWeightWithQuantizer) {
   // selectBestPath: changed due to weight update
   // weight: changed -> 3200
   EXPECT_TRUE(ribEntry.updatePath(peer2MajorLoss, attrs, false));
-  std::tie(bestpathChanged, nexthopChanged) = ribEntry.selectBestPath(
-      multipathSelector, bestpathSelector, false, 0, quantizer);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0, quantizer);
   allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_FALSE(nexthopChanged);
@@ -749,7 +771,8 @@ TEST(RibEntryTest, UpdatePathTest) {
   EXPECT_TRUE(ribEntry.needPathSelection());
 
   // Now, trigger the bestpath selection
-  ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   auto allocatedPathIds = getAndCheckAllocatedPathIds({}, ribEntry);
   // needPathSelection_ reset to false
   EXPECT_FALSE(ribEntry.needPathSelection());
@@ -777,7 +800,8 @@ TEST(RibEntryTest, UpdatePathTest) {
   EXPECT_TRUE(ribEntry.needPathSelection());
 
   // Trigger bestpath selection again
-  ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
   EXPECT_FALSE(ribEntry.needPathSelection());
 
@@ -813,7 +837,8 @@ TEST(RibEntryTest, UpdatePathTest) {
   EXPECT_TRUE(ribEntry.needPathSelection());
 
   // Trigger bestpath selection
-  ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
   EXPECT_FALSE(ribEntry.needPathSelection());
 
@@ -869,7 +894,8 @@ TEST(RibEntryTest, UpdateAddPathTest) {
   EXPECT_TRUE(ribEntry.needPathSelection());
 
   // Now, trigger the bestpath selection
-  ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   auto allocatedPathIds = getAndCheckAllocatedPathIds({}, ribEntry);
   // needPathSelection_ reset to false
   EXPECT_FALSE(ribEntry.needPathSelection());
@@ -898,7 +924,8 @@ TEST(RibEntryTest, UpdateAddPathTest) {
   EXPECT_TRUE(ribEntry.updatePath(peer2, attrs4, true, 1));
   EXPECT_TRUE(ribEntry.needPathSelection());
   // Now, trigger the bestpath selection
-  ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
   // needPathSelection_ reset to false
   EXPECT_FALSE(ribEntry.needPathSelection());
@@ -927,7 +954,8 @@ TEST(RibEntryTest, UpdateAddPathTest) {
   EXPECT_TRUE(ribEntry.updatePath(peer2, attrs5, true, 2));
   EXPECT_TRUE(ribEntry.needPathSelection());
   // Now, trigger the bestpath selection
-  ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
   // needPathSelection reset to false
   EXPECT_FALSE(ribEntry.needPathSelection());
@@ -953,7 +981,8 @@ TEST(RibEntryTest, UpdateAddPathTest) {
   EXPECT_TRUE(ribEntry.needPathSelection());
 
   // Trigger bestpath selection again
-  ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
   EXPECT_FALSE(ribEntry.needPathSelection());
 
@@ -983,7 +1012,8 @@ TEST(RibEntryTest, UpdateAddPathTest) {
   EXPECT_TRUE(ribEntry.needPathSelection());
 
   // Trigger bestpath selection
-  ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
   EXPECT_FALSE(ribEntry.needPathSelection());
 
@@ -1060,7 +1090,8 @@ TEST(RibEntryTest, commitBestpathTest) {
   EXPECT_TRUE(ribEntry.updatePath(peer2, attrs));
 
   // Now, trigger the bestpath selection
-  ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   auto allocatedPathIds = getAndCheckAllocatedPathIds({}, ribEntry);
 
   // advertisedBestpath and advertisedMultipathNexthops should still be
@@ -1098,7 +1129,8 @@ TEST(RibEntryTest, commitBestpathTest) {
   EXPECT_TRUE(ribEntry.updatePath(peer2, nullptr));
 
   // trigger bestpath selection again
-  ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   allocatedPathIds = getAndCheckAllocatedPathIds(allocatedPathIds, ribEntry);
 
   EXPECT_EQ(nullptr, ribEntry.getBestPath());
@@ -1198,8 +1230,8 @@ TEST(RibEntryTest, SelectBestPathWithNextHopTrackingTest) {
 
     // Trigger best path selection
     bool bestpathChanged, nexthopChanged;
-    std::tie(bestpathChanged, nexthopChanged) =
-        ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+    std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+        ribEntry, multipathSelector, bestpathSelector, false, 0);
     getAndCheckAllocatedPathIds({}, ribEntry);
 
     EXPECT_TRUE(bestpathChanged);
@@ -1244,8 +1276,8 @@ TEST(RibEntryTest, SelectBestPathWithNextHopTrackingTest) {
 
     // Trigger best path selection
     bool bestpathChanged, nexthopChanged;
-    std::tie(bestpathChanged, nexthopChanged) =
-        ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+    std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+        ribEntry, multipathSelector, bestpathSelector, false, 0);
     getAndCheckAllocatedPathIds({}, ribEntry);
 
     EXPECT_TRUE(bestpathChanged);
@@ -1289,8 +1321,8 @@ TEST(RibEntryTest, SelectBestPathWithNextHopTrackingTest) {
 
     // Trigger best path selection
     bool bestpathChanged, nexthopChanged;
-    std::tie(bestpathChanged, nexthopChanged) =
-        ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+    std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+        ribEntry, multipathSelector, bestpathSelector, false, 0);
     getAndCheckAllocatedPathIds({}, ribEntry);
 
     EXPECT_TRUE(bestpathChanged);
@@ -1332,8 +1364,8 @@ TEST(RibEntryTest, SelectBestPathWithNextHopTrackingTest) {
 
     // Trigger best path selection
     bool bestpathChanged, nexthopChanged;
-    std::tie(bestpathChanged, nexthopChanged) =
-        ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+    std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+        ribEntry, multipathSelector, bestpathSelector, false, 0);
     getAndCheckAllocatedPathIds({}, ribEntry);
 
     EXPECT_FALSE(bestpathChanged);
@@ -1373,8 +1405,8 @@ TEST(RibEntryTest, SelectBestPathWithNextHopTrackingTest) {
 
     // Trigger best path selection
     bool bestpathChanged, nexthopChanged;
-    std::tie(bestpathChanged, nexthopChanged) =
-        ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+    std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+        ribEntry, multipathSelector, bestpathSelector, false, 0);
     getAndCheckAllocatedPathIds({}, ribEntry);
 
     EXPECT_TRUE(bestpathChanged);
@@ -1421,7 +1453,8 @@ TEST(RibEntryTest, SelectBestPathAssignsPathIdsToSend) {
       std::nullopt);
 
   // run best path selection. both should get selected
-  ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   EXPECT_EQ(ribEntry.getMultipaths().size(), 2);
 
   // now due to being selected, both have unique assignments
@@ -1484,7 +1517,8 @@ TEST(RibEntryTest, SelectBestPathPreservesPathIdsToSend) {
 
   // run selectBestPath and make sure the IDs are preserved, for both the
   // selected path and the non-selected one
-  ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   EXPECT_EQ(ribEntry.getMultipaths().size(), 1);
   EXPECT_EQ(ribEntry.routeInfos_[peer1Id][kDefaultPathID]->pathIdToSend, 4);
   EXPECT_EQ(ribEntry.routeInfos_[peer2Id][kDefaultPathID]->pathIdToSend, 5);

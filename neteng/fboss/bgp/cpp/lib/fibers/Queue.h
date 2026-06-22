@@ -17,10 +17,10 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <utility>
 
 #include <folly/Function.h>
-#include <folly/Optional.h>
 #include <folly/fibers/Baton.h>
 #include <folly/fibers/FiberManager.h>
 #include <folly/fibers/TimedMutex.h>
@@ -64,12 +64,12 @@ class RQueue {
   // See documentation in detail::Queue
   //
 
-  folly::Optional<T> get() noexcept {
+  std::optional<T> get() noexcept {
     CHECK(queue_);
     return queue_->get();
   }
 
-  folly::Optional<T> sleepAndGet(
+  std::optional<T> sleepAndGet(
       std::chrono::milliseconds duration =
           std::chrono::milliseconds(1)) noexcept {
     CHECK(queue_);
@@ -226,7 +226,7 @@ class RWQueue {
   // See documentation in detail::Queue
   //
 
-  folly::Optional<T> get() noexcept {
+  std::optional<T> get() noexcept {
     CHECK(queue_);
     return queue_->get();
   }
@@ -241,7 +241,7 @@ class RWQueue {
     return queue_->get_num_writes();
   }
 
-  folly::Optional<T> sleepAndGet(
+  std::optional<T> sleepAndGet(
       std::chrono::milliseconds duration =
           std::chrono::milliseconds(1)) noexcept {
     CHECK(queue_);
@@ -380,7 +380,7 @@ class Queue {
   //
   bool put(T&& value) noexcept(std::is_nothrow_move_constructible<T>::value) {
     return putImpl([this, &value]() {
-      queue_.emplace_back(folly::Optional<T>(std::forward<T>(value)));
+      queue_.emplace_back(std::optional<T>(std::forward<T>(value)));
     });
   }
 
@@ -389,7 +389,7 @@ class Queue {
   // consumers as a signal to terminate.
   //
   bool putNull() noexcept {
-    return putImpl([this]() { queue_.emplace_back(folly::Optional<T>()); });
+    return putImpl([this]() { queue_.emplace_back(std::optional<T>()); });
   }
 
   //
@@ -400,7 +400,7 @@ class Queue {
   //
   bool putNullFront() noexcept {
     return putImpl(
-        [this]() { queue_.emplace_front(folly::Optional<T>()); },
+        [this]() { queue_.emplace_front(std::optional<T>()); },
         false /* waitForPut */);
   }
 
@@ -411,7 +411,7 @@ class Queue {
       std::is_nothrow_move_constructible<T>::value) {
     return putImpl(
         [this, &value]() {
-          queue_.emplace_front(folly::Optional<T>(std::forward<T>(value)));
+          queue_.emplace_front(std::optional<T>(std::forward<T>(value)));
         },
         false /* waitForPut */);
   }
@@ -421,17 +421,17 @@ class Queue {
   // The consumers are served in FIFO order, later joiners
   // join the line
   //
-  folly::Optional<T> get() noexcept(
+  std::optional<T> get() noexcept(
       std::is_nothrow_move_constructible<T>::value) {
     if (closed_) {
-      return folly::none;
+      return std::nullopt;
     }
 
     // if there are no waiters and msg queue is non empty, grab it
     std::unique_lock<folly::fibers::TimedMutex> g(lock_);
     // always check closed_ after lock
     if (closed_) {
-      return folly::none;
+      return std::nullopt;
     }
 
     bool canSkipWait = !queue_.empty() && consumers_.empty();
@@ -453,7 +453,7 @@ class Queue {
 
     // always check closed_ after lock
     if (closed_) {
-      return folly::none;
+      return std::nullopt;
     }
 
     consumers_.pop_front();
@@ -462,7 +462,7 @@ class Queue {
     return getNowaitLocked();
   }
 
-  folly::Optional<T> sleepAndGet(
+  std::optional<T> sleepAndGet(
       std::chrono::milliseconds duration = std::chrono::milliseconds(
           1)) noexcept(std::is_nothrow_move_constructible<T>::value) {
     fiberSleepFor(duration);
@@ -515,7 +515,7 @@ class Queue {
   }
 
   // This function does not acquire lock_, caller is expected to handle lock_
-  folly::Optional<T> getNowaitLocked() {
+  std::optional<T> getNowaitLocked() {
     DCHECK(!queue_.empty());
 
     auto result = std::move(queue_.front());
@@ -580,7 +580,7 @@ class Queue {
   folly::fibers::TimedMutex lock_;
 
   // the messages passed from publishers to  consumers
-  std::deque<folly::Optional<T>> queue_;
+  std::deque<std::optional<T>> queue_;
 
   // the queue publishers wait on when capacity is exceeded
   std::deque<folly::fibers::Baton*> publishers_;

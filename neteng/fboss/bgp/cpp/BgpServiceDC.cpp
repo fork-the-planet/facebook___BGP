@@ -16,11 +16,16 @@
 
 #include <fb303/ServiceData.h>
 #include <fboss/lib/LogThriftCall.h>
+#include <folly/ExceptionString.h>
 #include <folly/ScopeGuard.h>
 #include <folly/futures/Future.h>
 #include <folly/logging/xlog.h>
 #include <neteng/fboss/bgp/cpp/BgpServiceDC.h>
+#include <neteng/fboss/bgp/cpp/BgpServiceUtil.h>
 #include <neteng/fboss/bgp/cpp/peer/PeerManager.h>
+#include <neteng/fboss/bgp/cpp/rib/RibDC.h>
+#include <neteng/fboss/bgp/cpp/rib/RibFileUtils.h>
+#include <neteng/fboss/bgp/cpp/stats/Stats.h>
 #include <neteng/fboss/bgp/if/gen-cpp2/bgp_thrift_types.h>
 #include "neteng/fboss/bgp/cpp/common/Consts.h"
 #include "neteng/fboss/bgp/cpp/common/EvbUtils.h"
@@ -41,7 +46,7 @@ static const std::string kExitNullPtrLogPrefix = "BgpServiceDCExitOrNullPtr";
 BgpServiceDC::BgpServiceDC(
     PeerManager& peerMgr,
     std::shared_ptr<ConfigManager> configManager,
-    RibBase& rib,
+    RibDC& rib,
     std::shared_ptr<NeighborWatcher> neighborWatcher,
     Watchdog& watchdog,
     bool enable_thrift_protection)
@@ -51,7 +56,9 @@ BgpServiceDC::BgpServiceDC(
           rib,
           watchdog,
           enable_thrift_protection),
-      neighborWatcher_(std::move(neighborWatcher)) {}
+      ribDC_(rib),
+      neighborWatcher_(std::move(neighborWatcher)),
+      dcRib_(rib) {}
 
 folly::coro::Task<bool> BgpServiceDC::co_getIsSafeModeOn() {
   auto log = LOG_THRIFT_CALL(DBG2);
@@ -305,7 +312,7 @@ BgpServiceDC::co_setPathSelectionPolicy(
   auto result = co_await co_runOnEvbWithTimeout(
       rib_.getEventBase(),
       [this, p = std::move(policy)]() mutable {
-        return rib_.setPathSelectionPolicy(std::move(p));
+        return dcRib_.setPathSelectionPolicy(std::move(p));
       },
       kRibThriftHandlerTimeout);
 
@@ -341,7 +348,7 @@ BgpServiceDC::co_getPathSelectionPolicy() {
 
   auto result = co_await co_runOnEvbWithTimeout(
       rib_.getEventBase(),
-      [this]() { return rib_.getPathSelectionPolicy(); },
+      [this]() { return dcRib_.getPathSelectionPolicy(); },
       kRibThriftHandlerTimeout);
 
   if (result.hasValue()) {
@@ -369,7 +376,7 @@ folly::coro::Task<void> BgpServiceDC::co_clearPathSelectionPolicy() {
 
   auto result = co_await co_runOnEvbWithTimeout(
       rib_.getEventBase(),
-      [this]() { rib_.clearPathSelectionPolicy(); },
+      [this]() { dcRib_.clearPathSelectionPolicy(); },
       kRibThriftHandlerTimeout);
 
   if (result.hasException()) {
@@ -408,7 +415,7 @@ BgpServiceDC::co_getActivePathSelectionCriteria(
   auto result = co_await co_runOnEvbWithTimeout(
       rib_.getEventBase(),
       [this, p = std::move(prefixes)]() mutable {
-        return rib_.getActivePathSelectionCriteria(std::move(p));
+        return dcRib_.getActivePathSelectionCriteria(std::move(p));
       },
       kRibThriftHandlerTimeout);
 
@@ -468,6 +475,103 @@ BgpServiceDC::co_clearIngressEgressRouteFiltersPolicy() {
   };
 
   peerMgr_.clearIngressEgressRouteFiltersPolicy();
+}
+
+folly::coro::Task<std::unique_ptr<TPartialDrainStatus>>
+BgpServiceDC::co_getPartialDrainStatus() {
+  auto log = LOG_THRIFT_CALL(DBG2);
+  if (exitInitiated_) {
+    co_return std::make_unique<TPartialDrainStatus>();
+  }
+
+  if (!continueExecution(true)) {
+    co_return std::make_unique<TPartialDrainStatus>();
+  }
+  SCOPE_EXIT {
+    decrRequestsInExecution();
+  };
+
+  auto result = co_await co_runOnEvbWithTimeout(
+      rib_.getEventBase(),
+      [this]() { return rib_.getPartialDrainStatus(); },
+      kRibThriftHandlerTimeout);
+
+  if (result.hasValue()) {
+    co_return std::make_unique<TPartialDrainStatus>(std::move(result.value()));
+  }
+
+  if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
+    XLOGF(ERR, "getPartialDrainStatus timed out — Rib evb unresponsive");
+  } else {
+    XLOGF(ERR, "getPartialDrainStatus failed: {}", result.exception().what());
+  }
+  co_return std::make_unique<TPartialDrainStatus>();
+}
+
+folly::coro::Task<std::unique_ptr<TPartialDrainState>>
+BgpServiceDC::co_getPartialDrainState() {
+  auto log = LOG_THRIFT_CALL(DBG2);
+  if (exitInitiated_) {
+    co_return std::make_unique<TPartialDrainState>();
+  }
+
+  if (!continueExecution(true)) {
+    co_return std::make_unique<TPartialDrainState>();
+  }
+  SCOPE_EXIT {
+    decrRequestsInExecution();
+  };
+
+  auto result = co_await co_runOnEvbWithTimeout(
+      rib_.getEventBase(),
+      [this]() { return rib_.getPartialDrainState(); },
+      kRibThriftHandlerTimeout);
+
+  if (result.hasValue()) {
+    co_return std::make_unique<TPartialDrainState>(std::move(result.value()));
+  }
+
+  if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
+    XLOGF(ERR, "getPartialDrainState timed out — Rib evb unresponsive");
+  } else {
+    XLOGF(ERR, "getPartialDrainState failed: {}", result.exception().what());
+  }
+  co_return std::make_unique<TPartialDrainState>();
+}
+
+folly::coro::Task<std::unique_ptr<std::vector<TPartiallyDrainedPrefix>>>
+BgpServiceDC::co_getPartiallyDrainedPrefixes() {
+  auto log = LOG_THRIFT_CALL(DBG2);
+  if (exitInitiated_) {
+    co_return std::make_unique<std::vector<TPartiallyDrainedPrefix>>();
+  }
+
+  if (!continueExecution(true)) {
+    co_return std::make_unique<std::vector<TPartiallyDrainedPrefix>>();
+  }
+  SCOPE_EXIT {
+    decrRequestsInExecution();
+  };
+
+  auto result = co_await co_runOnEvbWithTimeout(
+      rib_.getEventBase(),
+      [this]() { return rib_.getPartiallyDrainedPrefixes(); },
+      kRibThriftHandlerTimeout);
+
+  if (result.hasValue()) {
+    co_return std::make_unique<std::vector<TPartiallyDrainedPrefix>>(
+        std::move(result.value()));
+  }
+
+  if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
+    XLOGF(ERR, "getPartiallyDrainedPrefixes timed out — Rib evb unresponsive");
+  } else {
+    XLOGF(
+        ERR,
+        "getPartiallyDrainedPrefixes failed: {}",
+        result.exception().what());
+  }
+  co_return std::make_unique<std::vector<TPartiallyDrainedPrefix>>();
 }
 
 void BgpServiceDC::addNetwork(
@@ -601,6 +705,179 @@ void BgpServiceDC::delNetworks(std::unique_ptr<std::set<TIpPrefix>> prefixes) {
   }
 
   decrRequestsInExecution();
+}
+
+/**
+ * [Route Filter Policy — FILE_MODE gating]
+ */
+folly::coro::Task<std::unique_ptr<TResult>>
+BgpServiceDC::co_setRouteFilterPolicy(
+    std::unique_ptr<rib_policy::TRouteFilterPolicy> policy) {
+  auto crfLock = co_await crfPolicyMutex_.co_scoped_lock_shared();
+
+  if (ribDC_.isCrfFileModeEnabled()) {
+    XLOGF(WARN, "[CRF] CRF policy is in FILE_MODE, cannot set via Thrift RPC");
+    BgpStats::incrCrfThriftRpcRejected();
+    auto ret = std::make_unique<TResult>();
+    ret->success() = false;
+    ret->err() = "CRF policy is in FILE_MODE, cannot set via Thrift RPC";
+    co_return ret;
+  }
+
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  co_return co_await BgpServiceBase::co_setRouteFilterPolicy(std::move(policy));
+}
+
+folly::coro::Task<void> BgpServiceDC::co_clearRouteFilterPolicy() {
+  auto crfLock = co_await crfPolicyMutex_.co_scoped_lock_shared();
+
+  if (ribDC_.isCrfFileModeEnabled()) {
+    XLOGF(WARN, "[CRF] Cannot clear CRF policy while in FILE_MODE");
+    BgpStats::incrCrfThriftRpcRejected();
+    co_return;
+  }
+
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  co_await BgpServiceBase::co_clearRouteFilterPolicy();
+}
+
+folly::coro::Task<std::unique_ptr<TResult>>
+BgpServiceDC::co_setCrfPolicyFromFile() {
+  auto log = LOG_THRIFT_CALL(DBG2);
+  if (exitInitiated_) {
+    auto ret = std::make_unique<TResult>();
+    ret->success() = false;
+    ret->err() = "Session exits";
+    co_return ret;
+  }
+
+  // Read artifact outside the lock to avoid blocking Thrift CRF RPCs on I/O
+  auto artifact = readThriftArtifactFromFile<rib_policy::CrfPolicyArtifact>(
+      FLAGS_crf_policy_file);
+  if (artifact.hasError()) {
+    /*
+     * Only kError (file present but unreadable/corrupt) is a read failure.
+     * kAbsent (no path configured or file not present) still fails the RPC
+     * below, but is not counted so bgpd.crf.artifact_read.failure keeps one
+     * consistent meaning fleet-wide (genuine read/parse errors only), matching
+     * the startup bootstrap path in RibDC.
+     */
+    if (artifact.error() == ArtifactReadError::kError) {
+      BgpStats::incrCrfArtifactReadFailure();
+    }
+    auto ret = std::make_unique<TResult>();
+    ret->success() = false;
+    ret->err() = "Failed to read CRF policy artifact file";
+    co_return ret;
+  }
+  BgpStats::incrCrfArtifactReadSuccess();
+
+  auto crfLock = co_await crfPolicyMutex_.co_scoped_lock();
+
+  if (exitInitiated_) {
+    auto ret = std::make_unique<TResult>();
+    ret->success() = false;
+    ret->err() = "Session exits";
+    co_return ret;
+  }
+
+  bool fileMode = !*artifact->dryrun();
+
+  if (!fileMode) {
+    /*
+     * Transition to THRIFT_MODE. The previously-applied CRF policy (if any)
+     * remains active in PeerManager and RIB — only the gating flag changes.
+     * Clearing the policy here would cause unnecessary traffic disruption.
+     */
+    ribDC_.setCrfFileModeEnabled(false);
+    auto ret = std::make_unique<TResult>();
+    ret->success() = true;
+    ret->err() =
+        "CRF artifact dryrun=true, staying in THRIFT_MODE (no policy applied)";
+    co_return ret;
+  }
+
+  auto policy = std::make_unique<rib_policy::TRouteFilterPolicy>(
+      std::move(*artifact->policy()));
+
+  neteng::fboss::bgp::thrift::TResult validationResult;
+  auto config = configManager_->getConfig();
+  validatePeerGroupConfigInPolicy(
+      validationResult, *policy, config->getPeerGroups());
+  if (!*validationResult.success()) {
+    XLOGF(
+        ERR,
+        "[CRF] Failed to validate file-based CRF policy. Error: {}",
+        *validationResult.err());
+    BgpStats::incrCrfPolicyAppliedFailure();
+    auto ret = std::make_unique<TResult>();
+    ret->success() = false;
+    ret->err() = *validationResult.err();
+    co_return ret;
+  }
+
+  bool wasFileModeActive = ribDC_.isCrfFileModeEnabled();
+  ribDC_.setCrfFileModeEnabled(true);
+  continueExecution(false);
+  SCOPE_EXIT {
+    decrRequestsInExecution();
+  };
+  try {
+    peerMgr_.setRouteFilterPolicy(
+        std::make_unique<RouteFilterPolicy>(*policy), /*forceUpdate=*/true);
+  } catch (const BgpError& ex) {
+    if (!wasFileModeActive) {
+      ribDC_.setCrfFileModeEnabled(false);
+    }
+    BgpStats::incrCrfPolicyAppliedFailure();
+    auto errorMsg = folly::exceptionStr(ex);
+    XLOGF(ERR, "[CRF] {}", errorMsg);
+    auto ret = std::make_unique<TResult>();
+    ret->success() = false;
+    ret->err() = std::string(errorMsg);
+    co_return ret;
+  } catch (const std::exception& ex) {
+    if (!wasFileModeActive) {
+      ribDC_.setCrfFileModeEnabled(false);
+    }
+    BgpStats::incrCrfPolicyAppliedFailure();
+    auto errorMsg = folly::exceptionStr(ex);
+    XLOGF(ERR, "[CRF] Unexpected error applying CRF policy: {}", errorMsg);
+    auto ret = std::make_unique<TResult>();
+    ret->success() = false;
+    ret->err() = std::string(errorMsg);
+    co_return ret;
+  }
+
+  auto result = co_await co_runOnEvbWithTimeout(
+      rib_.getEventBase(),
+      [this, p = std::move(policy)]() mutable {
+        rib_.setRouteFilterPolicy(std::move(p), /*forceUpdate=*/true);
+      },
+      kRibThriftHandlerTimeout);
+
+  if (result.hasException()) {
+    BgpStats::incrCrfPolicyAppliedFailure();
+    auto ret = std::make_unique<TResult>();
+    ret->success() = false;
+    if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
+      XLOGF(ERR, "[CRF] setCrfPolicyFromFile timed out — Rib evb unresponsive");
+      ret->err() = "Rib evb unresponsive (timeout)";
+    } else {
+      XLOGF(
+          ERR,
+          "[CRF] setCrfPolicyFromFile failed: {}",
+          result.exception().what());
+      ret->err() = std::string(result.exception().what());
+    }
+    co_return ret;
+  }
+
+  BgpStats::incrCrfPolicyAppliedSuccess();
+  auto ret = std::make_unique<TResult>();
+  ret->success() = true;
+  ret->err() = "CRF policy applied from file (FILE_MODE)";
+  co_return ret;
 }
 
 } // namespace facebook::bgp

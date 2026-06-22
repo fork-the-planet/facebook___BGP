@@ -35,7 +35,7 @@ namespace facebook::bgp {
  * Peers with identical UpdateGroupKey values belong to the same update group.
  */
 struct UpdateGroupKey {
-  std::string egressPolicyName;
+  std::optional<std::string> egressPolicyName;
   std::string routeFilterStmtName; /* peer device regex or peer-group name */
   std::chrono::seconds outDelay{0};
   BgpSessionType sessionType{BgpSessionType::EBGP};
@@ -60,7 +60,7 @@ struct UpdateGroupKey {
   size_t hash() const;
 
   static UpdateGroupKey buildUpdateGroupKey(
-      std::string policyName,
+      std::optional<std::string> policyName,
       std::string routeFilterStmtName,
       std::chrono::seconds outDelay,
       BgpSessionType sessionType,

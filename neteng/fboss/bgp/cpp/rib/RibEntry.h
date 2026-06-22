@@ -135,6 +135,31 @@ class RibEntry {
     return installToFib_;
   }
 
+  bool getIsPartialDrain() const {
+    return isPartialDrain_;
+  }
+
+  /*
+   * The configured BGP native min-nexthop threshold that triggered the
+   * current partial-drain state, or 0 when isPartialDrain_ is false or
+   * the trigger was aggregate LBW (use getAggLbwBpsThreshold() in that
+   * case). Captured during selectBestPath() from PathSelectionPolicyResult
+   * so the Thrift accessor can surface it without re-walking the policy.
+   */
+  int32_t getMnhThreshold() const {
+    return mnhThreshold_;
+  }
+
+  /*
+   * The configured aggregate-LBW threshold (bps) that triggered the
+   * current partial-drain state, or 0 when isPartialDrain_ is false or
+   * the trigger was MNH (use getMnhThreshold() in that case). Captured
+   * during selectBestPath() from PathSelectionPolicyResult.
+   */
+  int64_t getAggLbwBpsThreshold() const {
+    return aggLbwBpsThreshold_;
+  }
+
   /**
    * Return aggregate UCMP weight of all ECMP paths. Will be none if any of the
    * ECMP path is missing the UCMP weight community.
@@ -182,10 +207,12 @@ class RibEntry {
          aggregateReceivedUcmpWeight_);
     ret |= (advertisedAggregateLocalUcmpWeight_ != aggregateLocalUcmpWeight_);
     ret |= (advertisedRibPolicyUcmpWeight_ != ribPolicyUcmpWeight_);
+    ret |= (advertisedIsPartialDrain_ != isPartialDrain_);
 
     advertisedAggregateReceivedUcmpWeight_ = aggregateReceivedUcmpWeight_;
     advertisedAggregateLocalUcmpWeight_ = aggregateLocalUcmpWeight_;
     advertisedRibPolicyUcmpWeight_ = ribPolicyUcmpWeight_;
+    advertisedIsPartialDrain_ = isPartialDrain_;
 
     if (!advertisedBestpath_ && !bestpath_) {
       // if old and new bestpaths are nullptr don't bother advertise anything
@@ -225,16 +252,10 @@ class RibEntry {
       std::optional<facebook::bgp::NexthopInfo*> nexthopInfo =
           std::nullopt) noexcept;
 
-  // Select the bestpath for this entry. The return value is used to indicate
-  // if a new bestpath or ECMP nexthops is selected.
-  std::pair<bool, bool> selectBestPath(
-      const std::unique_ptr<RouteInfoSelector>& multipathSelector,
-      const std::unique_ptr<RouteInfoSelector>& bestpathSelector,
-      bool computeUcmp,
-      uint32_t ucmpWidth,
-      std::optional<BgpUcmpQuantizer> quantizer = std::nullopt,
-      const std::unique_ptr<PathSelectionPolicy>& pathSelectionPolicy = nullptr,
-      bool enableRibAllocatedPathId = false) noexcept;
+  // Path selection (selectBestPath + 7 phase helpers + PathSelectionInput /
+  // MultiPathSelectionResult structs) lives on RibBase as static methods
+  // taking RibEntry& by reference, gated by the RibBase friend declaration
+  // below.
 
   // Check if the entry is already on Fib batch processing list by checking
   // if the list hook is linked or not.
@@ -354,6 +375,33 @@ class RibEntry {
   bool isUcmpActive_{false};
 
   /*
+   * Partial drain state — set when drain_on_min_nexthop_violation is active
+   * and a min capacity threshold (MNH or aggregate LBW) is violated. Placed
+   * adjacent to installToFib_ / isUcmpActive_ so all four bools share a
+   * single 8-byte word; this avoids introducing new padding (cost ≈ 0 bytes
+   * per RibEntry vs. 8 bytes if placed elsewhere).
+   */
+  bool isPartialDrain_{false};
+  bool advertisedIsPartialDrain_{false};
+
+  /*
+   * Capacity-threshold values captured at the moment isPartialDrain_ flips
+   * true. Exactly one is non-zero per drain (the active criterion on the
+   * matched policy statement); the other stays 0. Both reset to 0 in
+   * selectBestPath() prior to recompute. Surfaced via
+   * TPartiallyDrainedPrefix.min_capacity (TCapacity union) without
+   * per-prefix policy lookup at RPC time.
+   *
+   * Memory: mnhThreshold_ fills the 4-byte alignment hole between the
+   * partial-drain bool word and uint64_t ribVersion_ below (0 net cost vs.
+   * pre-MNH state). aggLbwBpsThreshold_ adds 8 bytes per RibEntry
+   * (+240MB at 30M routes) — justified by clean LBW threshold surfacing
+   * for FSDB/NSDB consumers downstream.
+   */
+  int32_t mnhThreshold_{0};
+  int64_t aggLbwBpsThreshold_{0};
+
+  /*
    * RIB version when this entry was last updated (best path or multipath
    * change). Used for tracking routing table version per prefix.
    */
@@ -383,8 +431,13 @@ class RibEntry {
       RouteInfo& routeInfo,
       std::optional<facebook::bgp::NexthopInfo*> nexthopInfo);
 
-  // Rib needs to be able to access this list hook for its operation
+  /*
+   * Rib needs to access this list hook for its operation; path-selection
+   * helpers on the rib classes are static methods taking RibEntry& that
+   * read/write RibEntry private state through these friendships.
+   */
   friend class RibBase;
+  friend class RibDC;
 
   // store a free ID interval for this prefix, starting as [minPathId,
   // maxPathId] (inclusive)

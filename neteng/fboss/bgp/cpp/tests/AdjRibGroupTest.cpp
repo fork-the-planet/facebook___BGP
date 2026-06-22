@@ -16,17 +16,20 @@
 
 #include <gtest/gtest.h>
 
-#define AdjRibOutGroup_TEST_FRIENDS            \
-  friend class AdjRibGroupTest;                \
-  friend class AdjRibGroupPackingFixture;      \
-  friend class AdjRibGroupRibOutEntryFixture;  \
-  friend class AdjRibGroupWithdrawalFixture;   \
-  friend class AdjRibGroupDistributionFixture; \
-  friend class AdjRibGroupPolicyFixture;       \
-  friend class AdjRibGroupAddPathFixture;      \
-  FRIEND_TEST(                                 \
-      AdjRibGroupTest,                         \
-      BuildAndSendGroupBgpMessages_EmptyPackingListEmitsRejoinLogs);
+#define AdjRibOutGroup_TEST_FRIENDS                                  \
+  friend class AdjRibGroupTest;                                      \
+  friend class AdjRibGroupPackingFixture;                            \
+  friend class AdjRibGroupRibOutEntryFixture;                        \
+  friend class AdjRibGroupWithdrawalFixture;                         \
+  friend class AdjRibGroupDistributionFixture;                       \
+  friend class AdjRibGroupPolicyFixture;                             \
+  friend class AdjRibGroupAddPathFixture;                            \
+  FRIEND_TEST(                                                       \
+      AdjRibGroupTest,                                               \
+      BuildAndSendGroupBgpMessages_EmptyPackingListEmitsRejoinLogs); \
+  FRIEND_TEST(                                                       \
+      AdjRibGroupPackingFixture,                                     \
+      ProcessRibAnnouncedEntryForGroup_NoEgressPolicyWithPolicyManagerDoesNotCrash);
 
 #include <folly/coro/BlockingWait.h>
 #include <folly/io/async/EventBase.h>
@@ -37,6 +40,8 @@
 #include "neteng/fboss/bgp/cpp/adjrib/AdjRibGroup.h"
 #include "neteng/fboss/bgp/cpp/changeTracker/ChangeTracker.h"
 #include "neteng/fboss/bgp/cpp/changeTracker/ConsumerBitmap.h"
+#include "neteng/fboss/bgp/cpp/common/Consts.h"
+#include "neteng/fboss/bgp/cpp/policy/PolicyManager.h"
 #include "neteng/fboss/bgp/cpp/tests/Utils.h"
 
 namespace facebook::bgp {
@@ -101,9 +106,9 @@ class AdjRibGroupTest : public ::testing::Test {
     adjRibOutGroup_->setChangeListConsumer(changeListConsumer);
   }
 
-  std::shared_ptr<AdjRib> createMinimalAdjRib() {
+  std::shared_ptr<AdjRib> createMinimalAdjRib(uint8_t id = 1) {
     auto peerId = nettools::bgplib::BgpPeerId(
-        folly::IPAddress("10.0.0.1"),
+        folly::IPAddress(fmt::format("10.0.0.{}", id)),
         folly::IPAddressV4("255.0.0.1").toLongHBO());
     return std::make_shared<AdjRib>(
         peerId,
@@ -192,10 +197,9 @@ TEST_F(AdjRibGroupTest, ActivateChangeListConsumer) {
   MockChangeListConsumer();
   auto& messages = subscribeToLogMessages("", folly::LogLevel::DBG2);
 
-  // Activate the consumer
+  // Activate the consumer and schedule the timer
   adjRibOutGroup_->activateChangeListConsumer();
-
-  // The consumer should be registered and the timer should be scheduled
+  adjRibOutGroup_->scheduleConsumeTimer();
   // First loopOnce fires the timer, second runs the coro body
   evb_->loopOnce();
   evb_->loopOnce();
@@ -491,6 +495,70 @@ TEST_F(AdjRibGroupTest, ScheduleInitialDumpOnce) {
 
   // State should remain unchanged
   EXPECT_EQ(adjRibOutGroup_->getState(), stateAfterFirst);
+}
+
+/*
+ * With populated shadowRibEntries_, processRibDumpForGroup walks the shadow
+ * RIB and transitions INIT peers to JOINED_RUNNING with rib version set.
+ */
+TEST_F(AdjRibGroupTest, ScheduleInitialDumpSetsRibVersionOnJoinedPeers) {
+  ShadowRibEntriesMap shadowRibEntries;
+  auto prefix = folly::CIDRNetwork{folly::IPAddress("10.0.0.0"), 24};
+  auto attrs = std::make_shared<BgpPath>(*buildBgpPathFields(1, 1, 0, 0));
+  auto routeInfo = std::make_shared<ShadowRibRouteInfo>(
+      kV4LocalPeerInfo, attrs, /*pathIdToSend=*/0);
+  routeInfo->flags = SHADOWRIBROUTE_IN_UPDATE;
+  ShadowRibEntry srEntry;
+  srEntry.prefix = prefix;
+  srEntry.ribVersion = 42;
+  srEntry.bestpath = routeInfo;
+  auto trackable =
+      std::make_unique<TrackableObject<ShadowRibEntry>>(std::move(srEntry));
+  shadowRibEntries.emplace(prefix, std::move(trackable));
+
+  adjRibOutGroup_ = std::make_shared<AdjRibOutGroup>(
+      *evb_,
+      "test_group",
+      0,
+      true /* enableUpdateGroup */,
+      UpdateGroupKey{},
+      &shadowRibEntries);
+
+  auto adjRib1 = createMinimalAdjRib(1);
+  adjRibOutGroup_->registerPeer(adjRib1);
+  ASSERT_EQ(adjRib1->getPeerState(), PeerUpdateState::INIT);
+
+  adjRibOutGroup_->scheduleInitialDump();
+  evb_->loopOnce();
+
+  EXPECT_EQ(adjRib1->getPeerState(), PeerUpdateState::JOINED_RUNNING);
+  EXPECT_EQ(adjRib1->getLastSeenRibVersion(), 42);
+}
+
+/*
+ * With null shadowRibEntries_, processRibDumpForGroup early-returns with
+ * IDLE state. Peers stay in INIT — no transition or version update.
+ */
+TEST_F(AdjRibGroupTest, ScheduleInitialDumpWithNullShadowRibKeepsPeersInInit) {
+  createAdjRibOutGroup("test_group");
+
+  auto adjRib1 = createMinimalAdjRib(1);
+  adjRibOutGroup_->registerPeer(adjRib1);
+  auto adjRib2 = createMinimalAdjRib(2);
+  adjRibOutGroup_->registerPeer(adjRib2);
+  ASSERT_EQ(adjRib1->getPeerState(), PeerUpdateState::INIT);
+  ASSERT_EQ(adjRib2->getPeerState(), PeerUpdateState::INIT);
+
+  adjRib2->setPeerState(PeerUpdateState::DETACHED_BLOCKED);
+
+  adjRibOutGroup_->scheduleInitialDump();
+  evb_->loopOnce();
+
+  // No shadowRibEntries_ — peers stay in INIT, group goes IDLE
+  EXPECT_EQ(adjRibOutGroup_->getState(), UpdateGroupState::IDLE);
+  EXPECT_EQ(adjRib1->getPeerState(), PeerUpdateState::INIT);
+  EXPECT_EQ(adjRib1->getLastSeenRibVersion(), 0);
+  EXPECT_EQ(adjRib2->getLastSeenRibVersion(), 0);
 }
 
 /**
@@ -874,6 +942,60 @@ TEST_F(
 
   auto prefixPathId = std::make_pair(kV4Prefix1_, kPlaceholderPathID);
   EXPECT_TRUE(attrToPrefixMap.at(attrsWithAfi).contains(prefixPathId));
+}
+
+/*
+ * Regression test: a group with NO egress policy configured (empty
+ * egressPolicyName) but a non-null policyManager_ must not crash while
+ * processing the initial dump.
+ *
+ * UpdateGroupKey::egressPolicyName is a std::string where "" means "no egress
+ * policy", whereas the shared PeerConfig::egressPolicyName is a
+ * std::optional<std::string> where has_value() means "policy configured".
+ * Constructing the optional from an empty string yields optional("") whose
+ * has_value() is true, so updateAttributesOutWithoutNexthopCommon() used to
+ * look up a policy-attributes mask for "" (returning nullptr) and CHECK-fail.
+ * This drives the exact production crash path: buildInitialDumpFromShadowRib ->
+ * ... -> overridePrePolicyAttributesCommon.
+ */
+TEST_F(
+    AdjRibGroupPackingFixture,
+    ProcessRibAnnouncedEntryForGroup_NoEgressPolicyWithPolicyManagerDoesNotCrash) {
+  // Group with both AFIs negotiated and no egress policy name configured.
+  createAdjRibOutGroup("test_group", 42, createDefaultGroupKey());
+  ASSERT_FALSE(adjRibOutGroup_->getGroupKey().egressPolicyName.has_value());
+
+  // Reaching the crashing path requires (1) cached peering params so
+  // updateAttributesOutWithoutNexthop() does not early-return, and (2) a
+  // non-null policy manager so the egress-policy branch is entered. An empty
+  // BgpPolicies yields a policy DB with no entry for "" (mask lookup -> null).
+  adjRibOutGroup_->peeringParams_ = PeeringParams{};
+  adjRibOutGroup_->policyManager_ =
+      std::make_shared<PolicyManager>(bgp_policy::BgpPolicies{});
+
+  RibOutAnnouncementEntry entry(
+      kV4Prefix1_,
+      kDefaultPathID,
+      TinyPeerInfo(
+          folly::IPAddress("1.1.1.1"), 65000, 1, BgpSessionType::EBGP, false),
+      announcementAttrs_,
+      0,
+      0,
+      0,
+      0,
+      0);
+
+  // Pre-fix: aborts via CHECK(mask) in overridePrePolicyAttributesCommon.
+  adjRibOutGroup_->processRibAnnouncedEntryForGroup(entry);
+
+  // Post-fix: the announcement is processed and stored (no policy override
+  // applied because no egress policy is configured).
+  auto groupOwnerKey =
+      AdjRibOutOwnerKey::forGroup(adjRibOutGroup_->getGroupId());
+  auto* adjRibEntry = adjRibOutGroup_->getFromLiteTree(
+      adjRibOutGroup_->LiteTree_, kV4Prefix1_, groupOwnerKey);
+  ASSERT_NE(adjRibEntry, nullptr);
+  EXPECT_NE(adjRibEntry->getPostAttr(), nullptr);
 }
 
 /**
@@ -2036,7 +2158,9 @@ class AdjRibGroupAddPathFixture : public AdjRibGroupTest {
     AdjRibGroupTest::SetUp();
   }
 
-  void createGroupWithAddPath(bool sendAddPath) {
+  void createGroupWithAddPath(
+      bool sendAddPath,
+      const ShadowRibEntriesMap* shadowRibEntries = nullptr) {
     UpdateGroupKey groupKey;
     groupKey.sendAddPath = sendAddPath;
     groupKey.sessionType = BgpSessionType::EBGP;
@@ -2044,7 +2168,12 @@ class AdjRibGroupAddPathFixture : public AdjRibGroupTest {
     groupKey.afiIpv6Negotiated = false;
 
     adjRibOutGroup_ = std::make_shared<AdjRibOutGroup>(
-        *evb_, "test_group", 42, true /* enableUpdateGroup */, groupKey);
+        *evb_,
+        "test_group",
+        42,
+        true /* enableUpdateGroup */,
+        groupKey,
+        shadowRibEntries);
   }
 
   std::shared_ptr<BgpPath> createPath(uint32_t localPref) {
@@ -3644,6 +3773,220 @@ TEST_F(
 
   // Clean up
   adjRibOutGroup_->detachedPeers_.clear();
+}
+
+/*
+ * Add-path SEND drain attach test for AdjRibGroup.
+ *
+ * Mirrors the partial-drain coverage in AdjRibOutUpdateAttributesTest, but
+ * exercises the parallel code path in AdjRibGroup.cpp:1175-1184 (group-level
+ * processRibAnnouncedEntryForGroup):
+ *
+ *     auto prePolicyAttrs = entry.attrs->clone();
+ *     if (entry.isPartialDrain) {
+ *       applyPartialDrainCommunities(prePolicyAttrs);
+ *     }
+ *     ... = getPostOutPolicyAttributesAndInfo(...);
+ *
+ * Because the group fixture has no PolicyManager configured,
+ * getPostOutPolicyAttributesAndInfo is a passthrough — the test isolates
+ * the per-entry drain attach and verifies it survives the policy step (no
+ * future change to the group policy plumbing should strip the drain
+ * community). Multiple add-path entries with distinct path IDs are
+ * processed to lock in that the attach is per-entry, not a one-shot.
+ */
+TEST_F(
+    AdjRibGroupAddPathFixture,
+    PartialDrainCommunityAttachedToAddPathEntries) {
+  createGroupWithAddPath(true /* sendAddPath */);
+
+  const auto prefix = folly::CIDRNetwork{folly::IPAddress("10.0.0.0"), 24};
+  const auto nexthop = folly::IPAddress("1.1.1.1");
+  const TinyPeerInfo peer{nexthop, 65000, 1, BgpSessionType::EBGP, false};
+
+  for (uint32_t pathId : {1U, 2U, 3U}) {
+    auto attrs = std::make_shared<BgpPath>(BgpPathFields());
+    attrs->setLocalPref(100);
+    nettools::bgplib::BgpAttrCommunitiesC seed;
+    seed.push_back(kLiveCommunity);
+    attrs->setCommunities(std::move(seed));
+
+    RibOutAnnouncementEntry update(prefix, pathId, peer, attrs, 0, 0, 0, 0, 0);
+    update.isPartialDrain = true;
+
+    auto* adjRibEntry =
+        adjRibOutGroup_->tryInsertRibOutEntry(prefix, nexthop, pathId);
+    ASSERT_NE(nullptr, adjRibEntry) << "pathIdToSend=" << pathId;
+
+    // Mirror production sequence at AdjRibGroup.cpp:1175-1184.
+    auto prePolicyAttrs = update.attrs->clone();
+    if (update.isPartialDrain) {
+      applyPartialDrainCommunities(prePolicyAttrs);
+    }
+    auto [postAttrs, postPolicyInfo] =
+        adjRibOutGroup_->getPostOutPolicyAttributesAndInfo(
+            update, adjRibEntry, prePolicyAttrs, "test_peer");
+
+    ASSERT_NE(nullptr, postAttrs) << "pathIdToSend=" << pathId;
+    const auto& comms = postAttrs->getCommunities().get();
+    EXPECT_TRUE(hasCommunity(comms, kDrainCommunity))
+        << "pathIdToSend=" << pathId;
+    EXPECT_FALSE(hasCommunity(comms, kLiveCommunity))
+        << "pathIdToSend=" << pathId;
+  }
+}
+
+/*
+ * walkAndProcessShadowRib bestpath test: when the ShadowRib contains a
+ * bestpath with isPartialDrain=true, the initial dump / policy re-eval
+ * path must propagate the flag into the RibOutAnnouncementEntry and
+ * attach the drain community on the group RIB-OUT entry.
+ *
+ * Regression guard for AdjRibGroup.cpp walkAndProcessShadowRib() where
+ * the emplace_back previously defaulted isPartialDrain to false.
+ */
+TEST_F(
+    AdjRibGroupAddPathFixture,
+    WalkAndProcessShadowRib_BestpathPartialDrainAttachesDrainCommunity) {
+  const auto prefix = folly::CIDRNetwork{folly::IPAddress("10.0.0.0"), 24};
+  const TinyPeerInfo peer{
+      folly::IPAddress("1.1.1.1"), 65000, 1, BgpSessionType::EBGP, false};
+
+  auto attrs = std::make_shared<BgpPath>(BgpPathFields());
+  attrs->setLocalPref(100);
+  nettools::bgplib::BgpAttrCommunitiesC seed;
+  seed.push_back(kLiveCommunity);
+  attrs->setCommunities(std::move(seed));
+  attrs->publish();
+
+  auto bestpath = std::make_shared<ShadowRibRouteInfo>(
+      peer, attrs, kDefaultPathID, /*isPartialDrain=*/true);
+  setShadowRibRouteState(bestpath, SHADOWRIBROUTE_IN_UPDATE);
+
+  ShadowRibEntriesMap shadowRibEntries;
+  ShadowRibEntry srEntry(prefix, std::move(bestpath), {});
+  srEntry.ribVersion = 1;
+  shadowRibEntries.emplace(
+      prefix,
+      std::make_unique<TrackableObject<ShadowRibEntry>>(std::move(srEntry)));
+
+  createGroupWithAddPath(false /* sendAddPath */, &shadowRibEntries);
+
+  adjRibOutGroup_->walkAndProcessShadowRib(false /* sendWithEoR */);
+  evb_->loopOnce();
+
+  // sendAddPath=false → entries go into LiteTree, not PathTree
+  auto* adjRibEntry = adjRibOutGroup_->getFromLiteTree(
+      adjRibOutGroup_->LiteTree_, prefix, adjRibOutGroup_->getGroupOwnerKey());
+  ASSERT_NE(nullptr, adjRibEntry);
+  const auto& postAttrs = adjRibEntry->getPostAttr();
+  ASSERT_NE(nullptr, postAttrs);
+  const auto& comms = postAttrs->getCommunities().get();
+  EXPECT_TRUE(hasCommunity(comms, kDrainCommunity));
+  EXPECT_FALSE(hasCommunity(comms, kLiveCommunity));
+}
+
+/*
+ * walkAndProcessShadowRib add-path test: when the ShadowRib contains
+ * multipaths with isPartialDrain=true, every path ID must carry the
+ * drain community through the group initial-dump / re-eval path.
+ */
+TEST_F(
+    AdjRibGroupAddPathFixture,
+    WalkAndProcessShadowRib_AddPathPartialDrainAttachesDrainCommunity) {
+  const auto prefix = folly::CIDRNetwork{folly::IPAddress("10.0.0.0"), 24};
+  const TinyPeerInfo peer{
+      folly::IPAddress("1.1.1.1"), 65000, 1, BgpSessionType::EBGP, false};
+
+  constexpr std::array<uint32_t, 3> kAddPathIds{1, 2, 3};
+
+  ShadowRibRouteInfos multipaths;
+  for (uint32_t pathId : kAddPathIds) {
+    auto attrs = std::make_shared<BgpPath>(BgpPathFields());
+    attrs->setLocalPref(100);
+    nettools::bgplib::BgpAttrCommunitiesC seed;
+    seed.push_back(kLiveCommunity);
+    attrs->setCommunities(std::move(seed));
+    attrs->publish();
+
+    auto path = std::make_shared<ShadowRibRouteInfo>(
+        peer, attrs, pathId, /*isPartialDrain=*/true);
+    setShadowRibRouteState(path, SHADOWRIBROUTE_IN_UPDATE);
+    multipaths.emplace(pathId, std::move(path));
+  }
+
+  ShadowRibEntriesMap shadowRibEntries;
+  ShadowRibEntry srEntry(prefix, /*bestpath=*/nullptr, std::move(multipaths));
+  srEntry.ribVersion = 1;
+  shadowRibEntries.emplace(
+      prefix,
+      std::make_unique<TrackableObject<ShadowRibEntry>>(std::move(srEntry)));
+
+  createGroupWithAddPath(true /* sendAddPath */, &shadowRibEntries);
+
+  adjRibOutGroup_->walkAndProcessShadowRib(false /* sendWithEoR */);
+  evb_->loopOnce();
+
+  for (uint32_t pathId : kAddPathIds) {
+    auto* adjRibEntry = adjRibOutGroup_->getFromPathTree(
+        adjRibOutGroup_->PathTree_,
+        prefix,
+        adjRibOutGroup_->getGroupOwnerKey(),
+        pathId);
+    ASSERT_NE(nullptr, adjRibEntry) << "pathIdToSend=" << pathId;
+    const auto& postAttrs = adjRibEntry->getPostAttr();
+    ASSERT_NE(nullptr, postAttrs) << "pathIdToSend=" << pathId;
+    const auto& comms = postAttrs->getCommunities().get();
+    EXPECT_TRUE(hasCommunity(comms, kDrainCommunity))
+        << "pathIdToSend=" << pathId;
+    EXPECT_FALSE(hasCommunity(comms, kLiveCommunity))
+        << "pathIdToSend=" << pathId;
+  }
+}
+
+/*
+ * Negative test: walkAndProcessShadowRib must NOT attach the drain
+ * community when isPartialDrain is false.
+ */
+TEST_F(
+    AdjRibGroupAddPathFixture,
+    WalkAndProcessShadowRib_NoDrainCommunityWhenNotPartialDrain) {
+  const auto prefix = folly::CIDRNetwork{folly::IPAddress("10.0.0.0"), 24};
+  const TinyPeerInfo peer{
+      folly::IPAddress("1.1.1.1"), 65000, 1, BgpSessionType::EBGP, false};
+
+  auto attrs = std::make_shared<BgpPath>(BgpPathFields());
+  attrs->setLocalPref(100);
+  nettools::bgplib::BgpAttrCommunitiesC seed;
+  seed.push_back(kLiveCommunity);
+  attrs->setCommunities(std::move(seed));
+  attrs->publish();
+
+  auto bestpath = std::make_shared<ShadowRibRouteInfo>(
+      peer, attrs, kDefaultPathID, /*isPartialDrain=*/false);
+  setShadowRibRouteState(bestpath, SHADOWRIBROUTE_IN_UPDATE);
+
+  ShadowRibEntriesMap shadowRibEntries;
+  ShadowRibEntry srEntry(prefix, std::move(bestpath), {});
+  srEntry.ribVersion = 1;
+  shadowRibEntries.emplace(
+      prefix,
+      std::make_unique<TrackableObject<ShadowRibEntry>>(std::move(srEntry)));
+
+  createGroupWithAddPath(false /* sendAddPath */, &shadowRibEntries);
+
+  adjRibOutGroup_->walkAndProcessShadowRib(false /* sendWithEoR */);
+  evb_->loopOnce();
+
+  // sendAddPath=false → entries go into LiteTree
+  auto* adjRibEntry = adjRibOutGroup_->getFromLiteTree(
+      adjRibOutGroup_->LiteTree_, prefix, adjRibOutGroup_->getGroupOwnerKey());
+  ASSERT_NE(nullptr, adjRibEntry);
+  const auto& postAttrs = adjRibEntry->getPostAttr();
+  ASSERT_NE(nullptr, postAttrs);
+  const auto& comms = postAttrs->getCommunities().get();
+  EXPECT_FALSE(hasCommunity(comms, kDrainCommunity));
+  EXPECT_TRUE(hasCommunity(comms, kLiveCommunity));
 }
 
 } // namespace facebook::bgp

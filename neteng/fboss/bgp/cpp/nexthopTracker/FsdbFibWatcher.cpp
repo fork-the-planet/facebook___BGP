@@ -16,6 +16,7 @@
 
 #include "neteng/fboss/bgp/cpp/nexthopTracker/FsdbFibWatcher.h"
 #include <fboss/agent/if/gen-cpp2/FbossCtrlAsyncClient.h>
+#include <fboss/agent/if/gen-cpp2/common_types.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <folly/CancellationToken.h>
@@ -31,11 +32,13 @@ FsdbFibWatcher::FsdbFibWatcher(
     std::shared_ptr<NexthopCache> nexthopCache,
     nettools::bgplib::MonitoredBackPressuredQueue<RibInMessage>& ribInQ,
     folly::EventBase* evb,
-    std::shared_ptr<fboss::fsdb::FsdbCowStateSubManager> fsdbSubMgr)
+    std::shared_ptr<fboss::fsdb::FsdbCowStateSubManager> fsdbSubMgr,
+    std::optional<fboss::ClientID> igpCostClientId)
     : fsdbSubMgr_(std::move(fsdbSubMgr)),
       nexthopCache_(std::move(nexthopCache)),
       ribInQ_(ribInQ),
-      evb_(evb) {}
+      evb_(evb),
+      igpCostClientId_(igpCostClientId) {}
 
 void FsdbFibWatcher::addPeerAddress(const folly::IPAddress& peerAddr) {
   if (pathsAdded_) {
@@ -65,7 +68,10 @@ void FsdbFibWatcher::removePeerAddress(const folly::IPAddress& peerAddr) {
   }
 }
 
-void FsdbFibWatcher::addPaths() noexcept {
+void FsdbFibWatcher::ensureSwitchIds() noexcept {
+  if (!switchIds_.empty()) {
+    return;
+  }
   /**
    * Fetch switch IDs from the FBOSS agent so we subscribe to FIB host
    * routes under every switch ID on the device, not just "0".
@@ -98,39 +104,134 @@ void FsdbFibWatcher::addPaths() noexcept {
         ex.what());
     switchIds_.emplace_back("id=0");
   }
+}
 
+void FsdbFibWatcher::addFsdbPathsForNexthop(const folly::IPAddress& nexthop) {
+  bool isV4 = nexthop.isV4();
+  auto hostPrefix = fmt::format("{}/{}", nexthop.str(), isV4 ? 32 : 128);
   for (const auto& switchId : switchIds_) {
+    /*
+     * Idempotent guard: skip a (switchId, prefix) path already registered with
+     * the sub manager. Without this, a retry after a partial failure (see
+     * addNexthopPaths) would re-add an already-registered path and trip the sub
+     * manager's fatal "Duplicate path added" CHECK. The key is recorded only
+     * after addPath() succeeds, so a throwing addPath leaves the path eligible
+     * for a clean retry.
+     */
+    auto pathKey = fmt::format("{}|{}", switchId, hostPrefix);
+    if (registeredFsdbPaths_.contains(pathKey)) {
+      continue;
+    }
     auto basePath = fsdbStateRootPath_.agent()
                         .switchState()
                         .fibsInfoMap()[switchId]
                         .fibsMap()[kDefaultVrfId];
+    if (isV4) {
+      fsdbSubMgr_->addPath(basePath.fibV4()[hostPrefix]);
+    } else {
+      fsdbSubMgr_->addPath(basePath.fibV6()[hostPrefix]);
+    }
+    registeredFsdbPaths_.insert(pathKey);
+    auto pathTokens = isV4 ? basePath.fibV4()[hostPrefix].tokens()
+                           : basePath.fibV6()[hostPrefix].tokens();
+    XLOGF(
+        INFO,
+        "[FsdbFibWatcher] Added FSDB path: [{}]",
+        fmt::join(pathTokens, "/"));
+  }
+  subscribedPrefixes_.emplace(hostPrefix, std::make_pair(nexthop, isV4));
+}
 
-    for (const auto& peerAddr : subscribedPeers_) {
-      bool isV4 = peerAddr.isV4();
-      auto hostPrefix = fmt::format("{}/{}", peerAddr.str(), isV4 ? 32 : 128);
-      if (isV4) {
-        fsdbSubMgr_->addPath(basePath.fibV4()[hostPrefix]);
-      } else {
-        fsdbSubMgr_->addPath(basePath.fibV6()[hostPrefix]);
-      }
-      subscribedPrefixes_.emplace(hostPrefix, std::make_pair(peerAddr, isV4));
-      auto pathTokens = isV4 ? basePath.fibV4()[hostPrefix].tokens()
-                             : basePath.fibV6()[hostPrefix].tokens();
+void FsdbFibWatcher::addPaths() noexcept {
+  ensureSwitchIds();
+  size_t failed = 0;
+  for (const auto& peerAddr : subscribedPeers_) {
+    /*
+     * Best-effort: addFsdbPathsForNexthop() can throw (e.g. allocation
+     * failure). This method is noexcept, so an escaping exception would
+     * std::terminate the process — catch per-nexthop, log, and keep going so a
+     * single failure cannot crash the daemon nor block the remaining paths.
+     */
+    try {
+      addFsdbPathsForNexthop(peerAddr);
+    } catch (const std::exception& ex) {
+      ++failed;
       XLOGF(
-          INFO,
-          "[FsdbFibWatcher] Added FSDB path: [{}]",
-          fmt::join(pathTokens, "/"));
+          ERR,
+          "[FsdbFibWatcher] Failed to add FSDB paths for {}: {}",
+          peerAddr.str(),
+          ex.what());
     }
   }
-
   pathsAdded_ = true;
 
   XLOGF(
       INFO,
-      "[FsdbFibWatcher] Added {} FSDB paths ({} peers x {} switch IDs)",
-      subscribedPeers_.size() * switchIds_.size(),
+      "[FsdbFibWatcher] Added FSDB paths for {} nexthops x {} switch IDs"
+      " ({} nexthop(s) failed)",
       subscribedPeers_.size(),
-      switchIds_.size());
+      switchIds_.size(),
+      failed);
+}
+
+std::vector<folly::IPAddress> FsdbFibWatcher::filterNewNexthops(
+    const std::vector<folly::IPAddress>& nexthops) const {
+  std::vector<folly::IPAddress> newNexthops;
+  folly::F14FastSet<folly::IPAddress> seen;
+  for (const auto& nh : nexthops) {
+    // Skip nexthops already tracked, and de-dupe within the input.
+    if (subscribedPeers_.count(nh) == 0 && seen.insert(nh).second) {
+      newNexthops.push_back(nh);
+    }
+  }
+  return newNexthops;
+}
+
+void FsdbFibWatcher::addNexthopPaths(
+    const std::vector<folly::IPAddress>& newNexthops) {
+  /**
+   * Register FSDB FIB host-route paths for nexthops learned at runtime (e.g.,
+   * from RIB-IN). The caller MUST stop the shared subscription first (addPath
+   * asserts there is no live subscriber) and re-subscribe the full path set
+   * afterwards.
+   **/
+  ensureSwitchIds();
+  size_t added = 0;
+  for (const auto& nh : newNexthops) {
+    if (subscribedPeers_.count(nh) != 0) {
+      // Already tracked — paths already registered.
+      continue;
+    }
+    /*
+     * Register paths first, then commit to subscribedPeers_ only on success. If
+     * addFsdbPathsForNexthop throws, the nexthop is left OUT of
+     * subscribedPeers_ so filterNewNexthops will surface it again on a future
+     * request (retry) rather than silently skipping it forever.
+     * addFsdbPathsForNexthop is idempotent, so the retry re-adds only the paths
+     * not registered on the failed attempt. The exception is swallowed (logged)
+     * so it can neither crash the process nor abort the remaining nexthops /
+     * the re-subscribe.
+     */
+    try {
+      addFsdbPathsForNexthop(nh);
+      subscribedPeers_.insert(nh);
+      ++added;
+    } catch (const std::exception& ex) {
+      XLOGF(
+          ERR,
+          "[FsdbFibWatcher] Failed to add FSDB paths for nexthop {}: {}"
+          " — will retry on a future request",
+          nh.str(),
+          ex.what());
+    }
+  }
+  if (added > 0) {
+    XLOGF(
+        INFO,
+        "[FsdbFibWatcher] Added {} new nexthop(s) for tracking ({} total)",
+        added,
+        subscribedPeers_.size());
+  }
 }
 
 void FsdbFibWatcher::registerPeers(
@@ -181,7 +282,12 @@ folly::coro::Task<void> FsdbFibWatcher::co_markNeedsReconcile() {
   FsdbStats::setFsdbNhtConnected(0);
   std::vector<NexthopStatus> batchUpdates;
   for (const auto& ip : reachableNexthops_) {
-    batchUpdates.emplace_back(ip, /* isReachable=*/false);
+    batchUpdates.emplace_back(
+        ip,
+        /*isReachable=*/false,
+        /*igpCost=*/std::nullopt,
+        /*isConnected=*/std::nullopt,
+        /*excludeNexthopWithoutCost=*/false);
   }
   reachableNexthops_.clear();
 
@@ -195,6 +301,75 @@ folly::coro::Task<void> FsdbFibWatcher::co_markNeedsReconcile() {
         "[FsdbFibWatcher] co_markNeedsReconcile failed: {}",
         result.exception().what());
   }
+}
+
+std::optional<uint32_t> FsdbFibWatcher::lookupIgpCostFromRoute(
+    const facebook::fboss::state::RouteFields& route,
+    const std::optional<fboss::ClientID>& igpCostClientId) {
+  /*
+   * A FIB route node carries two distinct nexthop sets:
+   *  - nexthopsmulti.client2NextHopEntry: ALL nexthops contributed per source
+   *    protocol/client (e.g. Open/R, TE Agent, BGP). Each client's entry holds
+   *    that protocol's own per-nexthop cost (its IGP metric).
+   *  - fwd: the nexthops the agent actually selected for forwarding, after
+   *    resolving/tie-breaking across all clients (lowest admin distance wins).
+   *
+   * When igpCostClientId is unset, the cost is the minimum over fwd.nexthops[]
+   * (legacy behavior).
+   *
+   * When igpCostClientId is set, the IGP cost is taken SOLELY from that
+   * client's entry: we read the configured client's (e.g. Open/R) nexthops and
+   * return the minimum cost over them.
+   *
+   * NOTE -- no intersection with fwd. We intentionally do NOT intersect the
+   * configured client's nexthops with the resolved fwd nexthops, and we do NOT
+   * check whether the two sets overlap at all. When the flag is set we blindly
+   * trust the configured IGP: the cost comes only from that client's nexthops,
+   * regardless of which nexthops the agent ultimately selected for forwarding.
+   * This is deliberate for the current limited single-IGP (Open/R) use-case --
+   * the fwd nexthops are not consulted for cost, only for the legacy
+   * (flag-unset) path above.
+   *
+   * If the client has no entry (or none of its nexthops carry a cost), the
+   * cost is left unset (nullopt). The route still stays reachable; an unset
+   * cost just means the path takes part in best-path selection without an
+   * IGP-cost preference. During tie-breaking a path that has a cost is
+   * preferred over one that does not (an unset cost is treated as the worst
+   * possible cost, UINT32_MAX).
+   */
+
+  // Minimum cost over a nexthop list (nexthops without a cost are ignored).
+  auto minCost = [](const std::vector<facebook::fboss::NextHopThrift>& nexthops)
+      -> std::optional<uint32_t> {
+    std::optional<uint32_t> result;
+    for (const auto& nh : nexthops) {
+      if (nh.cost().has_value()) {
+        auto cost = static_cast<uint32_t>(*nh.cost());
+        if (!result || cost < *result) {
+          result = cost;
+        }
+      }
+    }
+    return result;
+  };
+
+  // No protocol configured: keep current behavior (min cost over fwd nexthops).
+  if (!igpCostClientId.has_value()) {
+    return minCost(*route.fwd()->nexthops());
+  }
+
+  /*
+   * Protocol configured: read the IGP cost solely from that client's entry,
+   * with no intersection against fwd (see NOTE above). Missing client entry =>
+   * nullopt (route stays reachable, cost unset).
+   */
+  const auto& client2NextHopEntry =
+      *route.nexthopsmulti()->client2NextHopEntry();
+  auto it = client2NextHopEntry.find(*igpCostClientId);
+  if (it == client2NextHopEntry.end()) {
+    return std::nullopt;
+  }
+  return minCost(*it->second.nexthops());
 }
 
 std::pair<bool, std::optional<uint32_t>> FsdbFibWatcher::routeExistsInCowTree(
@@ -267,24 +442,9 @@ std::pair<bool, std::optional<uint32_t>> FsdbFibWatcher::routeExistsInCowTree(
       continue;
     }
     if (mapNode->count(prefixStr) > 0) {
-      std::optional<uint32_t> igpCost;
       const auto& routeNode = mapNode->cref(prefixStr);
-      auto fwdNode = routeNode->template safe_cref<thrift_tags::fwd>();
-      if (fwdNode) {
-        auto nexthopsNode =
-            fwdNode->template safe_cref<thrift_tags::nexthops>();
-        if (nexthopsNode) {
-          for (const auto& nhop : *nexthopsNode) {
-            auto costNode = nhop->template safe_cref<thrift_tags::cost>();
-            if (costNode) {
-              auto cost = static_cast<uint32_t>(costNode->cref());
-              if (!igpCost || cost < *igpCost) {
-                igpCost = cost;
-              }
-            }
-          }
-        }
-      }
+      auto igpCost =
+          lookupIgpCostFromRoute(routeNode->toThrift(), igpCostClientId_);
       XLOGF(
           INFO,
           "[FsdbFibWatcher] routeExists({}): found in switchId={} {}"
@@ -338,7 +498,12 @@ folly::coro::Task<void> FsdbFibWatcher::co_processFibUpdate(
           reachableNexthops_.insert(peerAddr);
           FsdbStats::incrFsdbNhtNexthopReachable();
         }
-        batchUpdates.emplace_back(peerAddr, /*isReachable=*/true, igpCost);
+        batchUpdates.emplace_back(
+            peerAddr,
+            /*isReachable=*/true,
+            igpCost,
+            /*isConnected=*/std::nullopt,
+            /*excludeNexthopWithoutCost=*/false);
         XLOGF(
             INFO,
             "[FsdbFibWatcher] Nexthop {}: {} igpCost={}",
@@ -351,7 +516,11 @@ folly::coro::Task<void> FsdbFibWatcher::co_processFibUpdate(
           FsdbStats::incrFsdbNhtNexthopUnreachable();
         }
         batchUpdates.emplace_back(
-            peerAddr, /*isReachable=*/false, std::nullopt);
+            peerAddr,
+            /*isReachable=*/false,
+            /*igpCost=*/std::nullopt,
+            /*isConnected=*/std::nullopt,
+            /*excludeNexthopWithoutCost=*/false);
         XLOGF(
             INFO,
             "[FsdbFibWatcher] Nexthop unreachable: {} igpCost=none",

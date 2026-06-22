@@ -38,6 +38,17 @@ namespace bgp {
 TEST_P(UpdateGroupPeerDownTest, PeerDownFromInit) {
   XLOG(INFO, "=== TEST: PeerDownFromInit ===");
 
+  /*
+   * This test brings the peer down before it ever sends an EoR, so peer
+   * manager initialization can only complete when the EoR convergence timer
+   * expires. Shorten that timer (default 45s) so the peer reaches DOWN
+   * promptly; the test asserts only the DOWN transition and clean shutdown,
+   * with no timing dependency, so the outcome is identical. Must be set before
+   * getConfig() runs (i.e. before setupSlowPeerComponents creates the peer
+   * manager).
+   */
+  setEorTimeSeconds(2);
+
   addPeer(kDefaultPeerSpec3);
   addLocalRoute("30.1.0.0/16", {"3001:1"}, 100);
 

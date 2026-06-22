@@ -41,6 +41,31 @@
 #define MockRib_TEST_FRIENDS \
   FRIEND_TEST(RibFsdbAddPathTestSuite, ReplacePathSelectionPolicyTest);
 
+/*
+ * pathSelectionPolicy_ moved from RibBase to RibDC in diff 9/10. Tests that
+ * access the field directly need RibDC friend access too.
+ */
+#define RibDC_TEST_FRIENDS                                                     \
+  friend class RibFixtureAddPathTestSuite;                                     \
+  friend class RibFsdbFixture;                                                 \
+  FRIEND_TEST(RibFixtureAddPathTestSuite, PathSelectionReadOnlyTest);          \
+  FRIEND_TEST(RibFixtureAddPathTestSuite, PathSelectionIdenticalPolicyTest);   \
+  FRIEND_TEST(RibFixtureAddPathTestSuite, PathSelectionReplaceTest);           \
+  FRIEND_TEST(RibFixtureAddPathTestSuite, PathSelectionExpirationTest);        \
+  FRIEND_TEST(RibFixtureAddPathTestSuite, PathSelectionMultipleUpdateTest);    \
+  FRIEND_TEST(RibFixtureAddPathTestSuite, PathSelectionClearTest);             \
+  FRIEND_TEST(                                                                 \
+      RibFixtureAddPathTestSuite,                                              \
+      PathSelectionRollOutBackTestRelaxDefaultMNH);                            \
+  FRIEND_TEST(RibFixtureAddPathTestSuite, PathSelectionRollOutBackTest);       \
+  FRIEND_TEST(RibFixtureAddPathTestSuite, PathSelectionMinAggLbwbpsRelaxTest); \
+  FRIEND_TEST(RibFixtureAddPathTestSuite, PathSelectionMinAggLbwbpsTest);      \
+  FRIEND_TEST(                                                                 \
+      RibFixtureAddPathTestSuite, PathSelectionMinAggLbwbpsMissingLbwTest);    \
+  FRIEND_TEST(RibFixtureAddPathTestSuite, AnnouncementTest);                   \
+  FRIEND_TEST(RibFixtureAddPathTestSuite, SetGetClearPathSelectionPolicyTest); \
+  FRIEND_TEST(RibFsdbAddPathTestSuite, ReplacePathSelectionPolicyTest);
+
 #include "configerator/structs/neteng/bgp_policy/thrift/gen-cpp2/rib_policy_types.h"
 #include "fboss/lib/CommonUtils.h"
 #include "neteng/fboss/bgp/cpp/BgpServiceUtil.h"
@@ -536,8 +561,15 @@ TEST_P(
     EXPECT_EQ(*item.bgp_native_path_selection_min_nexthop(), 3);
   }
 
-  // Expect no announcement
-  EXPECT_TRUE(ribOutQ_.empty());
+  // With partial drain, bestpath is retained and announced
+  WITH_RETRIES({ ASSERT_EVENTUALLY_GE(ribOutQ_.size(), 1); });
+  {
+    auto msg = folly::coro::blockingWait(ribOutQ_.pop());
+    ASSERT_TRUE(std::holds_alternative<RibOutAnnouncement>(msg));
+    auto announcement = std::get<RibOutAnnouncement>(msg);
+    ASSERT_EQ(1, announcement.entries.size());
+    EXPECT_EQ(kDefaultPathID, announcement.entries[0].pathIdToSend);
+  }
 
   // - same route got updated with 3 more nexthops -> expect announcement
   ribFuture = rib_->getRibPrepareFibProgrammingFuture();
@@ -558,7 +590,7 @@ TEST_P(
     EXPECT_EQ(kDefaultPathID, announcement.entries[0].pathIdToSend);
   }
 
-  // - same route dropped 3 nexthops -> expect withdrawal from peers
+  // - same route dropped 3 nexthops -> back to partial drain
   ribFuture = rib_->getRibPrepareFibProgrammingFuture();
   sendWithdrawal(prefixBatch, eBgpPeer3_);
   sendWithdrawal(prefixBatch, eBgpPeer4_);
@@ -568,17 +600,18 @@ TEST_P(
   // back to two paths
   EXPECT_EQ(2, ribEntry.getMultipaths().size());
 
-  // Expect withdrawl from peers
+  // With partial drain, bestpath is retained — re-announcement, not withdrawal
+  WITH_RETRIES({ ASSERT_EVENTUALLY_GE(ribOutQ_.size(), 1); });
   {
     auto msg = folly::coro::blockingWait(ribOutQ_.pop());
-    ASSERT_TRUE(std::holds_alternative<RibOutWithdrawal>(msg));
-    auto withdrawal = std::get<RibOutWithdrawal>(msg);
-    ASSERT_EQ(1, withdrawal.entries.size());
-    EXPECT_EQ(kDefaultPathID, withdrawal.entries[0].pathIdToSend);
+    ASSERT_TRUE(std::holds_alternative<RibOutAnnouncement>(msg));
+    auto announcement = std::get<RibOutAnnouncement>(msg);
+    ASSERT_EQ(1, announcement.entries.size());
+    EXPECT_EQ(kDefaultPathID, announcement.entries[0].pathIdToSend);
   }
 
   // CPS roll back case:
-  // - clear rib-policy -> expect announcement to peers
+  // - clear rib-policy -> expect announcement to peers (drain → normal)
   ribFuture = rib_->getRibPrepareFibProgrammingFuture();
   rib_->clearRibPolicy();
   rib_->waitForRibPolicyClear();
@@ -586,11 +619,9 @@ TEST_P(
 
   // no change to multipaths
   EXPECT_EQ(2, ribEntry.getMultipaths().size());
+  EXPECT_FALSE(ribEntry.getIsPartialDrain());
 
-  // no change to FIB
-  EXPECT_EQ(1, rib_->fibItems.size());
-
-  // expect announcement to peers
+  WITH_RETRIES({ ASSERT_EVENTUALLY_GE(ribOutQ_.size(), 1); });
   {
     auto msg = folly::coro::blockingWait(ribOutQ_.pop());
     ASSERT_TRUE(std::holds_alternative<RibOutAnnouncement>(msg));
@@ -609,13 +640,14 @@ TEST_P(
 
   EXPECT_EQ(2, ribEntry.getMultipaths().size());
 
-  // Expect withdrawl from peers
+  // With partial drain, bestpath is retained — re-announcement, not withdrawal
+  WITH_RETRIES({ ASSERT_EVENTUALLY_GE(ribOutQ_.size(), 1); });
   {
     auto msg = folly::coro::blockingWait(ribOutQ_.pop());
-    ASSERT_TRUE(std::holds_alternative<RibOutWithdrawal>(msg));
-    auto withdrawal = std::get<RibOutWithdrawal>(msg);
-    ASSERT_EQ(1, withdrawal.entries.size());
-    EXPECT_EQ(kDefaultPathID, withdrawal.entries[0].pathIdToSend);
+    ASSERT_TRUE(std::holds_alternative<RibOutAnnouncement>(msg));
+    auto announcement = std::get<RibOutAnnouncement>(msg);
+    ASSERT_EQ(1, announcement.entries.size());
+    EXPECT_EQ(kDefaultPathID, announcement.entries[0].pathIdToSend);
   }
 
   // - clear MNH -> expect announcement to peers
@@ -628,9 +660,8 @@ TEST_P(
 
   EXPECT_EQ(2, ribEntry.getMultipaths().size());
 
-  EXPECT_EQ(1, rib_->fibItems.size());
-
   // expect announcement to peers
+  WITH_RETRIES({ ASSERT_EVENTUALLY_GE(ribOutQ_.size(), 1); });
   {
     auto msg = folly::coro::blockingWait(ribOutQ_.pop());
     ASSERT_TRUE(std::holds_alternative<RibOutAnnouncement>(msg));

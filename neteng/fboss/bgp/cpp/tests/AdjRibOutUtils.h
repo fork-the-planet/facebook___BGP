@@ -26,6 +26,7 @@
 #include "neteng/fboss/bgp/cpp/config/ConfigManager.h"
 #include "neteng/fboss/bgp/cpp/lib/coro/BackPressuredQueue.h"
 #include "neteng/fboss/bgp/cpp/policy/PolicyManager.h"
+#include "neteng/fboss/bgp/cpp/tests/BoundedWaitUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/PolicyUtils.h"
 #include "neteng/fboss/bgp/if/gen-cpp2/bgp_thrift_types.h"
 
@@ -124,9 +125,14 @@ class AdjRibOutboundFixture : public ::testing::Test {
   folly::coro::Task<
       std::optional<nettools::bgplib::FiberBgpPeer::InputMessageT>>
   popFromEgressQueue() {
+    /*
+     * Bounded — a never-arriving message fails the test with a clear
+     * BoundedWaitTimeout instead of hanging.
+     */
     auto msg = FLAGS_enable_egress_backpressure_in_adjribout_tests
-        ? co_await boundedAdjRibOutQ_->pop()
-        : co_await adjRibOutQ_->pop();
+        ? co_await facebook::bgp::test::boundedPop(
+              *boundedAdjRibOutQ_, "boundedAdjRibOutQ_")
+        : co_await facebook::bgp::test::boundedPop(*adjRibOutQ_, "adjRibOutQ_");
     co_return msg;
   }
 

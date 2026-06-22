@@ -538,5 +538,65 @@ TEST_F(AdjRibCachedVersionE2ETest, MultiplePeersAtDifferentVersions) {
   EXPECT_GT(peer5CachedVersion, peer4CachedVersion);
 }
 
+/*
+ * Test: After rib dump, peer's cached version matches RIB version.
+ *
+ * Verifies that processRibDumpReq propagates ribVersion from the ShadowRib
+ * entries to the peer's AdjRib (via setLastSeenRibVersion).
+ *
+ * Steps:
+ * 1. Bring up both peers, complete initialization (no 45s EoR timer wait)
+ * 2. Inject routes via peer3, verify RIB version
+ * 3. Verify peer4 receives routes via change list (normal flow)
+ * 4. Tear down peer4
+ * 5. Bring up peer4 again — arrives after init, triggers rib dump
+ * 6. Assert peer4's cachedRibVersion == RIB version
+ */
+TEST_F(AdjRibCachedVersionE2ETest, RibDumpSetsCorrectCachedVersion) {
+  addPeer(kDefaultPeerSpec3_v4only);
+  addPeer(kDefaultPeerSpec4_v4only);
+
+  createRib(false /* enableNexthopTracking */);
+  setDefaultQueueSizes(100 /* capacity */, 80 /* highWm */, 20 /* lowWm */);
+  createPeerManager(
+      false /* enableUpdateGroup */, true /* enableEgressBackpressure */);
+
+  bringUpPeer(kPeerAddr3);
+  bringUpPeer(kPeerAddr4);
+
+  BgpPeerId peerId3{kPeerAddr3, kPeerAddr3.asV4().toLongHBO()};
+  BgpPeerId peerId4{kPeerAddr4, kPeerAddr4.asV4().toLongHBO()};
+
+  /* Consume EoR from peer4 to complete initialization */
+  EXPECT_TRUE(waitForEoR(peerId4));
+
+  /* Inject routes from peer3 */
+  addRoute("v4", "10.0.1.0", 24, kPeerAddr3, kNextHopV4_3.str());
+  addRoute("v4", "10.0.2.0", 24, kPeerAddr3, kNextHopV4_3.str());
+  addRoute("v4", "10.0.3.0", 24, kPeerAddr3, kNextHopV4_3.str());
+
+  /*
+   * Routes with the same attributes are batched into a single UPDATE.
+   * Verify one route arrives; the rest are in the same message.
+   */
+  EXPECT_TRUE(
+      verifyRouteAdd("v4", "10.0.1.0", 24, kPeerAddr4, kNextHopV4_4.str()));
+
+  uint64_t ribVersion = getRibVersion();
+  EXPECT_EQ(ribVersion, 3);
+
+  /* Tear down peer4 and bring it back up — triggers rib dump */
+  bringDownPeer(kPeerAddr4);
+  bringUpPeer(kPeerAddr4);
+
+  /*
+   * Wait for peer4's cached version to reach the RIB version.
+   * This confirms the rib dump completed and ribVersion was propagated
+   * from ShadowRibEntry to the peer's AdjRib.
+   */
+  EXPECT_TRUE(waitForPeerCachedVersion(kPeerAddr4, ribVersion));
+  EXPECT_EQ(getPeerCachedRibVersion(kPeerAddr4), ribVersion);
+}
+
 } // namespace bgp
 } // namespace facebook

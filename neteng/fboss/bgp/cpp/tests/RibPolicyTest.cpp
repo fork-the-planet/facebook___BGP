@@ -53,6 +53,8 @@
 #include "neteng/fboss/bgp/cpp/BgpServiceUtil.h"
 #include "neteng/fboss/bgp/cpp/common/RouteInfo.h"
 #include "neteng/fboss/bgp/cpp/common/Utils.h"
+#include "neteng/fboss/bgp/cpp/rib/RibBase.h"
+#include "neteng/fboss/bgp/cpp/rib/RibDC.h"
 #include "neteng/fboss/bgp/cpp/rib/RibEntry.h"
 #include "neteng/fboss/bgp/cpp/rib/RibPolicy.h"
 #include "neteng/fboss/bgp/cpp/tests/PolicyUtils.h"
@@ -2021,6 +2023,597 @@ TEST_F(RibPolicyFixture, SelectPathDefaultMinNexthopRelaxTest) {
   EXPECT_EQ(3, *selectors[0].bgp_native_path_selection_min_nexthop());
 }
 
+TEST_F(RibPolicyFixture, PartialDrainOutcomeSetOnMnhViolation) {
+  auto tMatcher = createCommunityMatch(200, 666, bgp_policy::Origin::EGP);
+  auto tPathSelector = createTPathSlectorWithOneMatcher(tMatcher, 2, 3);
+  tPathSelector.drain_on_min_nexthop_violation() = true;
+
+  RibPolicy policy{
+      createTRibPolicyWithPathSelector({kV4Prefix1}, tPathSelector)};
+
+  policy.getPathSelectionPolicy()->overrideMultipathSelection(
+      *ribEntry_, pathsToOverride_, multipathSelector);
+
+  auto result = policy.getPathSelectionPolicy()->getPathSelectionPolicyResult(
+      ribEntry_->getPrefix());
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(
+      result->outcome,
+      PathSelectionPolicyResult::Outcome::BGP_FAILED_CPS_MIN_NEXTHOP);
+  EXPECT_TRUE(result->drainOnMinCapacityThresholdViolation);
+}
+
+TEST_F(RibPolicyFixture, StrictMnhOutcomeWhenPartialDrainDisabled) {
+  auto tMatcher = createCommunityMatch(200, 666, bgp_policy::Origin::EGP);
+  auto tPathSelector = createTPathSlectorWithOneMatcher(tMatcher, 2, 3);
+  // drain_on_min_nexthop_violation NOT set (defaults to false)
+
+  RibPolicy policy{
+      createTRibPolicyWithPathSelector({kV4Prefix1}, tPathSelector)};
+
+  auto overriddenPaths =
+      policy.getPathSelectionPolicy()->overrideMultipathSelection(
+          *ribEntry_, pathsToOverride_, multipathSelector);
+
+  EXPECT_EQ(overriddenPaths.size(), 0);
+
+  auto result = policy.getPathSelectionPolicy()->getPathSelectionPolicyResult(
+      ribEntry_->getPrefix());
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(
+      result->outcome,
+      PathSelectionPolicyResult::Outcome::BGP_FAILED_CPS_MIN_NEXTHOP);
+}
+
+TEST_F(RibPolicyFixture, PartialDrainRetainsBestpath) {
+  auto tMatcher = createCommunityMatch(200, 666, bgp_policy::Origin::EGP);
+  auto tPathSelector = createTPathSlectorWithOneMatcher(tMatcher, 2, 3);
+  tPathSelector.drain_on_min_nexthop_violation() = true;
+
+  auto policy = std::make_unique<PathSelectionPolicy>(
+      createTPathSelectionPolicyWithPathSelector({kV4Prefix1}, tPathSelector));
+
+  bool bestpathChanged, multipathChanged;
+  std::tie(bestpathChanged, multipathChanged) = RibDC::selectBestPath(
+      *ribEntry_,
+
+      multipathSelector,
+      bestpathSelector,
+      false,
+      0,
+      std::nullopt,
+      policy);
+
+  EXPECT_NE(ribEntry_->getBestPath(), nullptr);
+  EXPECT_TRUE(ribEntry_->getInstallToFib());
+  EXPECT_TRUE(ribEntry_->getIsPartialDrain());
+}
+
+TEST_F(RibPolicyFixture, StrictMnhNullifiesBestpath) {
+  auto tMatcher = createCommunityMatch(200, 666, bgp_policy::Origin::EGP);
+  auto tPathSelector = createTPathSlectorWithOneMatcher(tMatcher, 2, 3);
+  // drain_on_min_nexthop_violation NOT set
+
+  auto policy = std::make_unique<PathSelectionPolicy>(
+      createTPathSelectionPolicyWithPathSelector({kV4Prefix1}, tPathSelector));
+
+  bool bestpathChanged, multipathChanged;
+  std::tie(bestpathChanged, multipathChanged) = RibDC::selectBestPath(
+      *ribEntry_,
+
+      multipathSelector,
+      bestpathSelector,
+      false,
+      0,
+      std::nullopt,
+      policy);
+
+  EXPECT_EQ(ribEntry_->getBestPath(), nullptr);
+}
+
+TEST_F(RibPolicyFixture, NoPartialDrainWhenMnhSatisfied) {
+  auto tMatcher = createCommunityMatch(200, 666, bgp_policy::Origin::EGP);
+  // MNH threshold = 1, we have 1 path → satisfied
+  auto tPathSelector = createTPathSlectorWithOneMatcher(tMatcher, 2, 1);
+  tPathSelector.drain_on_min_nexthop_violation() = true;
+
+  RibPolicy policy{
+      createTRibPolicyWithPathSelector({kV4Prefix1}, tPathSelector)};
+
+  policy.getPathSelectionPolicy()->overrideMultipathSelection(
+      *ribEntry_, pathsToOverride_, multipathSelector);
+
+  auto result = policy.getPathSelectionPolicy()->getPathSelectionPolicyResult(
+      ribEntry_->getPrefix());
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->outcome, PathSelectionPolicyResult::Outcome::BGP);
+}
+
+TEST_F(RibPolicyFixture, PartialDrainToStrictMnhRollback) {
+  auto tMatcher = createCommunityMatch(200, 666, bgp_policy::Origin::EGP);
+  auto tPathSelector = createTPathSlectorWithOneMatcher(tMatcher, 2, 3);
+  tPathSelector.drain_on_min_nexthop_violation() = true;
+
+  auto drainPolicy = std::make_unique<PathSelectionPolicy>(
+      createTPathSelectionPolicyWithPathSelector({kV4Prefix1}, tPathSelector));
+
+  bool bestpathChanged, multipathChanged;
+  std::tie(bestpathChanged, multipathChanged) = RibDC::selectBestPath(
+      *ribEntry_,
+
+      multipathSelector,
+      bestpathSelector,
+      false,
+      0,
+      std::nullopt,
+      drainPolicy);
+
+  EXPECT_NE(ribEntry_->getBestPath(), nullptr);
+  EXPECT_TRUE(ribEntry_->getIsPartialDrain());
+
+  auto tPathSelectorStrict = createTPathSlectorWithOneMatcher(tMatcher, 2, 3);
+
+  auto strictPolicy = std::make_unique<PathSelectionPolicy>(
+      createTPathSelectionPolicyWithPathSelector(
+          {kV4Prefix1}, tPathSelectorStrict));
+
+  std::tie(bestpathChanged, multipathChanged) = RibDC::selectBestPath(
+      *ribEntry_,
+
+      multipathSelector,
+      bestpathSelector,
+      false,
+      0,
+      std::nullopt,
+      strictPolicy);
+
+  EXPECT_TRUE(bestpathChanged);
+  EXPECT_EQ(ribEntry_->getBestPath(), nullptr);
+  EXPECT_FALSE(ribEntry_->getIsPartialDrain());
+}
+
+TEST_F(RibPolicyFixture, StrictMnhToPartialDrainRollout) {
+  auto tMatcher = createCommunityMatch(200, 666, bgp_policy::Origin::EGP);
+  auto tPathSelector = createTPathSlectorWithOneMatcher(tMatcher, 2, 3);
+
+  auto strictPolicy = std::make_unique<PathSelectionPolicy>(
+      createTPathSelectionPolicyWithPathSelector({kV4Prefix1}, tPathSelector));
+
+  bool bestpathChanged, multipathChanged;
+  std::tie(bestpathChanged, multipathChanged) = RibDC::selectBestPath(
+      *ribEntry_,
+
+      multipathSelector,
+      bestpathSelector,
+      false,
+      0,
+      std::nullopt,
+      strictPolicy);
+
+  EXPECT_EQ(ribEntry_->getBestPath(), nullptr);
+  EXPECT_FALSE(ribEntry_->getIsPartialDrain());
+
+  auto tPathSelectorDrain = createTPathSlectorWithOneMatcher(tMatcher, 2, 3);
+  tPathSelectorDrain.drain_on_min_nexthop_violation() = true;
+
+  auto drainPolicy = std::make_unique<PathSelectionPolicy>(
+      createTPathSelectionPolicyWithPathSelector(
+          {kV4Prefix1}, tPathSelectorDrain));
+
+  std::tie(bestpathChanged, multipathChanged) = RibDC::selectBestPath(
+      *ribEntry_,
+
+      multipathSelector,
+      bestpathSelector,
+      false,
+      0,
+      std::nullopt,
+      drainPolicy);
+
+  EXPECT_TRUE(bestpathChanged);
+  EXPECT_NE(ribEntry_->getBestPath(), nullptr);
+  EXPECT_TRUE(ribEntry_->getInstallToFib());
+  EXPECT_TRUE(ribEntry_->getIsPartialDrain());
+}
+
+// PathSelectionPolicy caches one PathSelectionPolicyResult per prefix
+// (PathSelectionPolicy::pathSelectionResults_) and reuses it across calls.
+// PathSelector::overrideMultipathSelection must reset transition fields on
+// every entry so a previous "drain triggered" call cannot leak
+// drainOnMinCapacityThresholdViolation=true into a subsequent call that exits
+// via the centralized-criteria-matched early return — otherwise RibEntry would
+// spuriously activate partial drain even when the prefix is healthy via CPS.
+TEST_F(
+    RibPolicyFixture,
+    PathSelectorResetsDrainOnMinCapacityThresholdViolationOnReuse) {
+  auto tMatcher = createCommunityMatch(200, 666, bgp_policy::Origin::EGP);
+  auto tPathSelector = createTPathSlectorWithOneMatcher(tMatcher, 2, 3);
+  tPathSelector.drain_on_min_nexthop_violation() = true;
+
+  PathSelector pathSelector(tPathSelector);
+  PathSelectionPolicyResult result("stmt1");
+
+  // Phase 1: only attr1 (community 200,666) matches the centralized matcher.
+  // 1 < criteriaMinNexthop=2 -> centralized criteria returns empty -> falls
+  // through to default selector. 2 paths < defaultMinNexthop=3 ->
+  // BGP_FAILED_CPS_MIN_NEXTHOP with drain enabled.
+  pathSelector.overrideMultipathSelection(
+      pathsToOverride_, multipathSelector, result);
+  EXPECT_EQ(
+      result.outcome,
+      PathSelectionPolicyResult::Outcome::BGP_FAILED_CPS_MIN_NEXTHOP);
+  EXPECT_TRUE(result.drainOnMinCapacityThresholdViolation);
+  // Threshold captured alongside the drain flag; downstream RibEntry copies
+  // this into mnhThreshold_ for the Thrift accessor to surface. LBW
+  // threshold remains 0 because this is the MNH-violation branch.
+  EXPECT_EQ(3, result.mnhThreshold);
+  EXPECT_EQ(0, result.aggLbwBpsThreshold);
+
+  // Phase 2: feed a path set where the centralized criteria succeeds, taking
+  // the early-return branch at the top of overrideMultipathSelection. Find
+  // the path with the matching community and present it twice so the
+  // criteria's minNexthop=2 is satisfied.
+  std::shared_ptr<RouteInfo> matchingPath;
+  for (const auto& p : pathsToOverride_) {
+    if (p->attrs->getNexthop() == kV4Nexthop1) {
+      matchingPath = p;
+      break;
+    }
+  }
+  ASSERT_NE(matchingPath, nullptr);
+  std::vector<std::shared_ptr<RouteInfo>> matchingPaths{
+      matchingPath, matchingPath};
+
+  pathSelector.overrideMultipathSelection(
+      matchingPaths, multipathSelector, result);
+
+  EXPECT_EQ(result.outcome, PathSelectionPolicyResult::Outcome::CPS);
+  // Without the reset at the top of overrideMultipathSelection, the cached
+  // values from phase 1 leak through and these assertions fail.
+  EXPECT_FALSE(result.drainOnMinCapacityThresholdViolation);
+  EXPECT_EQ(0, result.mnhThreshold);
+  EXPECT_EQ(0, result.aggLbwBpsThreshold);
+}
+
+/*
+ * LBW partial drain coverage. Mirrors the MNH partial drain tests above:
+ * `drain_on_min_nexthop_violation` (renamed in C++ to
+ * drainOnMinCapacityThresholdViolation) gates partial drain for both MNH and
+ * aggregate-LBW threshold violations. attr1 has 800 GBps LBW; the tests pick
+ * an aggregate threshold above 800 GBps to force a violation.
+ */
+TEST_F(RibPolicyFixture, PartialDrainOutcomeSetOnLbwViolation) {
+  // Use only attr1 (community 200,666, 800 GBps LBW) so the LBW check has a
+  // path with a concrete LBW value (path2 has no LBW and would short-circuit
+  // the aggregate check to a healthy BGP outcome).
+  std::shared_ptr<RouteInfo> pathWithLbw;
+  for (const auto& p : pathsToOverride_) {
+    if (p->attrs->getNexthop() == kV4Nexthop1) {
+      pathWithLbw = p;
+      break;
+    }
+  }
+  ASSERT_NE(pathWithLbw, nullptr);
+
+  // criteriaMinNextHop=2 forces fall-through to the default selector
+  // (1 matching path < 2). bgpNativeMinAggLbwbps=1000 GBps is above the
+  // 800 GBps available, triggering the LBW threshold violation.
+  auto tMatcher = createCommunityMatch(200, 666, bgp_policy::Origin::EGP);
+  auto tPathSelector = createTPathSlectorWithOneMatcher(
+      tMatcher,
+      /*criteriaMinNextHop=*/2,
+      /*defaultMinNextHop=*/std::nullopt,
+      /*defaultMinAggLbwbps=*/(int64_t)1000 * BpsPerGBps,
+      /*relaxMinAggLbwbps=*/std::nullopt);
+  tPathSelector.drain_on_min_nexthop_violation() = true;
+
+  PathSelector pathSelector(tPathSelector);
+  PathSelectionPolicyResult result("stmt1");
+
+  auto multipaths = pathSelector.overrideMultipathSelection(
+      {pathWithLbw}, multipathSelector, result);
+  EXPECT_EQ(
+      result.outcome,
+      PathSelectionPolicyResult::Outcome::BGP_FAILED_CPS_MIN_AGG_LBW);
+  EXPECT_TRUE(result.drainOnMinCapacityThresholdViolation);
+  // LBW threshold captured on this branch; mnhThreshold remains 0 so the
+  // RibDC union-build at RPC time emits TMinCapacityThreshold.agg_lbw_bps
+  // rather than .mnh.
+  EXPECT_EQ(static_cast<int64_t>(1000) * BpsPerGBps, result.aggLbwBpsThreshold);
+  EXPECT_EQ(0, result.mnhThreshold);
+  EXPECT_EQ(multipaths.size(), 1);
+}
+
+TEST_F(RibPolicyFixture, StrictLbwOutcomeWhenPartialDrainDisabled) {
+  std::shared_ptr<RouteInfo> pathWithLbw;
+  for (const auto& p : pathsToOverride_) {
+    if (p->attrs->getNexthop() == kV4Nexthop1) {
+      pathWithLbw = p;
+      break;
+    }
+  }
+  ASSERT_NE(pathWithLbw, nullptr);
+
+  // drain_on_min_nexthop_violation NOT set (defaults to false)
+  auto tMatcher = createCommunityMatch(200, 666, bgp_policy::Origin::EGP);
+  auto tPathSelector = createTPathSlectorWithOneMatcher(
+      tMatcher,
+      /*criteriaMinNextHop=*/2,
+      /*defaultMinNextHop=*/std::nullopt,
+      /*defaultMinAggLbwbps=*/(int64_t)1000 * BpsPerGBps,
+      /*relaxMinAggLbwbps=*/std::nullopt);
+
+  PathSelector pathSelector(tPathSelector);
+  PathSelectionPolicyResult result("stmt1");
+
+  auto multipaths = pathSelector.overrideMultipathSelection(
+      {pathWithLbw}, multipathSelector, result);
+  EXPECT_EQ(
+      result.outcome,
+      PathSelectionPolicyResult::Outcome::BGP_FAILED_CPS_MIN_AGG_LBW);
+  EXPECT_FALSE(result.drainOnMinCapacityThresholdViolation);
+  // Without drain (or relax), the policy returns an empty set so the route
+  // is dropped.
+  EXPECT_EQ(multipaths.size(), 0);
+}
+
+TEST_F(RibPolicyFixture, NoPartialDrainWhenLbwSatisfied) {
+  std::shared_ptr<RouteInfo> pathWithLbw;
+  for (const auto& p : pathsToOverride_) {
+    if (p->attrs->getNexthop() == kV4Nexthop1) {
+      pathWithLbw = p;
+      break;
+    }
+  }
+  ASSERT_NE(pathWithLbw, nullptr);
+
+  // Threshold = 100 GBps, path has 800 GBps -> satisfied
+  auto tMatcher = createCommunityMatch(200, 666, bgp_policy::Origin::EGP);
+  auto tPathSelector = createTPathSlectorWithOneMatcher(
+      tMatcher,
+      /*criteriaMinNextHop=*/2,
+      /*defaultMinNextHop=*/std::nullopt,
+      /*defaultMinAggLbwbps=*/(int64_t)100 * BpsPerGBps,
+      /*relaxMinAggLbwbps=*/std::nullopt);
+  tPathSelector.drain_on_min_nexthop_violation() = true;
+
+  PathSelector pathSelector(tPathSelector);
+  PathSelectionPolicyResult result("stmt1");
+
+  pathSelector.overrideMultipathSelection(
+      {pathWithLbw}, multipathSelector, result);
+  EXPECT_EQ(result.outcome, PathSelectionPolicyResult::Outcome::BGP);
+  EXPECT_FALSE(result.drainOnMinCapacityThresholdViolation);
+}
+
+namespace {
+/*
+ * Build a RibEntry holding a single EGP path that carries 800 GBps of
+ * non-transitive LBW and matches community 200:666. Shared setup for the
+ * RibPolicyLbwDrainTest cases below, which pair it with a min-aggregate-LBW
+ * threshold above 800 GBps to exercise the drain-on-violation behavior.
+ */
+std::unique_ptr<RibEntry> makeLbwRibEntry() {
+  auto attr =
+      std::make_shared<facebook::bgp::BgpPath>(*buildBgpPathFields(2, 2, 2, 2));
+  nettools::bgplib::BgpAttrCommunitiesC community;
+  community.emplace_back(200, 666);
+  attr->setNexthop(kV4Nexthop1);
+  attr->setLocalPref(kLocalPref);
+  attr->setCommunities(community);
+  attr->setOrigin(nettools::bgplib::BgpAttrOrigin::BGP_ORIGIN_EGP);
+  attr->setNonTransitiveLbwExtCommunity(kLocalAs1, float(800) * BpsPerGBps / 8);
+  attr->publish();
+
+  auto peer = TinyPeerInfo(
+      kPeerAddr1, kPeerAsn1, kPeerRouterId1, BgpSessionType::EBGP, false);
+
+  auto ribEntry = std::make_unique<RibEntry>(kV4Prefix1);
+  EXPECT_TRUE(ribEntry->updatePath(peer, attr, true, 0));
+  return ribEntry;
+}
+} // namespace
+
+/*
+ * Verify RibEntry honors the drain flag on LBW violation: bestpath retained,
+ * isPartialDrain set, install-to-FIB true. Uses a custom RibEntry with a
+ * single LBW-bearing path so the aggregate check sees a concrete LBW value.
+ */
+TEST(RibPolicyLbwDrainTest, PartialDrainRetainsBestpathOnLbwViolation) {
+  auto ribEntry = makeLbwRibEntry();
+
+  // criteriaMinNextHop=2 forces fall-through; bgpNativeMinAggLbwbps=1000 GBps
+  // > 800 GBps available -> LBW violation -> drain flag triggers.
+  auto tMatcher = createCommunityMatch(200, 666, bgp_policy::Origin::EGP);
+  auto tPathSelector = createTPathSlectorWithOneMatcher(
+      tMatcher,
+      /*criteriaMinNextHop=*/2,
+      /*defaultMinNextHop=*/std::nullopt,
+      /*defaultMinAggLbwbps=*/(int64_t)1000 * BpsPerGBps,
+      /*relaxMinAggLbwbps=*/std::nullopt);
+  tPathSelector.drain_on_min_nexthop_violation() = true;
+
+  auto policy = std::make_unique<PathSelectionPolicy>(
+      createTPathSelectionPolicyWithPathSelector({kV4Prefix1}, tPathSelector));
+
+  bool bestpathChanged, multipathChanged;
+  std::tie(bestpathChanged, multipathChanged) = RibDC::selectBestPath(
+      *ribEntry,
+
+      multipathSelector,
+      bestpathSelector,
+      false,
+      0,
+      std::nullopt,
+      policy);
+
+  EXPECT_NE(ribEntry->getBestPath(), nullptr);
+  EXPECT_TRUE(ribEntry->getInstallToFib());
+  EXPECT_TRUE(ribEntry->getIsPartialDrain());
+}
+
+TEST(RibPolicyLbwDrainTest, StrictLbwNullifiesBestpath) {
+  auto ribEntry = makeLbwRibEntry();
+
+  // drain_on_min_nexthop_violation NOT set: LBW violation -> bestpath null,
+  // route withdrawn.
+  auto tMatcher = createCommunityMatch(200, 666, bgp_policy::Origin::EGP);
+  auto tPathSelector = createTPathSlectorWithOneMatcher(
+      tMatcher,
+      /*criteriaMinNextHop=*/2,
+      /*defaultMinNextHop=*/std::nullopt,
+      /*defaultMinAggLbwbps=*/(int64_t)1000 * BpsPerGBps,
+      /*relaxMinAggLbwbps=*/std::nullopt);
+
+  auto policy = std::make_unique<PathSelectionPolicy>(
+      createTPathSelectionPolicyWithPathSelector({kV4Prefix1}, tPathSelector));
+
+  bool bestpathChanged, multipathChanged;
+  std::tie(bestpathChanged, multipathChanged) = RibDC::selectBestPath(
+      *ribEntry,
+
+      multipathSelector,
+      bestpathSelector,
+      false,
+      0,
+      std::nullopt,
+      policy);
+
+  EXPECT_EQ(ribEntry->getBestPath(), nullptr);
+  EXPECT_FALSE(ribEntry->getIsPartialDrain());
+}
+
+/*
+ * Rollback transition (drain → strict) under LBW violation. Mirrors
+ * PartialDrainToStrictMnhRollback: first inject a drain LBW policy so
+ * partial drain engages, then swap to the same LBW policy without the drain
+ * flag and verify bestpath is nullified and isPartialDrain_ clears.
+ * Rollback is the more dangerous direction (RFC: cited in BGP++
+ * general_rules.md), so explicit coverage is required.
+ */
+TEST(RibPolicyLbwDrainTest, PartialDrainToStrictLbwRollback) {
+  auto ribEntry = makeLbwRibEntry();
+
+  // Phase 1: drain enabled, LBW violation -> partial drain engages.
+  auto tMatcher = createCommunityMatch(200, 666, bgp_policy::Origin::EGP);
+  auto tPathSelectorDrain = createTPathSlectorWithOneMatcher(
+      tMatcher,
+      /*criteriaMinNextHop=*/2,
+      /*defaultMinNextHop=*/std::nullopt,
+      /*defaultMinAggLbwbps=*/(int64_t)1000 * BpsPerGBps,
+      /*relaxMinAggLbwbps=*/std::nullopt);
+  tPathSelectorDrain.drain_on_min_nexthop_violation() = true;
+
+  auto drainPolicy = std::make_unique<PathSelectionPolicy>(
+      createTPathSelectionPolicyWithPathSelector(
+          {kV4Prefix1}, tPathSelectorDrain));
+
+  bool bestpathChanged, multipathChanged;
+  std::tie(bestpathChanged, multipathChanged) = RibDC::selectBestPath(
+      *ribEntry,
+
+      multipathSelector,
+      bestpathSelector,
+      false,
+      0,
+      std::nullopt,
+      drainPolicy);
+
+  EXPECT_NE(ribEntry->getBestPath(), nullptr);
+  EXPECT_TRUE(ribEntry->getIsPartialDrain());
+
+  // Phase 2: strict policy (drain flag absent) -> bestpath nullified.
+  auto tPathSelectorStrict = createTPathSlectorWithOneMatcher(
+      tMatcher,
+      /*criteriaMinNextHop=*/2,
+      /*defaultMinNextHop=*/std::nullopt,
+      /*defaultMinAggLbwbps=*/(int64_t)1000 * BpsPerGBps,
+      /*relaxMinAggLbwbps=*/std::nullopt);
+
+  auto strictPolicy = std::make_unique<PathSelectionPolicy>(
+      createTPathSelectionPolicyWithPathSelector(
+          {kV4Prefix1}, tPathSelectorStrict));
+
+  std::tie(bestpathChanged, multipathChanged) = RibDC::selectBestPath(
+      *ribEntry,
+
+      multipathSelector,
+      bestpathSelector,
+      false,
+      0,
+      std::nullopt,
+      strictPolicy);
+
+  EXPECT_TRUE(bestpathChanged);
+  EXPECT_EQ(ribEntry->getBestPath(), nullptr);
+  EXPECT_FALSE(ribEntry->getIsPartialDrain());
+}
+
+/*
+ * Rollout transition (strict → drain) under LBW violation. Mirrors
+ * StrictMnhToPartialDrainRollout: first inject a strict LBW policy so the
+ * bestpath is nullified, then swap to the same LBW policy with the drain
+ * flag and verify the bestpath is reinstated and isPartialDrain_ engages.
+ */
+TEST(RibPolicyLbwDrainTest, StrictLbwToPartialDrainRollout) {
+  auto ribEntry = makeLbwRibEntry();
+
+  // Phase 1: strict policy, LBW violation -> bestpath nullified.
+  auto tMatcher = createCommunityMatch(200, 666, bgp_policy::Origin::EGP);
+  auto tPathSelectorStrict = createTPathSlectorWithOneMatcher(
+      tMatcher,
+      /*criteriaMinNextHop=*/2,
+      /*defaultMinNextHop=*/std::nullopt,
+      /*defaultMinAggLbwbps=*/(int64_t)1000 * BpsPerGBps,
+      /*relaxMinAggLbwbps=*/std::nullopt);
+
+  auto strictPolicy = std::make_unique<PathSelectionPolicy>(
+      createTPathSelectionPolicyWithPathSelector(
+          {kV4Prefix1}, tPathSelectorStrict));
+
+  bool bestpathChanged, multipathChanged;
+  std::tie(bestpathChanged, multipathChanged) = RibDC::selectBestPath(
+      *ribEntry,
+
+      multipathSelector,
+      bestpathSelector,
+      false,
+      0,
+      std::nullopt,
+      strictPolicy);
+
+  EXPECT_EQ(ribEntry->getBestPath(), nullptr);
+  EXPECT_FALSE(ribEntry->getIsPartialDrain());
+
+  // Phase 2: enable drain -> bestpath retained, partial drain engages.
+  auto tPathSelectorDrain = createTPathSlectorWithOneMatcher(
+      tMatcher,
+      /*criteriaMinNextHop=*/2,
+      /*defaultMinNextHop=*/std::nullopt,
+      /*defaultMinAggLbwbps=*/(int64_t)1000 * BpsPerGBps,
+      /*relaxMinAggLbwbps=*/std::nullopt);
+  tPathSelectorDrain.drain_on_min_nexthop_violation() = true;
+
+  auto drainPolicy = std::make_unique<PathSelectionPolicy>(
+      createTPathSelectionPolicyWithPathSelector(
+          {kV4Prefix1}, tPathSelectorDrain));
+
+  std::tie(bestpathChanged, multipathChanged) = RibDC::selectBestPath(
+      *ribEntry,
+
+      multipathSelector,
+      bestpathSelector,
+      false,
+      0,
+      std::nullopt,
+      drainPolicy);
+
+  EXPECT_TRUE(bestpathChanged);
+  EXPECT_NE(ribEntry->getBestPath(), nullptr);
+  EXPECT_TRUE(ribEntry->getInstallToFib());
+  EXPECT_TRUE(ribEntry->getIsPartialDrain());
+}
+
 /*
  * Test the default min nexthop specified in the path selector. When it it not
  * met, no path would be selected. Native MNH is by default NOT relaxed.
@@ -2053,12 +2646,12 @@ TEST_F(RibPolicyFixture, SelectPathDefaultMinNexthopTest) {
  */
 TEST_F(RibPolicyFixture, OverridePathSelectionTestRelaxDefaultMNH) {
   bool bestpathChanged, multipathChanged;
-  std::tie(bestpathChanged, multipathChanged) =
-      ribEntry_->selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, multipathChanged) = RibBase::selectBestPath(
+      *ribEntry_, multipathSelector, bestpathSelector, false, 0);
 
   // Without changing the criteria, the best path should remain unchanged
-  std::tie(bestpathChanged, multipathChanged) =
-      ribEntry_->selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, multipathChanged) = RibBase::selectBestPath(
+      *ribEntry_, multipathSelector, bestpathSelector, false, 0);
   EXPECT_FALSE(bestpathChanged);
   EXPECT_FALSE(multipathChanged);
 
@@ -2073,8 +2666,14 @@ TEST_F(RibPolicyFixture, OverridePathSelectionTestRelaxDefaultMNH) {
       createTPathSelectionPolicyWithPathSelector({kV4Prefix1}, tPathSelector));
 
   // Now the bestpath and the multipath should be changed
-  std::tie(bestpathChanged, multipathChanged) = ribEntry_->selectBestPath(
-      multipathSelector, bestpathSelector, false, 0, std::nullopt, policy1);
+  std::tie(bestpathChanged, multipathChanged) = RibDC::selectBestPath(
+      *ribEntry_,
+      multipathSelector,
+      bestpathSelector,
+      false,
+      0,
+      std::nullopt,
+      policy1);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_TRUE(multipathChanged);
 
@@ -2089,8 +2688,14 @@ TEST_F(RibPolicyFixture, OverridePathSelectionTestRelaxDefaultMNH) {
       createTPathSelectionPolicyWithPathSelector({kV4Prefix1}, tPathSelector));
 
   // And hence no path should be changed
-  std::tie(bestpathChanged, multipathChanged) = ribEntry_->selectBestPath(
-      multipathSelector, bestpathSelector, false, 0, std::nullopt, policy2);
+  std::tie(bestpathChanged, multipathChanged) = RibDC::selectBestPath(
+      *ribEntry_,
+      multipathSelector,
+      bestpathSelector,
+      false,
+      0,
+      std::nullopt,
+      policy2);
   EXPECT_FALSE(bestpathChanged);
   EXPECT_FALSE(multipathChanged);
 
@@ -2102,26 +2707,41 @@ TEST_F(RibPolicyFixture, OverridePathSelectionTestRelaxDefaultMNH) {
   auto policy3 = std::make_unique<PathSelectionPolicy>(
       createTPathSelectionPolicyWithPathSelector({kV4Prefix1}, tPathSelector));
 
-  std::tie(bestpathChanged, multipathChanged) = ribEntry_->selectBestPath(
-      multipathSelector, bestpathSelector, false, 0, std::nullopt, policy3);
+  std::tie(bestpathChanged, multipathChanged) = RibDC::selectBestPath(
+      *ribEntry_,
+      multipathSelector,
+      bestpathSelector,
+      false,
+      0,
+      std::nullopt,
+      policy3);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_TRUE(multipathChanged);
 
-  // In this case, no best path could be found as we only have 1 path, which
-  // violates the min nexthop constraint (4)
-  EXPECT_EQ(ribEntry_->getBestPath(), nullptr);
+  // With drain_on_min_nexthop_violation, bestpath is retained (partial drain)
+  EXPECT_NE(ribEntry_->getBestPath(), nullptr);
+  EXPECT_EQ(ribEntry_->getBestPath()->getBgpAsPathLen(), 2);
+  EXPECT_TRUE(ribEntry_->getInstallToFib());
+  EXPECT_TRUE(ribEntry_->getIsPartialDrain());
 
   // Once the path selection policy is removed, the default multipath selection
-  // will be reapplied. Since the last multipath was selected by default
-  // selector, mulipath will not change. But the MNH constraint is lifted, so
-  // best path will be selected
-
-  std::tie(bestpathChanged, multipathChanged) = ribEntry_->selectBestPath(
-      multipathSelector, bestpathSelector, false, 0, std::nullopt, nullptr);
+  // will be reapplied. Bestpath stays the same (native selector picks same
+  // path), but the partial-drain marker flips from true to false — and
+  // selectBestPath() folds drain transitions into bestpathChanged so the
+  // RibOut announcement machinery re-advertises (drain community removal).
+  std::tie(bestpathChanged, multipathChanged) = RibDC::selectBestPath(
+      *ribEntry_,
+      multipathSelector,
+      bestpathSelector,
+      false,
+      0,
+      std::nullopt,
+      nullptr);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_FALSE(multipathChanged);
 
   EXPECT_EQ(ribEntry_->getBestPath()->getBgpAsPathLen(), 2);
+  EXPECT_FALSE(ribEntry_->getIsPartialDrain());
 }
 
 /**
@@ -2136,12 +2756,12 @@ TEST_F(RibPolicyFixture, OverridePathSelectionTestRelaxDefaultMNH) {
  */
 TEST_F(RibPolicyFixture, OverridePathSelectionTest) {
   bool bestpathChanged, multipathChanged;
-  std::tie(bestpathChanged, multipathChanged) =
-      ribEntry_->selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, multipathChanged) = RibBase::selectBestPath(
+      *ribEntry_, multipathSelector, bestpathSelector, false, 0);
 
   // Without changing the criteria, the best path should remain unchanged
-  std::tie(bestpathChanged, multipathChanged) =
-      ribEntry_->selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, multipathChanged) = RibBase::selectBestPath(
+      *ribEntry_, multipathSelector, bestpathSelector, false, 0);
   EXPECT_FALSE(bestpathChanged);
   EXPECT_FALSE(multipathChanged);
 
@@ -2156,8 +2776,14 @@ TEST_F(RibPolicyFixture, OverridePathSelectionTest) {
       createTPathSelectionPolicyWithPathSelector({kV4Prefix1}, tPathSelector));
 
   // Now the bestpath and the multipath should be changed
-  std::tie(bestpathChanged, multipathChanged) = ribEntry_->selectBestPath(
-      multipathSelector, bestpathSelector, false, 0, std::nullopt, policy1);
+  std::tie(bestpathChanged, multipathChanged) = RibDC::selectBestPath(
+      *ribEntry_,
+      multipathSelector,
+      bestpathSelector,
+      false,
+      0,
+      std::nullopt,
+      policy1);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_TRUE(multipathChanged);
 
@@ -2172,8 +2798,14 @@ TEST_F(RibPolicyFixture, OverridePathSelectionTest) {
       createTPathSelectionPolicyWithPathSelector({kV4Prefix1}, tPathSelector));
 
   // And hence no path should be changed
-  std::tie(bestpathChanged, multipathChanged) = ribEntry_->selectBestPath(
-      multipathSelector, bestpathSelector, false, 0, std::nullopt, policy2);
+  std::tie(bestpathChanged, multipathChanged) = RibDC::selectBestPath(
+      *ribEntry_,
+      multipathSelector,
+      bestpathSelector,
+      false,
+      0,
+      std::nullopt,
+      policy2);
   EXPECT_FALSE(bestpathChanged);
   EXPECT_FALSE(multipathChanged);
 
@@ -2184,8 +2816,14 @@ TEST_F(RibPolicyFixture, OverridePathSelectionTest) {
   auto policy3 = std::make_unique<PathSelectionPolicy>(
       createTPathSelectionPolicyWithPathSelector({kV4Prefix1}, tPathSelector));
 
-  std::tie(bestpathChanged, multipathChanged) = ribEntry_->selectBestPath(
-      multipathSelector, bestpathSelector, false, 0, std::nullopt, policy3);
+  std::tie(bestpathChanged, multipathChanged) = RibDC::selectBestPath(
+      *ribEntry_,
+      multipathSelector,
+      bestpathSelector,
+      false,
+      0,
+      std::nullopt,
+      policy3);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_TRUE(multipathChanged);
 
@@ -2197,8 +2835,14 @@ TEST_F(RibPolicyFixture, OverridePathSelectionTest) {
   // reapplied
 
   // Now the bestpath and the multipath should be changed back
-  std::tie(bestpathChanged, multipathChanged) = ribEntry_->selectBestPath(
-      multipathSelector, bestpathSelector, false, 0, std::nullopt, nullptr);
+  std::tie(bestpathChanged, multipathChanged) = RibDC::selectBestPath(
+      *ribEntry_,
+      multipathSelector,
+      bestpathSelector,
+      false,
+      0,
+      std::nullopt,
+      nullptr);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_TRUE(multipathChanged);
 
@@ -2337,6 +2981,50 @@ TEST_F(RibPolicyFixture, PathSelectionPolicyCacheTest) {
 
     EXPECT_EQ(policy.getPathSelectionPolicy(), std::nullopt);
   }
+}
+
+/*
+ * Regression test for drain-flag round-trip via getActivePathSelectionCriteria.
+ * The drain flag now covers both the MNH and aggregate-LBW thresholds, so it
+ * must survive reconstruction even when only bgp_min_aggregate_lbw_bps (and no
+ * MNH) is configured. Previously the flag was emitted only alongside an MNH
+ * value, silently dropping it for LBW-only statements.
+ */
+TEST_F(RibPolicyFixture, LbwOnlyDrainFlagPreservedInActiveCriteria) {
+  auto tMatcher = createCommunityMatch(200, 666, bgp_policy::Origin::EGP);
+  // criteriaMinNextHop=100 -> the statement matches but the criteria is
+  // unsatisfied, exercising the fall-through (activeCriteria == nullptr) path.
+  // No defaultMinNextHop: only the LBW threshold and drain flag are set.
+  auto tPathSelector = createTPathSlectorWithOneMatcher(
+      tMatcher,
+      /*criteriaMinNextHop=*/100,
+      /*defaultMinNextHop=*/std::nullopt,
+      /*defaultMinAggLbwbps=*/(int64_t)1000 * BpsPerGBps,
+      /*relaxMinAggLbwbps=*/std::nullopt);
+  tPathSelector.drain_on_min_nexthop_violation() = true;
+
+  PathSelectionPolicy policy(
+      createTPathSelectionPolicyWithPathSelector({kV4Prefix1}, tPathSelector));
+
+  // Populate the prefix -> statement cache so getActivePathSelectionCriteria
+  // reconstructs from the matched statement.
+  policy.overrideMultipathSelection(
+      *ribEntry_, pathsToOverride_, multipathSelector);
+
+  auto activeCriteria = policy.getActivePathSelectionCriteria(
+      {folly::IPAddress::networkToString(kV4Prefix1)});
+  ASSERT_EQ(activeCriteria.size(), 1);
+  const auto& reconstructed = activeCriteria[0];
+
+  // The drain flag must be preserved even though no MNH is configured.
+  ASSERT_TRUE(reconstructed.drain_on_min_nexthop_violation().has_value());
+  EXPECT_TRUE(*reconstructed.drain_on_min_nexthop_violation());
+  // The LBW threshold round-trips; the MNH field stays unset.
+  ASSERT_TRUE(reconstructed.bgp_min_aggregate_lbw_bps().has_value());
+  EXPECT_EQ(
+      *reconstructed.bgp_min_aggregate_lbw_bps(), (int64_t)1000 * BpsPerGBps);
+  EXPECT_FALSE(
+      reconstructed.bgp_native_path_selection_min_nexthop().has_value());
 }
 
 TEST(RibPolicyTest, RouteAttributeUcmpActionTest) {
@@ -2483,8 +3171,8 @@ TEST_F(RouteAttributeUcmpActionFixture, RibPolicyRouteAttributeUCMP) {
   EXPECT_TRUE(ribEntry1.updatePath(peer1, attrs1, false));
   // Trigger the bestpath selection.
   bool bestpathChanged, nexthopChanged;
-  std::tie(bestpathChanged, nexthopChanged) =
-      ribEntry1.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry1, multipathSelector, bestpathSelector, false, 0);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_TRUE(nexthopChanged);
 
@@ -2501,8 +3189,8 @@ TEST_F(RouteAttributeUcmpActionFixture, RibPolicyRouteAttributeUCMP) {
   EXPECT_EQ(nullptr, ribEntry2.getBestPath());
   EXPECT_EQ(nullptr, ribEntry2.getMultipathWeightedNexthops());
   // Trigger the bestpath selection.
-  std::tie(bestpathChanged, nexthopChanged) =
-      ribEntry2.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry2, multipathSelector, bestpathSelector, false, 0);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_TRUE(nexthopChanged);
 
@@ -2521,8 +3209,8 @@ TEST_F(RouteAttributeUcmpActionFixture, RibPolicyRouteAttributeUCMP) {
   EXPECT_EQ(nullptr, ribEntry3.getBestPath());
   EXPECT_EQ(nullptr, ribEntry3.getMultipathWeightedNexthops());
   // Trigger the bestpath selection.
-  std::tie(bestpathChanged, nexthopChanged) =
-      ribEntry3.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry3, multipathSelector, bestpathSelector, false, 0);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_TRUE(nexthopChanged);
 
@@ -2568,8 +3256,8 @@ TEST_F(RouteAttributeUcmpActionFixture, RouteAttributeUcmpActionStrict) {
   EXPECT_TRUE(ribEntry1.updatePath(peer1, attrs1, false));
   // Trigger the bestpath selection.
   bool bestpathChanged, nexthopChanged;
-  std::tie(bestpathChanged, nexthopChanged) =
-      ribEntry1.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry1, multipathSelector, bestpathSelector, false, 0);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_TRUE(nexthopChanged);
 
@@ -2586,8 +3274,8 @@ TEST_F(RouteAttributeUcmpActionFixture, RouteAttributeUcmpActionStrict) {
   EXPECT_EQ(nullptr, ribEntry2.getBestPath());
   EXPECT_EQ(nullptr, ribEntry2.getMultipathWeightedNexthops());
   // Trigger the bestpath selection.
-  std::tie(bestpathChanged, nexthopChanged) =
-      ribEntry2.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry2, multipathSelector, bestpathSelector, false, 0);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_TRUE(nexthopChanged);
 
@@ -2606,8 +3294,8 @@ TEST_F(RouteAttributeUcmpActionFixture, RouteAttributeUcmpActionStrict) {
   EXPECT_EQ(nullptr, ribEntry3.getBestPath());
   EXPECT_EQ(nullptr, ribEntry3.getMultipathWeightedNexthops());
   // Trigger the bestpath selection.
-  std::tie(bestpathChanged, nexthopChanged) =
-      ribEntry3.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry3, multipathSelector, bestpathSelector, false, 0);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_TRUE(nexthopChanged);
 
@@ -2686,8 +3374,8 @@ TEST_F(RouteAttributeUcmpActionFixture, RouteAttributeUcmpActionRelaxed) {
   EXPECT_TRUE(ribEntry1.updatePath(peer1, attrs1, false));
   // Trigger the bestpath selection.
   bool bestpathChanged, nexthopChanged;
-  std::tie(bestpathChanged, nexthopChanged) =
-      ribEntry1.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry1, multipathSelector, bestpathSelector, false, 0);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_TRUE(nexthopChanged);
 
@@ -2704,8 +3392,8 @@ TEST_F(RouteAttributeUcmpActionFixture, RouteAttributeUcmpActionRelaxed) {
   EXPECT_EQ(nullptr, ribEntry2.getBestPath());
   EXPECT_EQ(nullptr, ribEntry2.getMultipathWeightedNexthops());
   // Trigger the bestpath selection.
-  std::tie(bestpathChanged, nexthopChanged) =
-      ribEntry2.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry2, multipathSelector, bestpathSelector, false, 0);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_TRUE(nexthopChanged);
 
@@ -2724,8 +3412,8 @@ TEST_F(RouteAttributeUcmpActionFixture, RouteAttributeUcmpActionRelaxed) {
   EXPECT_EQ(nullptr, ribEntry3.getBestPath());
   EXPECT_EQ(nullptr, ribEntry3.getMultipathWeightedNexthops());
   // Trigger the bestpath selection.
-  std::tie(bestpathChanged, nexthopChanged) =
-      ribEntry3.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  std::tie(bestpathChanged, nexthopChanged) = RibBase::selectBestPath(
+      ribEntry3, multipathSelector, bestpathSelector, false, 0);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_TRUE(nexthopChanged);
 
@@ -2844,8 +3532,8 @@ TEST(RibPolicyTest, DivideWeightsByMatchingPathCount) {
   EXPECT_TRUE(ribEntry.updatePath(peer2, attrs2, false));
   EXPECT_TRUE(ribEntry.updatePath(peer3, attrs3, false));
 
-  auto [bestpathChanged, nexthopChanged] =
-      ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  auto [bestpathChanged, nexthopChanged] = RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
   EXPECT_TRUE(bestpathChanged);
   EXPECT_TRUE(nexthopChanged);
 
@@ -2925,7 +3613,8 @@ TEST(RibPolicyTest, DivideWeightsOnlyAmongSelectedNexthops) {
   EXPECT_TRUE(ribEntry.updatePath(peer2, attrs2, false));
   EXPECT_TRUE(ribEntry.updatePath(peer3, attrs3, false));
 
-  ribEntry.selectBestPath(multipathSelector, bestpathSelector, false, 0);
+  RibBase::selectBestPath(
+      ribEntry, multipathSelector, bestpathSelector, false, 0);
 
   // Simulate the production scenario where one of the three paths is in
   // routeInfos_ (visible via getAllPaths()) but is NOT selected for the

@@ -153,7 +153,15 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
    * sessionTerminated() to skip expensive O(n) cleanup operations that would
    * otherwise cause systemd timeout during shutdown.
    */
-  void markDaemonShutdown() noexcept;
+  void markDaemonShutdown();
+
+  /**
+   * @brief Save GR state information to a file before restarting.
+   *
+   * @details Must be called before SessionManager::stop() triggers
+   * sessionTerminated() which clears establishedGrPeers_.
+   */
+  void saveGrState();
 
   void setSessionManager(std::shared_ptr<SessionManager> sessionManager);
 
@@ -384,7 +392,9 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
 
   void logEoRPeers(const bool isIngressEoR) noexcept;
 
-  void setRouteFilterPolicy(std::unique_ptr<RouteFilterPolicy> policy) noexcept;
+  void setRouteFilterPolicy(
+      std::unique_ptr<RouteFilterPolicy> policy,
+      bool forceUpdate = false) noexcept;
   void clearGoldenPrefixesPolicy() noexcept;
   void clearIngressEgressRouteFiltersPolicy() noexcept;
 
@@ -538,12 +548,29 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
   // filter/routing policy is updated
   void sendRibDumpReqForEgressPolicyUpdate(PolicyChangeScope scope);
 
+  // Collect update groups with pending egress policy re-evaluation
+  folly::F14NodeSet<std::shared_ptr<AdjRibOutGroup>>
+  getPolicyReEvalPendingGroups();
+
+  // Schedule group-level egress policy re-evaluation for affected groups
+  void schedulePolicyReEvalForPendingGroups();
+
+  // Schedule per-peer re-evaluation when peer's group key changes
+  void schedulePolicyReEvalForGroupAdjRibs();
+
+  // Schedule per-peer egress policy re-evaluation (non-update-group mode)
+  void schedulePolicyReEvalForAdjRibs();
+
+  // Orchestrate group-level + detached peer egress policy re-evaluation
+  folly::coro::Task<void> processGroupEgressPolicyReEvaluation(
+      std::shared_ptr<AdjRibOutGroup> group);
+
   /* Helper method to distribute RibOutAnnouncement to all adjRibs */
   void distributeRibOutAnnouncementToAdjRibs(
       const RibOutAnnouncement& announcement);
 
   // Helper coroutine to process RibDumpReq for a specific peer during egress
-  // policy update
+  // policy update (non-update-group path).
   folly::coro::Task<void> processRibDumpReqForEgressPolicyUpdate(
       const nettools::bgplib::BgpPeerId& peerId,
       std::shared_ptr<AdjRib> adjRib);
@@ -557,9 +584,38 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
   // Coroutine to handle RibDumpReq
   // NOTE: we intended to do the pass-by-value to prevent memory use-after-free
   folly::coro::Task<void> processRibDumpReqCoro(RibDumpReq ribDumpReq);
+  /*
+   * Cancellable variant used by scheduleRibDumpForAdjRib for update-group
+   * peers: the dump is tracked by the AdjRib's cancellation source so it can be
+   * superseded or cancelled on teardown.
+   */
+  folly::coro::Task<void> processRibDumpReqWithCancellationCoro(
+      std::shared_ptr<AdjRib> adjRib);
   void processRibDumpReq(
       const std::shared_ptr<AdjRib>& adjRib,
       bool sendAddPath);
+
+  /*
+   * Whether a rib dump is pending for this peer in either form: buffered in
+   * pendingRibDumpReqs_ (waiting for the drain) or scheduled / in flight on
+   * asyncScope_ (its cancellation source is armed). Pure predicate.
+   */
+  bool isRibDumpScheduledForAdjRib(const std::shared_ptr<AdjRib>& adjRib) const;
+
+  /*
+   * Cancel a peer's pending rib dump regardless of state: drop a buffered
+   * request from pendingRibDumpReqs_ and cancel an armed/in-flight one via the
+   * AdjRib's cancellation source. Counterpart to scheduleRibDumpForAdjRib.
+   */
+  void cancelRibDumpForAdjRib(const std::shared_ptr<AdjRib>& adjRib);
+
+  /*
+   * Schedule a rib dump for a peer on asyncScope_, but only if one is not
+   * already scheduled or in flight (checked via isRibDumpScheduledForAdjRib).
+   * The AdjRib owns the cancellation source so teardown can cancel the dump;
+   * its token is passed into asyncScope_.add().
+   */
+  void scheduleRibDumpForAdjRib(const std::shared_ptr<AdjRib>& adjRib);
 
   /**
    * When sessionEstablished is called, the peer should eventually
@@ -601,6 +657,22 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
    * will be scheduled as coro tasks per peer in this method.
    */
   folly::coro::Task<void> handleBufferedRibDumpReqs();
+
+  /**
+   * Update-group equivalent of maybeBufferRibDumpReq for detached peers that
+   * must catch up independently before joining their group. Buffers the AdjRib
+   * in pendingRibDumpAdjRibs_ to be served once the initial announcement is
+   * done.
+   */
+  void maybeBufferRibDumpForDetachedPeer(const std::shared_ptr<AdjRib>& adjRib);
+
+  /**
+   * Update-group equivalent of handleBufferedRibDumpReqs. Drains the buffered
+   * detached-peer RibDumpReqs in pendingRibDumpAdjRibs_ one at a time,
+   * co_awaiting each per-peer dump inline with a small sleep between dumps to
+   * pace the ShadowRib walks.
+   */
+  folly::coro::Task<void> handleBufferedRibDumpsForDetachedPeers();
 
   /**
    * @brief Determine if this is a dynamic peer.
@@ -780,9 +852,6 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
   std::tuple<bool, bool> updateIngressEgressPolicyNamesForAdjRib(
       std::shared_ptr<AdjRib> adjRib,
       const PeerToPolicyMap& peerToPolicyNames) noexcept;
-
-  // Save GR state information to a file before restarting.
-  void saveGrState() noexcept;
 
   // Read saved GR state. Returns nullptr if no valid previous state exits.
   GrLoadResult readGrState() const noexcept;
@@ -1008,6 +1077,12 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
   bool allEgressEoRSent_{false};
   // One-time flag, mark BGP++ initialized after restart
   std::atomic<bool> initialized_{false};
+  /*
+   * Flag indicating daemon shutdown is in progress. Set by
+   * markDaemonShutdown() before SessionManager::stop() to prevent
+   * cross-module coroutine calls to a stopped SessionManager evb.
+   */
+  std::atomic<bool> daemonShutdown_{false};
   // One-time flag, mark true when all initial announcements are done
   bool ribInitialAnnouncementDone_{false};
   // One-time flag to prevent scheduling multiple handleBufferedRibDumpReqs
@@ -1029,6 +1104,15 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
    */
   folly::F14NodeMap<nettools::bgplib::BgpPeerId, bool /* sendAddPath */>
       pendingRibDumpReqs_;
+
+  /**
+   * Update-group equivalent of pendingRibDumpReqs_. One-time collection of
+   * AdjRibs with a pending RibDumpReq from detached peers that come up and must
+   * catch up independently before joining their group. Held as a set of AdjRib
+   * shared_ptrs; since there is one AdjRib per peer, this keeps at most one
+   * pending RibDumpReq per peer.
+   */
+  folly::F14FastSet<std::shared_ptr<AdjRib>> pendingRibDumpAdjRibs_;
 
   //
   // Stats

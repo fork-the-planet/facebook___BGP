@@ -20,6 +20,7 @@
  * */
 #pragma once
 
+#include "neteng/fboss/bgp/cpp/tests/BoundedWaitUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/FibFbossMock.h"
 namespace facebook::bgp {
 
@@ -93,8 +94,11 @@ class FibFbossUtilFixture : public ::testing::Test {
   folly::coro::Task<void> verifyDelayedFullSyncRequest(uint32_t expectedDelay) {
     // Record the start time of the test
     auto start = std::chrono::steady_clock::now();
-    // Wait for a message to be received on the fibMsgQ_ queue
-    auto msg = co_await fibMsgQ_.pop();
+    /*
+     * Wait for a message to be received on the fibMsgQ_ queue. Bounded
+     * so a never-arriving message fails the test fast instead of hanging.
+     */
+    auto msg = co_await facebook::bgp::test::boundedPop(fibMsgQ_, "fibMsgQ_");
     // Record the end time of the test
     auto end = std::chrono::steady_clock::now();
     // Calculate the duration of the test
@@ -116,9 +120,14 @@ class FibFbossUtilFixture : public ::testing::Test {
   folly::coro::Task<void> verifyImmediateFullSyncRequest() {
     // Record the start time of the test
     auto start = std::chrono::steady_clock::now();
-    // Ignore the first message, it is saying Fib is successfully programmed
-    auto msg1 = co_await fibMsgQ_.pop();
-    auto msg2 = co_await fibMsgQ_.pop();
+    /*
+     * Ignore the first message, it is saying Fib is successfully
+     * programmed. Bounded so a never-arriving message fails the test fast.
+     */
+    auto msg1 =
+        co_await facebook::bgp::test::boundedPop(fibMsgQ_, "fibMsgQ_(msg1)");
+    auto msg2 =
+        co_await facebook::bgp::test::boundedPop(fibMsgQ_, "fibMsgQ_(msg2)");
 
     // Record the end time of the test
     auto end = std::chrono::steady_clock::now();

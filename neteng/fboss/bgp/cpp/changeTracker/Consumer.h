@@ -242,9 +242,13 @@ class Consumer : public std::enable_shared_from_this<Consumer<T>> {
   void end();
 
   /**
-   * Consume changes using iterator interface.
-   * This is a convenience method that encapsulates the iterator-based
-   * consumption pattern, eliminating code duplication.
+   * Consume changes up to but NOT including the specified boundary marker.
+   *
+   * @param untilMarker If non-null, stop when the current item equals
+   *        untilMarker (exclusive — the boundary item is NOT processed).
+   *        The consumer's marker will be left pointing at untilMarker.
+   *        If nullptr, consume all available items (equivalent to the
+   *        old iterateChanges behavior).
    *
    * PRECONDITION: processChangeItemCallback_ MUST be set via
    * setProcessChangeItemCallback() before calling this method.
@@ -257,14 +261,27 @@ class Consumer : public std::enable_shared_from_this<Consumer<T>> {
    * The method will:
    * 1. Call begin() to get first item
    * 2. Loop through items, calling processChangeItemCallback_ for each
-   * 3. Handle YIELD behavior (add to pending list and return)
-   * 4. Call markProcessed() to advance to next item
-   * 5. Call end() when done
+   * 3. Stop BEFORE processing the untilMarker item (if non-null)
+   * 4. Handle YIELD behavior (add to pending list and return)
+   * 5. Call markProcessed() to advance to next item
+   * 6. Call end() when done
    *
    * This should be used when enable_iterable_change_list_tracker flag is
    * enabled.
    */
-  void consumeChangesWithIterator();
+  void iterateChangesUntilExcluding(ChangeItem<T>* untilMarker);
+
+  /**
+   * Consume all available changes using iterator interface.
+   * Convenience wrapper that calls
+   * iterateChangesUntilExcluding(nullptr).
+   *
+   * This should be used when enable_iterable_change_list_tracker flag is
+   * enabled.
+   */
+  void iterateChanges() {
+    iterateChangesUntilExcluding(nullptr);
+  }
 
   /**
    * Set the consumer display callback for debug tracing.
@@ -708,11 +725,34 @@ void Consumer<T>::end() {
 }
 
 template <typename T>
-void Consumer<T>::consumeChangesWithIterator() {
+void Consumer<T>::iterateChangesUntilExcluding(ChangeItem<T>* untilMarker) {
   CT_DEBUG_LOG(
       DBG3,
-      "Consumer {}: consumeChangesWithIterator() called",
-      getDisplayString());
+      "Consumer {}: iterateChangesUntilExcluding() called, boundary: {}, "
+      "consumer bit set on boundary: {}",
+      getDisplayString(),
+      tracker.getItemDisplayString(untilMarker),
+      untilMarker &&
+          BitmapUtils::isBitSet(untilMarker->consumerBitmap, bitPosition_));
+
+  /*
+   * The boundary item must carry this consumer's bit. markProcessed()/next()
+   * skip items that don't have our bit set, so a boundary that lacks our bit
+   * would be jumped over rather than stopped at — the loop would never satisfy
+   * item == untilMarker and would consume PAST the boundary to the end of the
+   * change list. Rather than silently overrun the boundary, log an error and
+   * return without consuming; leaving the consumer untouched makes this far
+   * easier to debug than an unintended skip.
+   */
+  if (untilMarker &&
+      !BitmapUtils::isBitSet(untilMarker->consumerBitmap, bitPosition_)) {
+    XLOGF(
+        ERR,
+        "Consumer {}: iterateChangesUntilExcluding boundary {} does not have this consumer's bit set; returning without consuming to avoid skipping past the boundary",
+        getDisplayString(),
+        tracker.getItemDisplayString(untilMarker));
+    return;
+  }
 
   // Remove from pending list if we're starting fresh
   if (marker_ != nullptr) {
@@ -728,9 +768,18 @@ void Consumer<T>::consumeChangesWithIterator() {
   // Capture initial marker to detect progress at end of cycle
   auto* initialMarker = marker_;
 
+  // Tracks the last callback result. Defaults to CONTINUE so the boundary-first
+  // case (loop breaks before any callback runs) is treated as "did not yield".
+  ProcessResult result = ProcessResult::CONTINUE;
+
   // Iterator-based polling cycle to consume available changes
   auto* item = begin();
   while (item) {
+    // Stop before processing the boundary item (exclusive)
+    if (item == untilMarker) {
+      break;
+    }
+
     CT_DEBUG_LOG(
         DBG3,
         "Consumer {}: Processing item: {}",
@@ -738,7 +787,7 @@ void Consumer<T>::consumeChangesWithIterator() {
         tracker.getItemDisplayString(item));
 
     // Process the change item using the callback (MANDATORY)
-    auto result = processChangeItemCallback_(item);
+    result = processChangeItemCallback_(item);
 
     if (result == ProcessResult::YIELD) {
       CT_DEBUG_LOG(
@@ -748,7 +797,6 @@ void Consumer<T>::consumeChangesWithIterator() {
       break;
     }
 
-    // Mark as processed and move to next
     markProcessed(item);
     item = next();
   }
@@ -764,6 +812,21 @@ void Consumer<T>::consumeChangesWithIterator() {
 
   CT_DEBUG_LOG(
       DBG3,
-      "Consumer {}: consumeChangesWithIterator() completed",
+      "Consumer {}: iterateChangesUntilExcluding() completed",
       getDisplayString());
+
+  /*
+   * Reaching the end of the change list before the boundary is unexpected when
+   * a boundary was requested. result == CONTINUE excludes the YIELD exit (which
+   * is expected and leaves marker_ on the yielded item); marker_ != untilMarker
+   * excludes the normal stop where we landed exactly on the boundary. When no
+   * boundary was requested (untilMarker == nullptr), marker_ is also null at
+   * the end, so marker_ != untilMarker is false and we do not warn.
+   */
+  XLOGF_IF(
+      WARN,
+      result == ProcessResult::CONTINUE && marker_ != untilMarker,
+      "Consumer {}: iterateChangesUntilExcluding reached end of change list before boundary {}",
+      getDisplayString(),
+      tracker.getItemDisplayString(untilMarker));
 }

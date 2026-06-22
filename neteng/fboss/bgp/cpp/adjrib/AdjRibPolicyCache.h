@@ -53,7 +53,8 @@ class AdjRibPolicyCache : boost::noncopyable {
       const PolicyAttributesMask* mask,
       const folly::CIDRNetwork& prefix,
       std::shared_ptr<const BgpPath> attrs,
-      const std::shared_ptr<BgpPolicyActionData>& policyActionData);
+      const std::shared_ptr<BgpPolicyActionData>& policyActionData,
+      bool isPartialDrain = false);
 
   // add policy result to cache
   void addToPolicyCache(
@@ -63,7 +64,8 @@ class AdjRibPolicyCache : boost::noncopyable {
       std::shared_ptr<const BgpPath> attrs,
       const std::shared_ptr<BgpPolicyActionData>& policyActionData,
       std::shared_ptr<const routing::AttributesAndPolicy<BgpPath>>
-          postPolicyAttrsAndTerm);
+          postPolicyAttrsAndTerm,
+      bool isPartialDrain = false);
 
   // Set max size of the LRU Cache.
   void setCacheSize(uint32_t size);
@@ -148,11 +150,21 @@ class AdjRibPolicyCache : boost::noncopyable {
    */
   uint32_t maxCacheSize_{kMaxPolicyCacheEntries};
 
+  /*
+   * isPartialDrain (the trailing bool) is part of the key because partial
+   * drain mutates standard communities (kDrainCommunity/kLiveCommunity) on the
+   * pre-policy clone OUTSIDE of policy evaluation. The masked key otherwise
+   * only reflects communities when the egress policy itself matches/sets them
+   * (PolicyAttributesMask::communities), so a drained and an undrained clone of
+   * the same prefix would collide and return each other's post-policy result.
+   * Keying on isPartialDrain keeps the two states distinct.
+   */
   using PolicyCacheMaskedKey = std::tuple<
       const PolicyAttributesMask*,
       folly::CIDRNetwork,
       std::shared_ptr<const BgpPath>,
-      std::shared_ptr<BgpPolicyActionData>>;
+      std::shared_ptr<BgpPolicyActionData>,
+      bool>;
 
   struct PolicyCacheMaskedKeyHash {
    public:

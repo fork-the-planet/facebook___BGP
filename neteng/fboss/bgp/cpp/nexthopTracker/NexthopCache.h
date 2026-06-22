@@ -20,6 +20,7 @@
 #include <folly/Synchronized.h>
 #include <folly/container/F14Map.h>
 #include <folly/logging/xlog.h>
+#include <functional>
 #include <optional>
 #include <tuple>
 #include <vector>
@@ -101,6 +102,55 @@ class NexthopCache {
    */
   bool unregisterAndRemoveNexthopStatus(const folly::IPAddress& nexthopIp);
 
+  /**
+   * @brief Returns true if the nexthop is currently registered from the RIB.
+   */
+  bool isRegistered(const folly::IPAddress& nexthopIp) const;
+
+  /**
+   * @brief Returns the IPs of all RIB-registered nexthops that fall within the
+   *        given prefix (address families matched).
+   *
+   * Used by NetlinkWrapper to find which registered nexthops are affected when
+   * an interface prefix is added or removed, so they can be re-evaluated.
+   */
+  std::vector<folly::IPAddress> getRegisteredNexthopsInSubnet(
+      const folly::CIDRNetwork& prefix) const;
+
+  /**
+   * @brief Relinquishes directly-connected ownership of a nexthop.
+   *
+   * If the entry exists and is currently marked isConnected=true, resets it to
+   * unreachable with isConnected=unset, so a non-connected source (e.g.
+   * FsdbFibWatcher) can become authoritative again. This is the only way to
+   * clear a connected status, since the source-priority rule in
+   * addOrUpdateNextHopStatus otherwise blocks non-connected updates from
+   * modifying a connected entry.
+   *
+   * Called by NetlinkWrapper when an interface prefix is removed and a nexthop
+   * is no longer directly connected on any interface.
+   *
+   * @return the updated status if the entry was connected AND registered from
+   *         RIB (so the caller can notify the RIB), std::nullopt otherwise.
+   */
+  std::optional<NexthopStatus> clearConnectedStatus(
+      const folly::IPAddress& nexthopIp);
+
+  /**
+   * @brief Registers a hook invoked whenever a nexthop is registered from the
+   *        RIB and its current status is not reachable.
+   *
+   * NetlinkWrapper uses this to drive the pull resolution path: when the RIB
+   * registers interest in a nexthop that has no answer yet, the hook lets
+   * NetlinkWrapper evaluate it against interface link state.
+   *
+   * The hook is invoked on the RIB thread, OUTSIDE the cache lock, and must be
+   * non-blocking. It is set once at startup (only when the interface-state
+   * resolution flag is on) before any thread registers nexthops, so no
+   * synchronization is required for the pointer itself.
+   */
+  void setOnNexthopRegistered(std::function<void(folly::IPAddress)> callback);
+
  private:
   /**
    * Nexthop address -> NexthopStatusWithRegistration map
@@ -119,6 +169,12 @@ class NexthopCache {
   folly::Synchronized<
       folly::F14NodeMap<folly::IPAddress, NexthopStatusWithRegistration>>
       nexthopStatusMap_;
+
+  // Hook fired (outside the map lock) from registerAndGetNexthopStatus when a
+  // registered nexthop has no reachable answer yet. Set once at startup before
+  // any thread registers nexthops (see setOnNexthopRegistered), so it needs no
+  // synchronization. Empty unless the interface-state resolution flag is on.
+  std::function<void(folly::IPAddress)> onNexthopRegistered_;
 
   friend class NexthopCacheTestFixture;
 

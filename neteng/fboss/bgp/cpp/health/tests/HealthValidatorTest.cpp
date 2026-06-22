@@ -19,7 +19,12 @@
 #include <fb303/ThreadCachedServiceData.h>
 #include <folly/coro/GtestHelpers.h>
 
+#include "configerator/structs/neteng/fboss/bgp/gen-cpp2/bgp_config_types.h"
+#include "neteng/fboss/bgp/cpp/config/Config.h"
+#include "neteng/fboss/bgp/cpp/config/ConfigManager.h"
 #include "neteng/fboss/bgp/cpp/health/HealthValidator.h"
+#include "neteng/fboss/bgp/cpp/health/facebook/HealthValidatorBB.h"
+#include "neteng/fboss/bgp/cpp/stats/Stats.h"
 #include "neteng/fboss/bgp/cpp/watchdog/Watchdog.h"
 
 using namespace facebook::bgp;
@@ -70,6 +75,25 @@ class HealthValidatorTest : public ::testing::Test {
       }
     }
     return nullptr;
+  }
+
+  /* Build a validator whose config reports enable_next_hop_tracking=true so the
+   * NHT checks exercise the enabled (PASS/WARN) path instead of SKIPPED. */
+  std::unique_ptr<HealthValidator> makeNhtEnabledValidator() {
+    facebook::bgp::thrift::BgpConfig thriftConfig;
+    thriftConfig.router_id() = "1.1.1.1";
+    thriftConfig.local_as_4_byte() = 65000;
+    thriftConfig.bgp_setting_config() =
+        facebook::bgp::thrift::BgpSettingConfig();
+    thriftConfig.bgp_setting_config()->enable_next_hop_tracking() = true;
+    auto config = std::make_shared<const Config>(std::move(thriftConfig));
+    auto configManager = std::make_shared<ConfigManager>(config);
+    return std::make_unique<HealthValidator>(
+        /*peerMgr=*/nullptr,
+        /*rib=*/nullptr,
+        /*watchdog=*/nullptr,
+        /*nexthopHandler=*/nullptr,
+        configManager);
   }
 
   std::unique_ptr<HealthValidator> validator_;
@@ -620,9 +644,9 @@ CO_TEST_F(HealthValidatorTest, Peer_DroppedPrefixes_Pass) {
   EXPECT_EQ(*check->status(), HealthCheckStatus::PASS);
 }
 
-CO_TEST_F(HealthValidatorTest, Peer_DroppedPrefixes_Pass_Uninitialized) {
-  /* -1 = counter initialized but never updated -> PASS */
-  setCounter("peer.totalDroppedPrefixes", -1);
+CO_TEST_F(HealthValidatorTest, Peer_DroppedPrefixes_Warn) {
+  /* >0 = prefixes actually dropped -> WARN, regardless of mode. See S676351. */
+  setCounter("peer.totalDroppedPrefixes", 5);
 
   auto report = co_await validator_->generateReport();
   auto* check = findCheck(report, HealthCheckId::PEER_DROPPED_PREFIXES);
@@ -630,7 +654,8 @@ CO_TEST_F(HealthValidatorTest, Peer_DroppedPrefixes_Pass_Uninitialized) {
   if (!check) {
     co_return;
   }
-  EXPECT_EQ(*check->status(), HealthCheckStatus::PASS);
+  EXPECT_EQ(*check->status(), HealthCheckStatus::WARN);
+  EXPECT_EQ(*check->message(), "droppedPrefixes = 5");
 }
 
 CO_TEST_F(HealthValidatorTest, Peer_ThriftRejects_Pass) {
@@ -931,7 +956,7 @@ CO_TEST_F(HealthValidatorTest, Netlink_Skipped_NhtNotEnabled) {
 /* ── NEXTHOP_TRACKER checks ── */
 
 CO_TEST_F(HealthValidatorTest, NHT_ConfigConsistent_Pass_BothDisabled) {
-  /* No configManager -> nhtEnabled=false, no counter -> runtimeActive=false
+  /* No configManager -> nhtEnabled=false, counter unset -> runtimeActive=false
    * consistent = (!nhtEnabled) -> PASS */
   auto report = co_await validator_->generateReport();
   auto* check = findCheck(report, HealthCheckId::NHT_CONFIG_CONSISTENT);
@@ -953,12 +978,8 @@ CO_TEST_F(HealthValidatorTest, NHT_CacheNotEmpty_Skipped_NhtDisabled) {
   EXPECT_EQ(*check->status(), HealthCheckStatus::SKIPPED);
 }
 
-CO_TEST_F(HealthValidatorTest, NHT_CacheNotEmpty_Pass_WhenEnabled) {
-  /* Simulate NHT enabled with counter present */
-  setCounter("bgpd.rib.nexthopCacheSize", 50);
-
-  /* Without configManager, nhtEnabled=false -> SKIPPED.
-   * This test verifies the SKIPPED path since we can't mock config. */
+CO_TEST_F(HealthValidatorTest, NHT_CacheNotEmpty_Skipped_NoConfig) {
+  /* Without configManager, nhtEnabled=false -> SKIPPED */
   auto report = co_await validator_->generateReport();
   auto* check = findCheck(report, HealthCheckId::NHT_CACHE_NOT_EMPTY);
   EXPECT_NE(check, nullptr);
@@ -966,6 +987,64 @@ CO_TEST_F(HealthValidatorTest, NHT_CacheNotEmpty_Pass_WhenEnabled) {
     co_return;
   }
   EXPECT_EQ(*check->status(), HealthCheckStatus::SKIPPED);
+}
+
+CO_TEST_F(HealthValidatorTest, NHT_CacheNotEmpty_Pass_WhenTrackingNexthops) {
+  /* NHT enabled + nexthop_info.count > 0 -> PASS */
+  setCounter(RibStats::kNexthopInfoCount, 5);
+  auto validator = makeNhtEnabledValidator();
+
+  auto report = co_await validator->generateReport();
+  auto* check = findCheck(report, HealthCheckId::NHT_CACHE_NOT_EMPTY);
+  EXPECT_NE(check, nullptr);
+  if (!check) {
+    co_return;
+  }
+  EXPECT_EQ(*check->status(), HealthCheckStatus::PASS);
+}
+
+CO_TEST_F(HealthValidatorTest, NHT_CacheNotEmpty_Warn_WhenNoNexthopsTracked) {
+  /* NHT enabled + nexthop_info.count == 0 -> WARN */
+  setCounter(RibStats::kNexthopInfoCount, 0);
+  auto validator = makeNhtEnabledValidator();
+
+  auto report = co_await validator->generateReport();
+  auto* check = findCheck(report, HealthCheckId::NHT_CACHE_NOT_EMPTY);
+  EXPECT_NE(check, nullptr);
+  if (!check) {
+    co_return;
+  }
+  EXPECT_EQ(*check->status(), HealthCheckStatus::WARN);
+}
+
+CO_TEST_F(HealthValidatorTest, NHT_ConfigConsistent_Pass_WhenEnabledAndActive) {
+  /* config enabled + nexthop_info.count > 0 -> consistent -> PASS */
+  setCounter(RibStats::kNexthopInfoCount, 3);
+  auto validator = makeNhtEnabledValidator();
+
+  auto report = co_await validator->generateReport();
+  auto* check = findCheck(report, HealthCheckId::NHT_CONFIG_CONSISTENT);
+  EXPECT_NE(check, nullptr);
+  if (!check) {
+    co_return;
+  }
+  EXPECT_EQ(*check->status(), HealthCheckStatus::PASS);
+}
+
+CO_TEST_F(
+    HealthValidatorTest,
+    NHT_ConfigConsistent_Warn_WhenEnabledButInactive) {
+  /* config enabled + nexthop_info.count == 0 -> inconsistent -> WARN */
+  setCounter(RibStats::kNexthopInfoCount, 0);
+  auto validator = makeNhtEnabledValidator();
+
+  auto report = co_await validator->generateReport();
+  auto* check = findCheck(report, HealthCheckId::NHT_CONFIG_CONSISTENT);
+  EXPECT_NE(check, nullptr);
+  if (!check) {
+    co_return;
+  }
+  EXPECT_EQ(*check->status(), HealthCheckStatus::WARN);
 }
 
 CO_TEST_F(HealthValidatorTest, NHT_StreamConnected_Skipped) {
@@ -1169,4 +1248,32 @@ CO_TEST_F(HealthValidatorTest, Thrift_DrainState_Error_NoConfig) {
     co_return;
   }
   EXPECT_EQ(*check->status(), HealthCheckStatus::FAIL);
+}
+
+/* ── HealthValidatorBB checks ── */
+
+class HealthValidatorBBTest : public HealthValidatorTest {
+ protected:
+  void SetUp() override {
+    HealthValidatorTest::SetUp();
+    bbValidator_ = std::make_unique<HealthValidatorBB>(
+        /*peerMgr=*/nullptr,
+        /*rib=*/nullptr,
+        /*watchdog=*/nullptr,
+        /*nlWrapper=*/nullptr);
+  }
+
+  std::unique_ptr<HealthValidatorBB> bbValidator_;
+};
+
+CO_TEST_F(HealthValidatorBBTest, PlannedExit_Skipped_OnBBPlatform) {
+  /* checkPlannedExit() returns SKIPPED unconditionally on BB, regardless of
+   * the bgpd.plannedExit counter. */
+  auto report = co_await bbValidator_->generateReport();
+  auto* check = findCheck(report, HealthCheckId::GLOBAL_SYSTEM_PLANNED_EXIT);
+  EXPECT_NE(check, nullptr);
+  if (!check) {
+    co_return;
+  }
+  EXPECT_EQ(*check->status(), HealthCheckStatus::SKIPPED);
 }

@@ -15,16 +15,40 @@
  */
 
 #include "neteng/fboss/bgp/cpp/nexthopTracker/InterfaceEntry.h"
+
+#include <gflags/gflags.h>
+
 #include "neteng/fboss/bgp/cpp/common/Utils.h"
+
+DEFINE_bool(
+    bgp_resolve_nexthops_from_interface_state,
+    false,
+    "When true, NetlinkWrapper resolves a directly-connected nexthop's "
+    "reachability purely from interface link state: the nexthop is reachable if "
+    "a covering interface prefix is up, unreachable if it is down, and not "
+    "directly connected (left to the FIB/recursive path) if no interface prefix "
+    "covers it. Host routes / ARP / ND (kernel neighbor table) are ignored on "
+    "this path. This lets peers on subnets wider than a /31 (v4) or /127 (v6) "
+    "be resolved. Default false preserves the legacy subnet-enumeration "
+    "behavior. Intended for testing. "
+    "Backbone (BB/EBB) only: this flag is DEFINEd in the interface_entry "
+    "library, which is only linked into the backbone binary (bgpd_cpp_bb). It "
+    "is not present in the DC binary (bgpd_cpp), so it cannot be enabled there "
+    "and the DC nexthop-registration path (FsdbFibWatcher/FsdbNeighborWatcher "
+    "feeding NexthopCache) is unaffected.");
 
 namespace facebook::bgp {
 InterfaceEntry::InterfaceEntry(std::string const& ifName) : ifName_(ifName) {}
 
 bool InterfaceEntry::updateAddr(folly::CIDRNetwork const& addr, bool isValid) {
+  // Legacy (default) path: seed/clear reachability by enumerating every host IP
+  // in the interface prefix. Bounded by kDefaultMaxIPsInCIDR, so any prefix
+  // wider than a /31 (v4) or /127 (v6) seeds nothing. When
+  // bgp_resolve_nexthops_from_interface_state is on, reachability is driven
+  // purely by interface link state and interface prefixes are tracked globally
+  // by NetlinkWrapper (InterfacePrefixTable), so this is not called.
   bool isUpdated = false;
-
   auto ips = listAllIPsInCIDR(addr);
-
   if (isValid) {
     // Add all IPs from the CIDR
     for (const auto& ip : ips) {
@@ -37,7 +61,6 @@ bool InterfaceEntry::updateAddr(folly::CIDRNetwork const& addr, bool isValid) {
       isUpdated |= (ipReachabilityMap_.erase(ip) == 1);
     }
   }
-
   return isUpdated;
 }
 
@@ -56,6 +79,8 @@ bool InterfaceEntry::updateReachability(
     bool reachability) {
   auto it = ipReachabilityMap_.find(ip);
   if (it == ipReachabilityMap_.end()) {
+    // Legacy behavior: only IPs seeded by updateAddr are tracked; an update for
+    // an untracked IP is dropped.
     return false;
   }
 
@@ -91,6 +116,31 @@ std::string InterfaceEntry::getIfName() const {
 
 int InterfaceEntry::getIfIndex() const {
   return ifIndex_;
+}
+
+bool InterfaceEntry::setUp(bool isUp) {
+  if (isUp_ != isUp) {
+    isUp_ = isUp;
+    return true;
+  }
+  return false;
+}
+
+bool InterfaceEntry::isUp() const {
+  return isUp_;
+}
+
+bool InterfaceEntry::addPrefix(const folly::CIDRNetwork& prefix) {
+  return prefixes_.insert(prefix).second;
+}
+
+bool InterfaceEntry::removePrefix(const folly::CIDRNetwork& prefix) {
+  return prefixes_.erase(prefix) == 1;
+}
+
+const folly::F14FastSet<folly::CIDRNetwork>& InterfaceEntry::getPrefixes()
+    const {
+  return prefixes_;
 }
 
 const folly::F14NodeMap<folly::IPAddress, bool>&

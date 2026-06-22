@@ -162,6 +162,8 @@ struct RibOutAnnouncementEntry {
    */
   uint64_t ribVersion{0};
 
+  bool isPartialDrain{false};
+
   RibOutAnnouncementEntry(
       const folly::CIDRNetwork& prefix,
       const uint32_t pathIdToSend,
@@ -175,7 +177,8 @@ struct RibOutAnnouncementEntry {
       bool newlyInstalledInLocalRib = false,
       std::chrono::time_point<std::chrono::system_clock> installTimeStamp =
           std::chrono::system_clock::now(),
-      uint64_t ribVersion = 0)
+      uint64_t ribVersion = 0,
+      bool isPartialDrain = false)
       : prefix(prefix),
         pathIdToSend(pathIdToSend),
         peer(peer),
@@ -187,7 +190,8 @@ struct RibOutAnnouncementEntry {
         ribPolicyUcmpWeight(ribPolicyUcmpWeight),
         newlyInstalledInLocalRib(newlyInstalledInLocalRib),
         installTimeStamp(installTimeStamp),
-        ribVersion(ribVersion) {}
+        ribVersion(ribVersion),
+        isPartialDrain(isPartialDrain) {}
 };
 
 struct RibOutWithdrawalEntry {
@@ -229,13 +233,17 @@ struct ShadowRibRouteInfo {
   const std::shared_ptr<const BgpPath> attrs;
   uint8_t flags{0};
   const uint32_t pathIdToSend;
+  const bool isPartialDrain{false};
 
-  // Construction
   ShadowRibRouteInfo(
       const TinyPeerInfo& peer,
       std::shared_ptr<const BgpPath> attrs,
-      const uint32_t pathIdToSend)
-      : peer(peer), attrs(std::move(attrs)), pathIdToSend(pathIdToSend) {}
+      const uint32_t pathIdToSend,
+      bool isPartialDrain = false)
+      : peer(peer),
+        attrs(std::move(attrs)),
+        pathIdToSend(pathIdToSend),
+        isPartialDrain(isPartialDrain) {}
 };
 
 // TODO: keys should only be pathIdToSend (uint32_t) once ADD-PATH changes for

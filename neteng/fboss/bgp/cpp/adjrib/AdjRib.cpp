@@ -136,10 +136,14 @@ AdjRib::~AdjRib() {
   policyCache_.reset();
 
   /*
-   * Wait for all coro tasks to complete.
+   * Safety net: if stop() was never called (e.g. test fixtures that
+   * overwrite adjRib_ without stopping the previous instance), cancel and
+   * join the asyncScope_ here to avoid the CHECK failure in ~AsyncScope().
+   * In production, stop() is always called before destruction.
    */
   if (asyncScope_) {
     folly::coro::blockingWait(asyncScope_->cancelAndJoinAsync());
+    asyncScope_.reset();
   }
 
   XLOGF(
@@ -446,24 +450,16 @@ AdjRibEntry* FOLLY_NULLABLE AdjRib::getRibEntry(
       adjRibOutGroup_->LiteTree_, prefix, getPeerOwnerKey());
 }
 
-std::pair<AdjRibEntry * FOLLY_NULLABLE, bool> AdjRib::getRibOutEntry(
+AdjRibEntry* FOLLY_NULLABLE AdjRib::getRibEntryWithUpdateGroup(
     const CIDRNetwork& prefix,
-    uint32_t pathId,
-    bool copyOnWriteIfShared) noexcept {
-  if (enableUpdateGroup_) {
-    auto [entry, isPerPeerEntry] = adjRibOutGroup_->getRibEntrySharedOrPeer(
-        prefix, getPeerOwnerKey(), pathId, detachedRibVersion_);
-    if (entry && !isPerPeerEntry && copyOnWriteIfShared) {
-      return {
-          adjRibOutGroup_->copyEntryForPeer(
-              prefix, pathId, shared_from_this(), entry),
-          true /* isPerPeerEntry */};
-    }
-    return {entry, isPerPeerEntry};
+    uint32_t pathId) noexcept {
+  auto [entry, isPerPeerEntry] = adjRibOutGroup_->getRibEntrySharedOrPeer(
+      prefix, getPeerOwnerKey(), pathId, detachedRibVersion_);
+  if (entry && !isPerPeerEntry) {
+    return adjRibOutGroup_->copyEntryForPeer(
+        prefix, pathId, shared_from_this(), getPeerOwnerKey(), entry);
   }
-  return {
-      getRibEntry(/*ingress=*/false, prefix, pathId),
-      true /* isPerPeerEntry */};
+  return entry;
 }
 
 std::vector<CIDRNetwork> AdjRib::getAllPrefixes() noexcept {
@@ -624,10 +620,20 @@ void AdjRib::sessionEstablished(
 
   /* Reset pending state from previous session */
   sendCoroScheduled_ = false;
+  resetAdjRibFlags();
 
   /* initialize update group key */
+  buildAndSetUpdateGroupKey();
+
+  // Reset the baton so the next termination cycle starts fresh.
+  // Must be after session setup completes and before new loops start.
+  sessionTerminateBaton_->reset();
+  logPeerEvent("SESSION_ADJRIB_CREATED", BGP_LOG_SRC());
+}
+
+const UpdateGroupKey& AdjRib::buildAndSetUpdateGroupKey() {
   updateGroupKey_ = UpdateGroupKey::buildUpdateGroupKey(
-      egressPolicyName_.has_value() ? *egressPolicyName_ : "",
+      egressPolicyName_,
       "", // TODO: need to pass in route filter statement name
       outDelay_,
       getBgpSessionType(),
@@ -646,11 +652,7 @@ void AdjRib::sessionEstablished(
       extNhEncodingCapable_,
       peeringParams_.peerGroupName.value_or(""),
       hasPeerEgressPolicyOverride());
-
-  // Reset the baton so the next termination cycle starts fresh.
-  // Must be after session setup completes and before new loops start.
-  sessionTerminateBaton_->reset();
-  logPeerEvent("SESSION_ADJRIB_CREATED", BGP_LOG_SRC());
+  return updateGroupKey_;
 }
 
 bool AdjRib::hasPeerEgressPolicyOverride() const noexcept {
@@ -723,6 +725,12 @@ folly::coro::Task<void> AdjRib::sessionTerminated(
     asyncScope_->requestCancellation();
     XLOGF(DBG1, "Requested cancellation of async tasks for {}", getPeerName());
   }
+
+  /*
+   * Cancel any in-flight rib dump scheduled on PeerManager's asyncScope_ (its
+   * cancellation source lives on this AdjRib), tying it to session teardown.
+   */
+  cancelRibDump();
 
   /**
    * During BGP daemon shutdown, clear per-peer AdjRibIn trees using
@@ -926,14 +934,18 @@ folly::coro::Task<void> AdjRib::sessionTerminated(
   co_return;
 }
 
-folly::coro::Task<void> AdjRib::stop() noexcept {
+folly::coro::Task<void> AdjRib::cleanupGrState(bool isDaemonShutdown) noexcept {
   if (remoteGrRestartTimer_) {
     XLOGF(DBG1, "Stopping remoteGrRestart Timer for {}", getPeerName());
-    co_await cleanupStaleRoutes();
+    if (!isDaemonShutdown) {
+      co_await cleanupStaleRoutes();
+    }
     remoteGrRestartTimer_.reset();
   }
   if (stalePathTimer_) {
-    co_await cleanupStaleRoutes();
+    if (!isDaemonShutdown) {
+      co_await cleanupStaleRoutes();
+    }
     XLOGF(
         DBG1,
         "Stopping stalePathTimer_ from previous termination for {}",
@@ -947,6 +959,26 @@ folly::coro::Task<void> AdjRib::stop() noexcept {
   if (!pending.empty()) {
     co_await folly::coro::collectAllRange(std::move(pending));
   }
+  co_return;
+}
+
+folly::coro::Task<void> AdjRib::stop() noexcept {
+  co_await cleanupGrState(/*isDaemonShutdown=*/true);
+
+  /*
+   * Cancel and join all AdjRib coroutines (processRibMessageLoop,
+   * processPeerMessageLoop, postTerminateBaton, sendBgpUpdates) while
+   * evb_ is still alive. This is called from PeerManager::stop()'s task
+   * running on the evb_. If deferred to the destructor, the evb_ is already
+   * dead (terminateLoopSoon), and blockingWait hangs forever because the
+   * coroutines can't run on the dead event loop.
+   */
+  if (asyncScope_) {
+    co_await asyncScope_->cancelAndJoinAsync();
+    asyncScope_.reset();
+  }
+
+  XLOGF(INFO, "[Exit] AdjRib::stop() completed for {}", getPeerName());
   co_return;
 }
 
@@ -980,7 +1012,7 @@ void AdjRib::setPendingEgressPolicyUpdate(bool egressChanged) {
 
   // Only set egress flag for peers not in initial announcement
   // (peers in initial announcement get full dump anyway)
-  pendingEgressPolicyUpdate_ = egressChanged && !inInitialAnnouncement();
+  egressPolicyUpdateRequired_ = egressChanged && !inInitialAnnouncement();
 }
 
 std::tuple<bool, bool> AdjRib::setRouteFilterStatement(
@@ -1070,7 +1102,8 @@ AdjRib::getPostPolicyAttributesPolicyTermAndInfo(
     const std::string& policyName,
     const folly::CIDRNetwork& prefix,
     const std::shared_ptr<const BgpPath>& prePolicyAttrs,
-    const std::shared_ptr<BgpPolicyActionData>& policyActionData) {
+    const std::shared_ptr<BgpPolicyActionData>& policyActionData,
+    bool isPartialDrain) {
   std::optional<AdjRibPolicyCache::PolicyCacheValue> cacheResult{std::nullopt};
   std::shared_ptr<const BgpPath> postPolicyAttrs{nullptr};
   std::string policyTermName{""};
@@ -1082,7 +1115,8 @@ AdjRib::getPostPolicyAttributesPolicyTermAndInfo(
         policyManager_->getPolicyAttributesMask(policyName),
         prefix,
         prePolicyAttrs,
-        policyActionData);
+        policyActionData,
+        isPartialDrain);
   }
 
   if (cacheResult == std::nullopt) {
@@ -1131,7 +1165,8 @@ AdjRib::getPostPolicyAttributesPolicyTermAndInfo(
           prefix,
           prePolicyAttrs,
           policyActionData,
-          attrsAndPolicy);
+          attrsAndPolicy,
+          isPartialDrain);
 
       // Expose to ODS counters
       BgpStats::setPolicyCacheNumEntries(policyCache_->size());
@@ -1227,7 +1262,7 @@ void AdjRib::activateChangeListConsumer() noexcept {
           }
           // Use iterator-based interface for consuming change items
           auto previousRibVersion = lastSeenRibVersion_;
-          changeListConsumer_->consumeChangesWithIterator();
+          changeListConsumer_->iterateChanges();
           if (changeListConsumer_->isStale(kConsumerStalenessThreshold) &&
               !changeListConsumer_->isStalenessLogged()) {
             XLOGF(
@@ -1388,7 +1423,7 @@ void AdjRib::registerDetachedConsumer(
           }
           // Consume available changes from CL
           auto previousRibVersion = lastSeenRibVersion_;
-          changeListConsumer_->consumeChangesWithIterator();
+          changeListConsumer_->iterateChanges();
           if (changeListConsumer_->isStale(kConsumerStalenessThreshold) &&
               !changeListConsumer_->isStalenessLogged()) {
             XLOGF(

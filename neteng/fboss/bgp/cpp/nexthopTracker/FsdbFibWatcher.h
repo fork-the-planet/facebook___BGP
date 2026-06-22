@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "fboss/agent/gen-cpp2/switch_state_types.h"
+#include "fboss/agent/if/gen-cpp2/ctrl_types.h"
 #include "fboss/fsdb/client/FsdbSubscriber.h"
 #include "fboss/fsdb/client/instantiations/FsdbCowStateSubManager.h"
 #include "fboss/fsdb/if/FsdbModel.h"
@@ -29,6 +31,7 @@
 #include <folly/container/F14Set.h>
 #include <folly/coro/Task.h>
 #include <folly/io/async/EventBase.h>
+#include <optional>
 
 namespace facebook::bgp {
 
@@ -58,14 +61,22 @@ class FsdbFibWatcher : public std::enable_shared_from_this<FsdbFibWatcher> {
       std::shared_ptr<NexthopCache> nexthopCache,
       nettools::bgplib::MonitoredBackPressuredQueue<RibInMessage>& ribInQ,
       folly::EventBase* evb,
-      std::shared_ptr<fboss::fsdb::FsdbCowStateSubManager> fsdbSubMgr);
+      std::shared_ptr<fboss::fsdb::FsdbCowStateSubManager> fsdbSubMgr,
+      /*
+       * Protocol/client whose nexthops the IGP cost is read from (min cost over
+       * that client's nexthops, with no intersection against the resolved fwd
+       * nexthops). Unset => read cost from fwd only (current behavior). Wired
+       * from the next_hop_tracking_use_openr_igp_cost config in
+       * NeighborWatcher; FBOSS-only.
+       */
+      std::optional<fboss::ClientID> igpCostClientId = std::nullopt);
 
   FsdbFibWatcher(const FsdbFibWatcher&) = delete;
   FsdbFibWatcher& operator=(const FsdbFibWatcher&) = delete;
   FsdbFibWatcher(FsdbFibWatcher&&) = delete;
   FsdbFibWatcher& operator=(FsdbFibWatcher&&) = delete;
 
-  ~FsdbFibWatcher() = default;
+  virtual ~FsdbFibWatcher() = default;
 
   /**
    * Add a peer address to track. Must be called before addPaths() to
@@ -86,6 +97,22 @@ class FsdbFibWatcher : public std::enable_shared_from_this<FsdbFibWatcher> {
    * NeighborWatcher::subscribe() so paths are registered before subscribe().
    **/
   void registerPeers(const std::vector<folly::IPAddress>& peerAddresses);
+
+  /**
+   * Return the subset of the given nexthops not already tracked (and de-dupe
+   * the input). Runs on evb_. Used by NeighborWatcher to decide whether a
+   * re-subscribe is needed for newly-learned nexthops.
+   **/
+  std::vector<folly::IPAddress> filterNewNexthops(
+      const std::vector<folly::IPAddress>& nexthops) const;
+
+  /**
+   * Register FSDB FIB host-route paths for newly-learned nexthops (e.g., from
+   * RIB-IN). The caller MUST stop the shared subscription first and
+   * re-subscribe the full path set afterwards (addPath cannot run on a live
+   * subscription). Runs on evb_.
+   **/
+  void addNexthopPaths(const std::vector<folly::IPAddress>& newNexthops);
 
   void stop() noexcept;
 
@@ -111,6 +138,26 @@ class FsdbFibWatcher : public std::enable_shared_from_this<FsdbFibWatcher> {
    **/
   folly::coro::Task<void> co_markNeedsReconcile();
 
+  /**
+   * Look up the IGP cost for a FIB route node.
+   *
+   * If igpCostClientId is set, the cost is read solely from that
+   * client/protocol's entry in nexthopsmulti.client2NextHopEntry: the minimum
+   * cost over that client's nexthops. The resolved fwd nexthops are not
+   * consulted -- there is no intersection between the client's nexthops and
+   * fwd. Returns nullopt when the client has no entry or none of its nexthops
+   * carry a cost.
+   *
+   * If igpCostClientId is unset, the cost is the minimum over fwd.nexthops[]
+   * (current behavior).
+   *
+   * Static and pure (no member access) to keep the selection logic unit
+   * testable independent of the FSDB COW tree.
+   */
+  static std::optional<uint32_t> lookupIgpCostFromRoute(
+      const facebook::fboss::state::RouteFields& route,
+      const std::optional<fboss::ClientID>& igpCostClientId);
+
  private:
   /**
    * Update nexthop cache and push changed statuses to ribInQ.
@@ -125,10 +172,23 @@ class FsdbFibWatcher : public std::enable_shared_from_this<FsdbFibWatcher> {
   void addPaths() noexcept;
 
   /**
+   * Fetch switch IDs from the agent once; no-op if already fetched.
+   **/
+  void ensureSwitchIds() noexcept;
+
+  /**
+   * Add FSDB FIB host-route paths (across all switch IDs) for a single
+   * nexthop and record it in subscribedPrefixes_. May throw (e.g. allocation
+   * failure inside the sub manager); callers handle that without crashing.
+   * virtual so tests can inject a failure to exercise the no-crash/retry path.
+   **/
+  virtual void addFsdbPathsForNexthop(const folly::IPAddress& nexthop);
+
+  /**
    * Check if a route exists in the COW tree for the given prefix and
-   * extract the minimum IGP cost across its resolved nexthops.
-   * Returns {exists, igpCost} where igpCost is nullopt when the route
-   * does not exist or no nexthop carries a cost value.
+   * extract its IGP cost via lookupIgpCostFromRoute() (honoring
+   * igpCostClientId_). Returns {exists, igpCost} where igpCost is nullopt
+   * when the route does not exist or no applicable nexthop carries a cost.
    **/
   std::pair<bool, std::optional<uint32_t>> routeExistsInCowTree(
       const std::string& prefixStr,
@@ -150,8 +210,11 @@ class FsdbFibWatcher : public std::enable_shared_from_this<FsdbFibWatcher> {
   folly::F14FastSet<folly::IPAddress> reachableNexthops_;
 
   /**
-   * Peer addresses being tracked — the authoritative set of peers whose FIB
-   * host routes are subscribed (or pending subscription) in FSDB.
+   * The authoritative set of nexthop addresses whose FIB host routes are
+   * subscribed (or pending subscription) in FSDB. Populated from configured
+   * BGP peers at startup (before the initial subscribe) and from RIB-IN
+   * learned nexthops at runtime. Used for dedup so a nexthop is subscribed
+   * exactly once.
    **/
   folly::F14FastSet<folly::IPAddress> subscribedPeers_;
 
@@ -163,6 +226,15 @@ class FsdbFibWatcher : public std::enable_shared_from_this<FsdbFibWatcher> {
       subscribedPrefixes_;
 
   /**
+   * Per-(switchId, prefix) paths already registered with the sub manager,
+   * recorded only after a successful addPath(). Makes addFsdbPathsForNexthop()
+   * idempotent so that a retry following a partial failure does not re-add an
+   * already-registered path (which would trip the sub manager's fatal
+   * "Duplicate path added" CHECK). Key format: "<switchId>|<prefix>".
+   **/
+  folly::F14FastSet<std::string> registeredFsdbPaths_;
+
+  /**
    * Whether addPaths() has been called. After this point, peer addresses
    * cannot be added or removed (paths are already registered with the
    * shared sub manager).
@@ -172,6 +244,11 @@ class FsdbFibWatcher : public std::enable_shared_from_this<FsdbFibWatcher> {
   std::shared_ptr<NexthopCache> nexthopCache_;
   nettools::bgplib::MonitoredBackPressuredQueue<RibInMessage>& ribInQ_;
   folly::EventBase* evb_;
+
+  // Protocol/client whose nexthops the IGP cost is read from. Unset => cost is
+  // read from the resolved fwd nexthops only (current behavior). See
+  // lookupIgpCostFromRoute().
+  std::optional<fboss::ClientID> igpCostClientId_;
 };
 
 } // namespace facebook::bgp

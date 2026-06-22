@@ -161,6 +161,21 @@ void initCounters() {
   fb303::ThreadCachedServiceData::get()->addStatExportType(
       kNeighborPortIdStateMismatch, fb303::SUM);
 
+  // [CRF File Mode]
+  fb303::ThreadCachedServiceData::get()->setCounter(kCrfFileModeEnabled, 0);
+  fb303::ThreadCachedServiceData::get()->addStatExportType(
+      kCrfArtifactReadSuccess, fb303::SUM);
+  fb303::ThreadCachedServiceData::get()->addStatExportType(
+      kCrfArtifactReadFailure, fb303::SUM);
+  fb303::ThreadCachedServiceData::get()->addStatExportType(
+      kCrfPolicyAppliedSuccess, fb303::SUM);
+  fb303::ThreadCachedServiceData::get()->addStatExportType(
+      kCrfPolicyAppliedFailure, fb303::SUM);
+  fb303::ThreadCachedServiceData::get()->addStatExportType(
+      kCrfThriftRpcRejected, fb303::SUM);
+  fb303::ThreadCachedServiceData::get()->addStatExportType(
+      kCrfForceUpdateBypass, fb303::SUM);
+
   initEgressBackpressureStats();
   initWellKnownCommunityStats();
 }
@@ -686,19 +701,45 @@ void setIngressPolicyAllPeersLastReEvaluationTimeMs(int64_t timeMs) {
       timeMs);
 }
 
+void setCrfFileModeEnabled(bool enabled) {
+  fb303::ThreadCachedServiceData::get()->setCounter(
+      kCrfFileModeEnabled, enabled ? 1 : 0);
+}
+
+void incrCrfArtifactReadSuccess() {
+  fb303::ThreadCachedServiceData::get()->addStatValue(
+      kCrfArtifactReadSuccess, 1);
+}
+
+void incrCrfArtifactReadFailure() {
+  fb303::ThreadCachedServiceData::get()->addStatValue(
+      kCrfArtifactReadFailure, 1);
+}
+
+void incrCrfPolicyAppliedSuccess() {
+  fb303::ThreadCachedServiceData::get()->addStatValue(
+      kCrfPolicyAppliedSuccess, 1);
+}
+
+void incrCrfPolicyAppliedFailure() {
+  fb303::ThreadCachedServiceData::get()->addStatValue(
+      kCrfPolicyAppliedFailure, 1);
+}
+
+void incrCrfThriftRpcRejected() {
+  fb303::ThreadCachedServiceData::get()->addStatValue(kCrfThriftRpcRejected, 1);
+}
+
+void incrCrfForceUpdateBypass() {
+  fb303::ThreadCachedServiceData::get()->addStatValue(kCrfForceUpdateBypass, 1);
+}
+
 } // namespace BgpStats
 
 //------------------------ RibStats ------------------------//
 namespace RibStats {
 
 void initCounters() {
-  fb303::ThreadCachedServiceData::get()->setCounter(kPsPolicyRcvd, 0);
-  fb303::ThreadCachedServiceData::get()->setCounter(kPsPolicyUpdate, 0);
-  fb303::ThreadCachedServiceData::get()->setCounter(kRaPolicyRcvd, 0);
-  fb303::ThreadCachedServiceData::get()->setCounter(kRaPolicyUpdate, 0);
-  fb303::ThreadCachedServiceData::get()->setCounter(kRfPolicyRcvd, 0);
-  fb303::ThreadCachedServiceData::get()->setCounter(kRfPolicyUpdate, 0);
-
   // init shadowRib entries size to be -1
   fb303::ThreadCachedServiceData::get()->setCounter(kTotalShadowRibEntries, -1);
 
@@ -730,19 +771,6 @@ void initCounters() {
       kNhtCacheNexthopUnreachable + ".count", 0);
   fb303::ThreadCachedServiceData::get()->setCounter(
       kNhtCacheNexthopUnreachable + ".count.60", 0);
-  // RouteAttributePolicy cache preservation counters
-  fb303::ThreadCachedServiceData::get()->setCounter(kRaPolicyCacheHit, 0);
-  fb303::ThreadCachedServiceData::get()->setCounter(kRaPolicyCacheMiss, 0);
-  fb303::ThreadCachedServiceData::get()->setCounter(
-      kRaPolicyCacheMigrationIdentical, 0);
-  fb303::ThreadCachedServiceData::get()->setCounter(
-      kRaPolicyCacheMigrationExpirationOnly, 0);
-  fb303::ThreadCachedServiceData::get()->setCounter(
-      kRaPolicyCacheMigrationSelective, 0);
-  fb303::ThreadCachedServiceData::get()->setCounter(kRaPolicyCachePreserved, 0);
-  fb303::ThreadCachedServiceData::get()->setCounter(
-      kRaPolicyCacheInvalidated, 0);
-  fb303::ThreadCachedServiceData::get()->setCounter(kRaPolicyReEvalPrefixes, 0);
 
   fb303::ThreadCachedServiceData::get()->setCounter(kAdjRibInCount, 0);
   fb303::ThreadCachedServiceData::get()->setCounter(kAdjRibInStaleCount, 0);
@@ -1062,7 +1090,14 @@ namespace PeerStats {
 void initCounters() {
   fb303::ThreadCachedServiceData::get()->setCounter(kTotalRcvdPrefixes, -1);
   fb303::ThreadCachedServiceData::get()->setCounter(kTotalAcceptedPrefixes, -1);
-  fb303::ThreadCachedServiceData::get()->setCounter(kTotalDroppedPrefixes, -1);
+  /*
+   * Initialize to 0 (not -1 like the sibling "not yet reported" counters) so
+   * droppedPrefixes always shows a real number. Every capacity/overload drop
+   * path increments it, so 0 unambiguously means "no prefixes dropped" rather
+   * than "never evaluated". See S676351.
+   */
+  fb303::ThreadCachedServiceData::get()->setCounter(
+      kTotalPrefixesDroppedByLimit, 0);
   fb303::ThreadCachedServiceData::get()->setCounter(kTotalPaths, -1);
   fb303::ThreadCachedServiceData::get()->setCounter(kTotalSentPrefixes, -1);
   fb303::ThreadCachedServiceData::get()->setCounter(kTotalUniquePrefixes, -1);
@@ -1070,7 +1105,6 @@ void initCounters() {
   fb303::ThreadCachedServiceData::get()->setCounter(
       kTotalGoldenVipPrefixes, -1);
   fb303::ThreadCachedServiceData::get()->setCounter(kMaxPeerRcvdPrefixes, -1);
-  fb303::ThreadCachedServiceData::get()->setCounter(kNoGrRestart, 0);
   fb303::ThreadCachedServiceData::get()->setCounter(
       kTotalPeerWithNoRouteExchange, 0);
 
@@ -1096,6 +1130,8 @@ void initCounters() {
   initMessagesRecv(kMessageRecvAnnouncedIpv6);
   initMessagesRecv(kMessageRecvWithdraw);
 
+  fb303::ThreadCachedServiceData::get()->addStatExportType(
+      kNoGrRestart, fb303::COUNT);
   fb303::ThreadCachedServiceData::get()->addStatExportType(
       kTotalHoldTimerExpiry, fb303::COUNT);
   fb303::ThreadCachedServiceData::get()->addStatExportType(
@@ -1197,8 +1233,10 @@ void setTotalAcceptedPrefixes(uint32_t val) {
   fb303::ThreadCachedServiceData::get()->setCounter(
       kTotalAcceptedPrefixes, val);
 }
-void setTotalDroppedPrefixes(uint32_t val) {
-  fb303::ThreadCachedServiceData::get()->setCounter(kTotalDroppedPrefixes, val);
+void incrementTotalPrefixesDroppedByLimit(uint32_t val) {
+  // Use the global ServiceData (not the thread-cached wrapper) so the increment
+  // writes through immediately and is visible to getCounter() on any thread.
+  fb303::fbData->incrementCounter(kTotalPrefixesDroppedByLimit, val);
 }
 void setTotalPaths(uint32_t val) {
   fb303::ThreadCachedServiceData::get()->setCounter(kTotalPaths, val);

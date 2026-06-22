@@ -35,6 +35,7 @@
 
 #include "neteng/fboss/bgp/cpp/stats/Stats.h"
 #include "neteng/fboss/bgp/cpp/tests/AdjRibOutUtils.h"
+#include "neteng/fboss/bgp/cpp/tests/BoundedWaitUtils.h"
 
 /**
  * Test suite for out delay in AdjRibOut with egress backpressure enabled.
@@ -254,7 +255,8 @@ CO_TEST_F(AdjRibOutDelayFixture, SimpleOutDelayTest) {
   std::thread evbThread([this]() { evb_.loopForever(); });
 
   /* Wait for prefixes to come through to the queue. */
-  auto msg = co_await adjRib_->boundedAdjRibOutQueue_->pop();
+  auto msg = co_await facebook::bgp::test::boundedPop(
+      *adjRib_->boundedAdjRibOutQueue_, "adjRib_->boundedAdjRibOutQueue_");
 
   /* Event loop will naturally drain all pending callbacks and terminate */
   evbThread.join();
@@ -323,7 +325,8 @@ CO_TEST_F(AdjRibOutDelayFixture, WithdrawBeforeOutDelayTimerFiresTest) {
   std::thread evbThread([this]() { evb_.loopForever(); });
 
   /* Wait for prefixes to come through to the queue. */
-  auto msg = co_await adjRib_->boundedAdjRibOutQueue_->pop();
+  auto msg = co_await facebook::bgp::test::boundedPop(
+      *adjRib_->boundedAdjRibOutQueue_, "adjRib_->boundedAdjRibOutQueue_");
 
   evbThread.join();
 
@@ -577,13 +580,17 @@ CO_TEST_F(AdjRibOutDelayFixture, NumBackpressureEventsStatsTest) {
    * Drain queues to let sendBgpMessages continue queueing updates.
    */
   while (!adjRib1->boundedAdjRibOutQueue_->empty()) {
-    co_await adjRib1->boundedAdjRibOutQueue_->pop();
+    co_await facebook::bgp::test::boundedPop(
+        *adjRib1->boundedAdjRibOutQueue_, "adjRib1->boundedAdjRibOutQueue_");
   }
-  co_await adjRib1->boundedAdjRibOutQueue_->pop();
+  co_await facebook::bgp::test::boundedPop(
+      *adjRib1->boundedAdjRibOutQueue_, "adjRib1->boundedAdjRibOutQueue_");
   while (!adjRib2->boundedAdjRibOutQueue_->empty()) {
-    co_await adjRib2->boundedAdjRibOutQueue_->pop();
+    co_await facebook::bgp::test::boundedPop(
+        *adjRib2->boundedAdjRibOutQueue_, "adjRib2->boundedAdjRibOutQueue_");
   }
-  co_await adjRib2->boundedAdjRibOutQueue_->pop();
+  co_await facebook::bgp::test::boundedPop(
+      *adjRib2->boundedAdjRibOutQueue_, "adjRib2->boundedAdjRibOutQueue_");
 
   facebook::fb303::ThreadCachedServiceData::get()->publishStats();
   EXPECT_EQ(

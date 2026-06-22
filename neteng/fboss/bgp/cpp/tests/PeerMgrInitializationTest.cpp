@@ -37,6 +37,7 @@
 #include "neteng/fboss/bgp/cpp/config/ConfigManager.h"
 #include "neteng/fboss/bgp/cpp/lib/BgpStructs.h"
 #include "neteng/fboss/bgp/cpp/stats/Stats.h"
+#include "neteng/fboss/bgp/cpp/tests/BoundedWaitUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/PeerManagerTestUtils.h"
 
 using ::testing::_;
@@ -343,7 +344,7 @@ TEST_F(PeerManagerInitializationTestFixture, ProcessAdjRibMsgLoopTest) {
   taskFutures.emplace_back(std::move(task));
 
   std::thread stopPeerThread([&]() {
-    stopPeerBaton.wait();
+    facebook::bgp::test::boundedBatonWait(stopPeerBaton, "stopPeerBaton");
 
     const auto eorReceivedStr = fmt::format(
         kInitEventCounterFormat,

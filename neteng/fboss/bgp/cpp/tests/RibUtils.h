@@ -193,6 +193,7 @@ class MockRib : public RibDC {
  public:
   using RibDC::CacheMigrationResult;
   using RibDC::migrateRouteAttributePolicyCache;
+  using RibDC::recordPartialDrainTransition;
   using RibDC::RibDC;
   using RibDC::ribPolicyLogger_;
   using RibDC::scubaLogger_;
@@ -222,7 +223,8 @@ class MockRib : public RibDC {
   void clearPathSelectionPolicy() override;
 
   void setRouteFilterPolicy(
-      std::unique_ptr<rib_policy::TRouteFilterPolicy> policy) override;
+      std::unique_ptr<rib_policy::TRouteFilterPolicy> policy,
+      bool forceUpdate = false) override;
 
   void clearRouteFilterPolicy() override;
 
@@ -285,7 +287,8 @@ class MockRib : public RibDC {
       bool isBootstrap = false) override;
   bool replaceRouteFilterPolicy(
       std::unique_ptr<RouteFilterPolicy> newPolicy,
-      bool isBootstrap = false) override;
+      bool isBootstrap = false,
+      bool forceUpdate = false) override;
 
   void fulfillRibPolicyReplacePromise();
 

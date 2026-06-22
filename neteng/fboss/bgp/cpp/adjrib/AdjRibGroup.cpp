@@ -33,6 +33,7 @@
 #include "neteng/fboss/bgp/cpp/adjrib/AdjRibGroupSerializer.h"
 #include "neteng/fboss/bgp/cpp/adjrib/WellKnownCommunityFilter.h"
 #include "neteng/fboss/bgp/cpp/changeTracker/ConsumerBitmap.h"
+#include "neteng/fboss/bgp/cpp/common/Consts.h"
 #include "neteng/fboss/bgp/cpp/policy/PolicyManager.h"
 #include "neteng/fboss/bgp/cpp/stats/Stats.h"
 
@@ -412,6 +413,11 @@ void AdjRibOutGroup::activateChangeListConsumer() noexcept {
   XLOGF(
       DBG1, "Register update group {} to changeListTracker", groupDescriptor_);
 
+  // Register with tracker in polled mode
+  changeListConsumer_->registerWithTracker();
+  changeListConsumer_->setPolledMode();
+  changeListConsumer_->setBitmap();
+
   changeListConsumeTimer_ = folly::AsyncTimeout::make(evb_, [this]() noexcept {
     /*
      * Start a polled cycle to consume available changes.
@@ -445,7 +451,7 @@ void AdjRibOutGroup::activateChangeListConsumer() noexcept {
           auto previousRibVersion = lastSeenRibVersion_;
           {
             ScopedProfile profile("AdjRibOutGroup::consumeChangeList");
-            changeListConsumer_->consumeChangesWithIterator();
+            changeListConsumer_->iterateChanges();
           }
           if (changeListConsumer_->isStale(kConsumerStalenessThreshold) &&
               !changeListConsumer_->isStalenessLogged()) {
@@ -479,11 +485,19 @@ void AdjRibOutGroup::activateChangeListConsumer() noexcept {
           co_return;
         })));
   });
+}
 
-  // Register with tracker in polled mode
-  changeListConsumer_->registerWithTracker();
-  changeListConsumer_->setPolledMode();
-  changeListConsumer_->setBitmap();
+void AdjRibOutGroup::scheduleConsumeTimer() noexcept {
+  if (!changeListConsumeTimer_) {
+    XLOGF(
+        ERR,
+        "Group {}: cannot schedule consume timer — timer not created",
+        groupDescriptor_);
+    return;
+  }
+  if (changeListConsumeTimer_->isScheduled()) {
+    return;
+  }
   changeListConsumeTimer_->scheduleTimeout(
       std::chrono::milliseconds(mraiInterval_));
 }
@@ -542,25 +556,11 @@ void AdjRibOutGroup::scheduleInitialDump() noexcept {
   // Start the coroutine to build initial dump
   // Only proceed if update group feature is enabled
   if (enableUpdateGroup_) {
-    co_withExecutor(
-        &evb_, folly::coro::co_invoke([this]() -> folly::coro::Task<void> {
-          co_await buildInitialDumpFromShadowRib();
-        }))
-        .start();
+    asyncScope_.add(
+        co_withExecutor(&evb_, buildAndScheduleSendInitialDumpFromShadowRib()));
   }
 }
 
-/*
- * @brief  Build initial RIB dump from shadow RIB
- *         Walks shadow RIB, builds RibOutAnnouncement, processes it
- *         Transitions from UNINITIALIZED to WAITING state
- *
- * Similar to PeerManager::processRibDumpReq but operates at group level.
- *
- * @param  none
- *
- * @return folly::coro::Task<void>
- */
 /*
  * Shared core: walk ShadowRib and process all entries through
  * processRibOutAnnouncement().
@@ -608,7 +608,8 @@ uint64_t AdjRibOutGroup::walkAndProcessShadowRib(bool sendWithEoR) {
             srEntry.ribPolicyUcmpWeight,
             srEntry.newlyInstalledInLocalRib,
             srEntry.installTimeStamp,
-            srEntry.ribVersion);
+            srEntry.ribVersion,
+            bestpath->isPartialDrain);
       }
     } else {
       // Send out all multipaths with add-path enabled
@@ -629,7 +630,8 @@ uint64_t AdjRibOutGroup::walkAndProcessShadowRib(bool sendWithEoR) {
               srEntry.ribPolicyUcmpWeight,
               srEntry.newlyInstalledInLocalRib,
               srEntry.installTimeStamp,
-              srEntry.ribVersion);
+              srEntry.ribVersion,
+              multipath->isPartialDrain);
         }
       }
     }
@@ -656,7 +658,12 @@ uint64_t AdjRibOutGroup::walkAndProcessShadowRib(bool sendWithEoR) {
   return maxRibVersion;
 }
 
-folly::coro::Task<void> AdjRibOutGroup::buildInitialDumpFromShadowRib() {
+/*
+ * Build initial RIB dump from shadow RIB.
+ * Walks shadow RIB, builds RibOutAnnouncement, processes it.
+ * Transitions from UNINITIALIZED to WAITING state.
+ */
+uint64_t AdjRibOutGroup::processRibDumpForGroup() {
   XLOGF(
       INFO, "Group {} starting initial dump from shadow RIB", groupDescriptor_);
 
@@ -666,7 +673,7 @@ folly::coro::Task<void> AdjRibOutGroup::buildInitialDumpFromShadowRib() {
         "No shadow RIB reference for group {}, completing dump with empty list",
         groupDescriptor_);
     state_ = UpdateGroupState::IDLE;
-    co_return;
+    return lastSeenRibVersion_;
   }
 
   auto maxRibVersion = walkAndProcessShadowRib(true /* sendWithEoR */);
@@ -676,6 +683,35 @@ folly::coro::Task<void> AdjRibOutGroup::buildInitialDumpFromShadowRib() {
    * Note: Initial dump sent with EoR marker
    */
   state_ = UpdateGroupState::WAITING;
+
+  /*
+   * Set cached RIB version on the group after initial dump.
+   * All members of an update group share this version since they
+   * receive updates as a unit. Display logic reads from group.
+   */
+  XLOGF(
+      DBG2,
+      "Group {}: Updating cached RIB version from {} to {} after rib walk",
+      groupDescriptor_,
+      lastSeenRibVersion_,
+      maxRibVersion);
+  setLastSeenRibVersion(maxRibVersion);
+
+  initialDumpCompletionTimeMs_ =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count();
+
+  return lastSeenRibVersion_;
+}
+
+folly::coro::Task<void>
+AdjRibOutGroup::buildAndScheduleSendInitialDumpFromShadowRib() {
+  auto lastSeenRibVersion = processRibDumpForGroup();
+
+  if (state_ == UpdateGroupState::IDLE) {
+    co_return;
+  }
 
   /*
    * Transition INIT peers to JOINED_RUNNING
@@ -693,42 +729,12 @@ folly::coro::Task<void> AdjRibOutGroup::buildInitialDumpFromShadowRib() {
           adjRib->getPeerState(),
           PeerUpdateState::JOINED_RUNNING);
       adjRib->setPeerState(PeerUpdateState::JOINED_RUNNING);
+      adjRib->setLastSeenRibVersion(lastSeenRibVersion);
     }
   }
 
-  /*
-   * Set cached RIB version on the group after initial dump.
-   * All members of an update group share this version since they
-   * receive updates as a unit. Display logic reads from group.
-   */
-  XLOGF(
-      DBG2,
-      "Group {}: Updating cached RIB version from {} to {} after initial dump",
-      groupDescriptor_,
-      lastSeenRibVersion_,
-      maxRibVersion);
-  setLastSeenRibVersion(maxRibVersion);
-
-  initialDumpCompletionTimeMs_ =
-      std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::system_clock::now().time_since_epoch())
-          .count();
-
-  /*
-   * Activate change list consumer to start receiving incremental updates
-   * from the change tracker. This registers the group with the tracker
-   * and starts the MRAI timer for consuming changes.
-   */
-  if (changeListConsumer_) {
-    activateChangeListConsumer();
-  } else {
-    XLOGF(
-        WARN,
-        "Group {} has no change list consumer, cannot activate after initial dump",
-        groupDescriptor_);
-  }
-
-  co_return;
+  activateChangeListConsumer();
+  scheduleConsumeTimer();
 }
 
 /*
@@ -815,6 +821,7 @@ void AdjRibOutGroup::processShadowRibEntryChange(
         entry.newlyInstalledInLocalRib = srEntry.newlyInstalledInLocalRib;
         entry.installTimeStamp = srEntry.installTimeStamp;
         entry.ribVersion = srEntry.ribVersion;
+        entry.isPartialDrain = multipath->isPartialDrain;
         announcement.addPathEntries.push_back(entry);
       } else if (isShadowRibRouteInWithdraw(multipath->flags)) {
         /*
@@ -859,6 +866,7 @@ void AdjRibOutGroup::processShadowRibEntryChange(
       entry.newlyInstalledInLocalRib = srEntry.newlyInstalledInLocalRib;
       entry.installTimeStamp = srEntry.installTimeStamp;
       entry.ribVersion = srEntry.ribVersion;
+      entry.isPartialDrain = srEntry.bestpath->isPartialDrain;
       announcement.entries.push_back(entry);
     } else if (isShadowRibRouteInWithdraw(srEntry.bestpath->flags)) {
       /*
@@ -1211,6 +1219,9 @@ void AdjRibOutGroup::processRibAnnouncedEntryForGroup(
   // Clone attributes for policy evaluation
   // NOTE: Skip per-peer LBW config (no per-peer config at group level)
   auto prePolicyAttrs = entry.attrs->clone();
+  if (entry.isPartialDrain) {
+    applyPartialDrainCommunities(prePolicyAttrs);
+  }
 
   // Get post policy attributes
   // Policy cache lookup happens inside getPostOutPolicyAttributesAndInfo
@@ -1463,7 +1474,8 @@ AdjRibOutGroup::getPostPolicyAttributesPolicyTermAndInfo(
     const std::string& policyName,
     const folly::CIDRNetwork& prefix,
     const std::shared_ptr<const BgpPath>& prePolicyAttrs,
-    const std::shared_ptr<BgpPolicyActionData>& policyActionData) noexcept {
+    const std::shared_ptr<BgpPolicyActionData>& policyActionData,
+    bool isPartialDrain) noexcept {
   std::optional<AdjRibPolicyCache::PolicyCacheValue> cacheResult{std::nullopt};
   std::shared_ptr<const BgpPath> postPolicyAttrs{nullptr};
   std::string policyTermName;
@@ -1475,7 +1487,8 @@ AdjRibOutGroup::getPostPolicyAttributesPolicyTermAndInfo(
         policyManager_->getPolicyAttributesMask(policyName),
         prefix,
         prePolicyAttrs,
-        policyActionData);
+        policyActionData,
+        isPartialDrain);
   }
 
   if (cacheResult == std::nullopt) {
@@ -1513,7 +1526,8 @@ AdjRibOutGroup::getPostPolicyAttributesPolicyTermAndInfo(
           prefix,
           prePolicyAttrs,
           policyActionData,
-          attrsAndPolicy);
+          attrsAndPolicy,
+          isPartialDrain);
     }
 
   } else {
@@ -1573,10 +1587,11 @@ AdjRibOutGroup::getPostOutPolicyAttributesAndInfo(
 
     const auto& [attrs, postTermName, postPolicyInfo] =
         getPostPolicyAttributesPolicyTermAndInfo(
-            groupKey_.egressPolicyName,
+            *groupKey_.egressPolicyName,
             update.prefix,
             prePolicyAttrs,
-            policyActionData);
+            policyActionData,
+            update.isPartialDrain);
 
     policyResultAttrs = attrs;
     postPolicyResultInfo = postPolicyInfo;
@@ -1615,6 +1630,7 @@ void AdjRibOutGroup::updateAttributesOutWithoutNexthop(
     XLOGF(WARN, "No peering params cached for group {}", groupDescriptor_);
     return;
   }
+
   PeerConfig config{
       *peeringParams_, groupKey_.egressPolicyName, policyManager_.get()};
   updateAttributesOutWithoutNexthopCommon(
@@ -1970,6 +1986,7 @@ folly::coro::Task<void> AdjRibOutGroup::distributeMessageToInSyncPeers(
 
   uint32_t pushOkCount = 0;
   uint32_t pushPendingCount = 0;
+  uint32_t pushDroppedCount = 0;
 
   // Serialize once at group level if enabled
   nettools::bgplib::UpdateDescriptor groupDescriptor;
@@ -2063,17 +2080,29 @@ folly::coro::Task<void> AdjRibOutGroup::distributeMessageToInSyncPeers(
 
     if (result == PushResult::PUSH_OK) {
       pushOkCount++;
-    } else { // PUSH_PENDING
+    } else if (result == PushResult::PUSH_PENDING) {
       pushPendingCount++;
+    } else {
+      /* PUSH_FAILED: scheduling failed, blocked state already cleared.
+       * Message is dropped — peer session is likely going down. */
+      pushDroppedCount++;
+      XLOGF(
+          WARN,
+          "Group {}: Dropped message for peer {} at bit {} — "
+          "deferred push scheduling failed",
+          groupDescriptor_,
+          adjRib->getPeerName(),
+          bitPos);
     }
   }
 
   XLOGF(
       DBG3,
-      "Group {} distributed message ({} immediate, {} pending)",
+      "Group {} distributed message ({} immediate, {} pending, {} dropped)",
       groupDescriptor_,
       pushOkCount,
-      pushPendingCount);
+      pushPendingCount,
+      pushDroppedCount);
 
   // Wait for all pending pushes to complete
   if (pushPendingCount > 0) {
@@ -2124,10 +2153,21 @@ AdjRibOutGroup::PushResult AdjRibOutGroup::tryPushToPeer(
         adjRib->getPeerName(),
         bitPos);
 
-    // Schedule deferred push coroutine
-    asyncScope_.add(
-        folly::coro::co_withExecutor(
-            &evb_, deferredPushToPeer(message, adjRib)));
+    // Schedule deferred push on the peer's asyncScope
+    if (!adjRib->scheduleDeferredPushToPeer(message)) {
+      /* Scheduling failed (asyncScope null or cancelled). Clear the
+       * blocked state we just set so waitForAllPushesToComplete doesn't
+       * hang on a bit that will never be cleared. */
+      XLOGF(
+          WARN,
+          "Group {}: Failed to schedule deferred push for peer {} at bit {}, "
+          "clearing blocked state",
+          groupDescriptor_,
+          adjRib->getPeerName(),
+          bitPos);
+      markPeerUnblocked(adjRib);
+      return PushResult::PUSH_FAILED;
+    }
 
     return PushResult::PUSH_PENDING;
   } else {
@@ -2142,43 +2182,6 @@ AdjRibOutGroup::PushResult AdjRibOutGroup::tryPushToPeer(
         bitPos);
 
     return PushResult::PUSH_OK;
-  }
-}
-
-/*
- * @brief  Deferred push coroutine - waits for queue space then pushes
- *
- * This coroutine is scheduled when a peer's queue is blocked.
- * It waits for queue space to become available, then pushes the message
- * and clears the peer's bit in adjRibBlockedBitmap_.
- *
- * @param  message - Message to push (InputMessageT variant)
- * @param  adjRib - Peer's AdjRib (captured by value via shared_ptr)
- * @param  bitPos - Peer's bit position
- * @return void
- */
-folly::coro::Task<void> AdjRibOutGroup::deferredPushToPeer(
-    nettools::bgplib::FiberBgpPeer::InputMessageT message,
-    std::shared_ptr<AdjRib> adjRib) noexcept {
-  bool pushed = false;
-
-  /* RAII guard: Always clear blocked state and log when coroutine exits */
-  auto guard = folly::makeGuard([this, &adjRib, &pushed] {
-    markPeerUnblocked(adjRib);
-    XLOGF(
-        DBG2,
-        "Group {} deferred push for peer {} at bit {}: pushed={}",
-        groupDescriptor_,
-        adjRib->getPeerName(),
-        adjRib->getGroupBitPosition(),
-        pushed);
-  });
-
-  co_await folly::coro::co_safe_point;
-
-  auto boundedQueue = adjRib->getBoundedAdjRibOutQueue();
-  if (boundedQueue && co_await boundedQueue->waitToPush()) {
-    pushed = boundedQueue->push(message);
   }
 }
 
@@ -2374,31 +2377,12 @@ void AdjRibOutGroup::unregisterPeer(
    * When coroutine wakes up, it will find bit cleared and return safely.
    */
 
-  // Cancel slow peer duration timer if active
-  adjRib->resetSlowPeerDurationTimer();
-
-  // Clean up peer block info
-  adjRib->resetPeerBlockInfo();
-
-  // Deactivate detached mode if peer was detached
   if (adjRib->isDetachedPeer()) {
     adjRib->deactivateDetachedModeProcessing();
   }
 
-  // Clear all bitmaps for this peer
-  BitmapUtils::clearBit(adjRibEstablishedBitmap_, bit);
-  clearSyncBit(bit);
-  BitmapUtils::clearBit(adjRibBlockedBitmap_, bit);
-  detachedPeers_.erase(adjRib);
-
-  // Remove from tracking maps
-  bitToAdjRibs_.erase(bit);
-
-  // Free bit position back to bit manager for reuse
-  bitManager_.freeConsumerBit(bit);
-
-  // Clear bit position in adjRib
-  adjRib->clearGroupBitPosition();
+  adjRib->resetPeerBlockInfo();
+  removePeer(adjRib);
 
   XLOGF(
       INFO,
@@ -2439,11 +2423,6 @@ void AdjRibOutGroup::handleDetachedPeerDown(
       adjRib->getPeerState(),
       PeerUpdateState::DOWN);
   adjRib->setPeerState(PeerUpdateState::DOWN);
-
-  /*
-   * Cancel slow peer timer if active (update-group-specific timer)
-   */
-  adjRib->resetSlowPeerDurationTimer();
 
   /*
    * Clean up detached mode state (CL consumer, timers, RIB version)
@@ -2495,24 +2474,8 @@ void AdjRibOutGroup::handleDetachedPeerDown(
         bit);
   }
 
-  /* Clear group bitmaps for this peer (update-group-specific) */
-  BitmapUtils::clearBit(adjRibEstablishedBitmap_, bit);
-  clearSyncBit(bit);
-  BitmapUtils::clearBit(adjRibBlockedBitmap_, bit);
-  detachedPeers_.erase(adjRib);
-
-  /*
-   * Remove from group tracking maps (update-group-specific)
-   */
-  bitToAdjRibs_.erase(bit);
-
   adjRib->resetPeerBlockInfo();
-
-  /* Free bit position back to bit manager for reuse */
-  bitManager_.freeConsumerBit(bit);
-
-  /* Clear bit position in adjRib (update-group-specific association) */
-  adjRib->clearGroupBitPosition();
+  removePeer(adjRib);
 
   XLOGF(
       INFO,
@@ -2528,6 +2491,22 @@ void AdjRibOutGroup::handleDetachedPeerDown(
    * 3. TODO: If this was the last member, the group will be destroyed
    * when the last non-detached peer leaves
    */
+}
+
+void AdjRibOutGroup::removePeer(
+    const std::shared_ptr<AdjRib>& adjRib) noexcept {
+  uint64_t bit = adjRib->getGroupBitPosition();
+
+  adjRib->resetSlowPeerDurationTimer();
+
+  BitmapUtils::clearBit(adjRibEstablishedBitmap_, bit);
+  clearSyncBit(bit);
+  BitmapUtils::clearBit(adjRibBlockedBitmap_, bit);
+  detachedPeers_.erase(adjRib);
+
+  bitToAdjRibs_.erase(bit);
+  bitManager_.freeConsumerBit(bit);
+  adjRib->clearGroupBitPosition();
 }
 
 /*
@@ -2629,6 +2608,75 @@ bool AdjRibOutGroup::hasBlockedPeers() const noexcept {
 }
 
 /*
+ * Core peer detachment logic shared by detachSlowPeer and policy re-evaluation.
+ * detachPeer is not responsible for setting the peer state transition.
+ * The caller determines the appropriate target state.
+ */
+void AdjRibOutGroup::detachPeer(
+    const std::shared_ptr<AdjRib>& adjRib) noexcept {
+  uint64_t bit = adjRib->getGroupBitPosition();
+
+  XLOGF(
+      INFO,
+      "Group {}: Detaching peer {} at bit {}",
+      groupDescriptor_,
+      adjRib->getPeerName(),
+      bit);
+
+  // 1. Copy egress prefix counts while peer is still IN_SYNC
+  adjRib->copyEgressPrefixCountsFrom(stats_);
+
+  // 2. Clone packing list for the peer
+  clonePackingListForPeer(adjRib);
+
+  // 3. Mark peer as detached (adds to detachedPeers_, clears sync bit)
+  markPeerDetached(adjRib);
+
+  // 4. Peer inherits version fields
+  adjRib->setLastSeenRibVersion(lastSeenRibVersion_);
+  adjRib->setDetachedRibVersion(lastSeenRibVersion_);
+
+  // 5. Clear blocked bitmap (peer is leaving the group's sync set)
+  BitmapUtils::clearBit(adjRibBlockedBitmap_, bit);
+
+  // 6. Cancel slow peer duration timer (may be pending if peer was blocked)
+  adjRib->cancelSlowPeerDurationTimer();
+
+  // 7. Register detached consumer at group's CL position
+  if (changeListTracker_ && changeListConsumer_ && addPathConsumerBitmap_ &&
+      nonAddPathConsumerBitmap_) {
+    adjRib->registerDetachedConsumer(
+        changeListTracker_,
+        changeListConsumer_,
+        *addPathConsumerBitmap_,
+        *nonAddPathConsumerBitmap_);
+  } else {
+    XLOGF(
+        WARN,
+        "Group {}: Cannot register detached consumer for peer {} at bit {} - "
+        "missing changeListTracker or consumer bitmaps",
+        groupDescriptor_,
+        adjRib->getPeerName(),
+        bit);
+  }
+
+  // 8. Set EoR state if the group has pending EoR
+  if (egressEoRsPending_) {
+    adjRib->setEgressEoRsPending();
+  }
+
+  XLOGF(
+      INFO,
+      "Group {}: Peer {} at bit {} detached successfully "
+      "(lastSeenRibVersion={}, detachedRibVersion={})",
+      groupDescriptor_,
+      adjRib->getPeerName(),
+      bit,
+      lastSeenRibVersion_,
+      lastSeenRibVersion_);
+}
+
+/*
  * Detach a slow peer from the group.
  */
 void AdjRibOutGroup::detachSlowPeer(
@@ -2669,37 +2717,14 @@ void AdjRibOutGroup::detachSlowPeer(
       adjRib->getPeerName(),
       bit);
 
-  // 1. Clone packing list for the peer
-  clonePackingListForPeer(adjRib);
+  detachPeer(adjRib);
 
-  /*
-   * 1a. Copy egress prefix counts from group to peer. The peer necessarily
-   * advertised the same set of prefixes as the group if it is IN_SYNC.
-   */
-  adjRib->copyEgressPrefixCountsFrom(stats_);
-
-  // 2. Mark peer as detached (also clears sync bit)
-  markPeerDetached(adjRib);
-
-  // 3. Peer inherits version field
-  adjRib->setLastSeenRibVersion(lastSeenRibVersion_);
-  adjRib->setDetachedRibVersion(lastSeenRibVersion_);
-
-  /*
-   * 3a. Set EoR state on peer based on calling context or group state.
-   * The duration-based slow peer timer calls detachSlowPeer without
-   * sendWithEoR context. Check the group's egressEoRsPending_ flag
-   * to ensure peers detached during initial dump still get EoR after
-   * catching up via detached mode processing.
-   */
-  if (sendWithEoR || egressEoRsPending_) {
+  // Slow-peer-specific: set EoR if caller requires it
+  if (sendWithEoR) {
     adjRib->setEgressEoRsPending();
   }
 
-  // 4. Clear peer bit from adjRibBlockedBitmap_
-  BitmapUtils::clearBit(adjRibBlockedBitmap_, bit);
-
-  // 6. Transition peer state: JOINED_BLOCKED -> DETACHED_BLOCKED
+  // Slow-peer-specific: transition JOINED_BLOCKED -> DETACHED_BLOCKED
   XLOGF(
       DBG1,
       "Group {}: Peer {} at bit {} State Transition: {} -> {}",
@@ -2709,37 +2734,6 @@ void AdjRibOutGroup::detachSlowPeer(
       adjRib->getPeerState(),
       PeerUpdateState::DETACHED_BLOCKED);
   adjRib->setPeerState(PeerUpdateState::DETACHED_BLOCKED);
-
-  // 7. Cancel slow peer timer
-  adjRib->cancelSlowPeerDurationTimer();
-
-  // 8. Register detached consumer at group's CL position
-  if (changeListTracker_ && changeListConsumer_ && addPathConsumerBitmap_ &&
-      nonAddPathConsumerBitmap_) {
-    adjRib->registerDetachedConsumer(
-        changeListTracker_,
-        changeListConsumer_,
-        *addPathConsumerBitmap_,
-        *nonAddPathConsumerBitmap_);
-  } else {
-    XLOGF(
-        WARN,
-        "Group {}: Cannot register detached consumer for peer {} at bit {} - "
-        "missing changeListTracker or consumer bitmaps",
-        groupDescriptor_,
-        adjRib->getPeerName(),
-        bit);
-  }
-
-  XLOGF(
-      INFO,
-      "Group {}: Peer {} at bit {} detached successfully "
-      "(lastSeenRibVersion={}, detachedRibVersion={})",
-      groupDescriptor_,
-      adjRib->getPeerName(),
-      bit,
-      lastSeenRibVersion_,
-      lastSeenRibVersion_);
 }
 
 /*
@@ -2976,6 +2970,13 @@ std::vector<std::shared_ptr<AdjRib>> AdjRibOutGroup::tryAcceptPeersToGroup(
           peer->getPeerState(),
           PeerUpdateState::DETACHED_RUNNING);
       peer->setPeerState(PeerUpdateState::DETACHED_RUNNING);
+      /*
+       * Update detachedRibVersion to the group's current version so that
+       * the next collapse attempt only flags entries newer than this point.
+       * Without this, the same group-only entries keep being detected as
+       * discrepancies on every rejoin attempt (infinite loop).
+       */
+      peer->setDetachedRibVersion(lastSeenRibVersion_);
       peer->reschedulePackingTimers();
       peer->clearAdjRibFlag(AdjRib::RIB_OUT_DISCREPANCY);
       continue;
@@ -3069,10 +3070,9 @@ AdjRibEntry* AdjRibOutGroup::copyEntryForPeer(
     const folly::CIDRNetwork& prefix,
     uint32_t pathId,
     const std::shared_ptr<AdjRib>& peer,
+    const AdjRibOutOwnerKey& effectiveOwnerKey,
     const AdjRibEntry* entryToCopy) noexcept {
-  auto peerOwnerKey = peer->getPeerOwnerKey();
-
-  auto peerEntry = addRibEntry(prefix, peerOwnerKey, pathId);
+  auto peerEntry = addRibEntry(prefix, effectiveOwnerKey, pathId);
 
   peerEntry->flags_ = entryToCopy->flags_;
   peerEntry->setPreOut(entryToCopy->getPreOut());
@@ -3101,7 +3101,8 @@ void AdjRibOutGroup::lazyClonePathForDetachedPeers(
   for (const auto& adjRib : detachedPeers_) {
     if (shouldClonePathForPeer(
             radixNodeItr, pathId, adjRib, groupEntry->getRibVersion())) {
-      copyEntryForPeer(prefix, pathId, adjRib, groupEntry);
+      copyEntryForPeer(
+          prefix, pathId, adjRib, adjRib->getPeerOwnerKey(), groupEntry);
     }
   }
 }
@@ -3114,7 +3115,8 @@ void AdjRibOutGroup::lazyCloneLiteForDetachedPeers(
   for (const auto& adjRib : detachedPeers_) {
     if (shouldCloneLiteForPeer(
             radixNodeItr, adjRib, groupEntry->getRibVersion())) {
-      copyEntryForPeer(prefix, pathId, adjRib, groupEntry);
+      copyEntryForPeer(
+          prefix, pathId, adjRib, adjRib->getPeerOwnerKey(), groupEntry);
     }
   }
 }

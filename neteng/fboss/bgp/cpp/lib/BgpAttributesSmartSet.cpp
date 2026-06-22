@@ -45,7 +45,7 @@ void BgpAttributesSmartSet::removeEntry(BgpAttributesWrapper& attrWrapper) {
   attributesSet_.erase(attrWrapper);
 }
 
-folly::Optional<BgpAttributesWrapper> BgpAttributesSmartSet::getEntry(
+std::optional<BgpAttributesWrapper> BgpAttributesSmartSet::getEntry(
     const bgplib::BgpAttributes& attrRef) {
   auto attrWrapper =
       BgpAttributesWrapper(std::make_shared<bgplib::BgpAttributes>(attrRef));
@@ -55,7 +55,7 @@ folly::Optional<BgpAttributesWrapper> BgpAttributesSmartSet::getEntry(
     return *result;
   }
 
-  return folly::none;
+  return std::nullopt;
 }
 
 bool BgpAttributesSmartSet::containsEntry(

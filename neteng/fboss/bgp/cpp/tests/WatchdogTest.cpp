@@ -31,6 +31,7 @@
 #include <folly/coro/BlockingWait.h>
 
 #include "neteng/fboss/bgp/cpp/config/Config.h"
+#include "neteng/fboss/bgp/cpp/tests/BoundedWaitUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/Utils.h"
 #include "neteng/fboss/bgp/cpp/watchdog/Watchdog.h"
 
@@ -144,11 +145,12 @@ TEST(WatchdogTest, ProcessQueueSizeTest) {
 
     EXPECT_EQ(1, sessionMgrQ.size());
     EXPECT_EQ(1, ribQ.size());
-    auto msg1 = folly::coro::blockingWait(sessionMgrQ.pop());
+    auto msg1 =
+        facebook::bgp::test::boundedBlockingPop(sessionMgrQ, "sessionMgrQ");
     EXPECT_EQ(std::nullopt, msg1.peerId_);
     EXPECT_EQ(OperationStatus::PAUSE, msg1.opStatus_);
 
-    auto msg2 = folly::coro::blockingWait(ribQ.pop());
+    auto msg2 = facebook::bgp::test::boundedBlockingPop(ribQ, "ribQ");
     EXPECT_EQ(std::nullopt, msg2.peerId_);
     EXPECT_EQ(OperationStatus::PAUSE, msg2.opStatus_);
 
@@ -165,8 +167,8 @@ TEST(WatchdogTest, ProcessQueueSizeTest) {
         10,
         facebook::fb303::ThreadCachedServiceData::getShared()->getCounter(
             BgpStats::kRibOutQueueSize));
-    folly::coro::blockingWait(sessionMgrQ.pop());
-    folly::coro::blockingWait(ribQ.pop());
+    facebook::bgp::test::boundedBlockingPop(sessionMgrQ, "sessionMgrQ");
+    facebook::bgp::test::boundedBlockingPop(ribQ, "ribQ");
   }
 
   /*
@@ -188,11 +190,12 @@ TEST(WatchdogTest, ProcessQueueSizeTest) {
 
     EXPECT_EQ(1, sessionMgrQ.size());
     EXPECT_EQ(1, ribQ.size());
-    auto msg1 = folly::coro::blockingWait(sessionMgrQ.pop());
+    auto msg1 =
+        facebook::bgp::test::boundedBlockingPop(sessionMgrQ, "sessionMgrQ");
     EXPECT_EQ(std::nullopt, msg1.peerId_);
     EXPECT_EQ(OperationStatus::RESUME, msg1.opStatus_);
 
-    auto msg2 = folly::coro::blockingWait(ribQ.pop());
+    auto msg2 = facebook::bgp::test::boundedBlockingPop(ribQ, "ribQ");
     EXPECT_EQ(std::nullopt, msg2.peerId_);
     EXPECT_EQ(OperationStatus::RESUME, msg2.opStatus_);
   }
@@ -232,7 +235,8 @@ TEST(WatchdogTest, ProcessQueueSizeTest) {
     EXPECT_TRUE(watchdog.isPeerQueueBuildUp_.at(ingressQueueName));
 
     EXPECT_EQ(1, sessionMgrQ.size());
-    auto msg = folly::coro::blockingWait(sessionMgrQ.pop());
+    auto msg =
+        facebook::bgp::test::boundedBlockingPop(sessionMgrQ, "sessionMgrQ");
     EXPECT_EQ(peerId, msg.peerId_);
     EXPECT_EQ(OperationStatus::PAUSE, msg.opStatus_);
   }
@@ -271,7 +275,8 @@ TEST(WatchdogTest, ProcessQueueSizeTest) {
     EXPECT_FALSE(watchdog.isPeerQueueBuildUp_.at(ingressQueueName));
 
     EXPECT_EQ(1, sessionMgrQ.size());
-    auto msg = folly::coro::blockingWait(sessionMgrQ.pop());
+    auto msg =
+        facebook::bgp::test::boundedBlockingPop(sessionMgrQ, "sessionMgrQ");
     EXPECT_EQ(peerId, msg.peerId_);
     EXPECT_EQ(OperationStatus::RESUME, msg.opStatus_);
   }
@@ -476,7 +481,7 @@ TEST(WatchdogTest, NotificationQueueTest) {
     EXPECT_EQ(1, q.size());
   }
   {
-    auto msg = folly::coro::blockingWait(q.pop());
+    auto msg = facebook::bgp::test::boundedBlockingPop(q, "q");
     EXPECT_EQ(0, q.size());
     EXPECT_EQ(std::nullopt, msg.peerId_);
     EXPECT_EQ(msg.opStatus_, OperationStatus::PAUSE);

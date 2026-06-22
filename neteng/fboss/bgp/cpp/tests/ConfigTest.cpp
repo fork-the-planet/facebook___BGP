@@ -1308,6 +1308,391 @@ TEST_F(ConfigTestFixture, localASTest) {
   }
 }
 
+/*
+ * Verify Local-AS (RFC 7705) uses the same peer > peer-group cascade as remote
+ * AS: per-peer wins as a unit (including a per-peer legacy value over a
+ * peer-group 4-byte value), and within a level the 4-byte field overrides the
+ * deprecated i32 field. Each peer sets a valid eBGP remote AS so the
+ * Peer-Local-AS validation does not reject the config.
+ */
+TEST_F(ConfigTestFixture, localASCascadeTest) {
+  // Utils.h only defines addresses through index 9; define 10-12 locally.
+  const auto kLocalAddr10 = folly::IPAddress("127.1.0.9");
+  const auto kPeerAddr10 = folly::IPAddress("127.10.0.1");
+  const auto kNextHopV4_10 = folly::IPAddress("127.5.0.9");
+  const auto kNextHopV6_10 = folly::IPAddress("2401:db00:e011:411:1000::31");
+  const auto kLocalAddr11 = folly::IPAddress("127.1.0.10");
+  const auto kPeerAddr11 = folly::IPAddress("127.11.0.1");
+  const auto kNextHopV4_11 = folly::IPAddress("127.5.0.10");
+  const auto kNextHopV6_11 = folly::IPAddress("2401:db00:e011:411:1000::32");
+  const auto kLocalAddr12 = folly::IPAddress("127.1.0.11");
+  const auto kPeerAddr12 = folly::IPAddress("127.12.0.1");
+  const auto kNextHopV4_12 = folly::IPAddress("127.5.0.11");
+  const auto kNextHopV6_12 = folly::IPAddress("2401:db00:e011:411:1000::33");
+  const uint32_t kGroupLocalAs4Byte = 65010;
+  const uint32_t kGroupLocalAsLegacy = 65011;
+  const uint32_t kPeerLocalAs4ByteOverride = 65012;
+  const uint32_t kPeerLocalAsLegacyOverride = 65013;
+
+  auto testConfig = defaultConfig_;
+  testConfig.peers()->clear();
+
+  // Peer-group whose Local-AS is set via the 4-byte field (RFC 6793).
+  thrift::PeerGroup pg4Byte;
+  pg4Byte.name() = "PEERGROUP_LOCAL_AS_4BYTE";
+  pg4Byte.next_hop_self() = true;
+  pg4Byte.peer_tag() = kPeerTypeFa;
+  pg4Byte.bgp_peer_timers() = timers1_;
+  pg4Byte.local_as_4_byte() = kGroupLocalAs4Byte;
+
+  // Peer-group whose Local-AS is set via the deprecated i32 field.
+  thrift::PeerGroup pgLegacy;
+  pgLegacy.name() = "PEERGROUP_LOCAL_AS_LEGACY";
+  pgLegacy.next_hop_self() = true;
+  pgLegacy.peer_tag() = kPeerTypeFa;
+  pgLegacy.bgp_peer_timers() = timers1_;
+  pgLegacy.local_as() = static_cast<int32_t>(kGroupLocalAsLegacy);
+
+  auto peerGroups = testConfig.peer_groups().to_optional();
+  peerGroups->emplace_back(pg4Byte);
+  peerGroups->emplace_back(pgLegacy);
+  testConfig.peer_groups().from_optional(peerGroups);
+
+  // peer7: per-peer 4-byte Local-AS only, no peer-group.
+  {
+    thrift::BgpPeer p;
+    p.remote_as_4_byte() = kPeerAsn7;
+    p.local_as_4_byte() = kAsn6;
+    p.local_addr() = kLocalAddr7.str();
+    p.peer_addr() = kPeerAddr7.str();
+    p.next_hop4() = kNextHopV4_7.str();
+    p.next_hop6() = kNextHopV6_7.str();
+    testConfig.peers()->emplace_back(p);
+  }
+  // peer8: per-peer legacy i32 Local-AS only, no peer-group.
+  {
+    thrift::BgpPeer p;
+    p.remote_as_4_byte() = kPeerAsn8;
+    p.local_as() = static_cast<int32_t>(kAsn5);
+    p.local_addr() = kLocalAddr8.str();
+    p.peer_addr() = kPeerAddr8.str();
+    p.next_hop4() = kNextHopV4_8.str();
+    p.next_hop6() = kNextHopV6_8.str();
+    testConfig.peers()->emplace_back(p);
+  }
+  // peer9: no per-peer Local-AS, inherits peer-group's 4-byte value.
+  {
+    thrift::BgpPeer p;
+    p.remote_as_4_byte() = kPeerAsn9;
+    p.local_addr() = kLocalAddr9.str();
+    p.peer_addr() = kPeerAddr9.str();
+    p.next_hop4() = kNextHopV4_9.str();
+    p.next_hop6() = kNextHopV6_9.str();
+    p.peer_group_name() = *pg4Byte.name();
+    testConfig.peers()->emplace_back(p);
+  }
+  // peer10: no per-peer Local-AS, inherits peer-group's legacy value.
+  {
+    thrift::BgpPeer p;
+    p.remote_as_4_byte() = kPeerAsn7;
+    p.local_addr() = kLocalAddr10.str();
+    p.peer_addr() = kPeerAddr10.str();
+    p.next_hop4() = kNextHopV4_10.str();
+    p.next_hop6() = kNextHopV6_10.str();
+    p.peer_group_name() = *pgLegacy.name();
+    testConfig.peers()->emplace_back(p);
+  }
+  // peer11: per-peer 4-byte Local-AS overrides peer-group's 4-byte.
+  {
+    thrift::BgpPeer p;
+    p.remote_as_4_byte() = kPeerAsn8;
+    p.local_as_4_byte() = kPeerLocalAs4ByteOverride;
+    p.local_addr() = kLocalAddr11.str();
+    p.peer_addr() = kPeerAddr11.str();
+    p.next_hop4() = kNextHopV4_11.str();
+    p.next_hop6() = kNextHopV6_11.str();
+    p.peer_group_name() = *pg4Byte.name();
+    testConfig.peers()->emplace_back(p);
+  }
+  // peer12: per-peer legacy i32 Local-AS overrides peer-group's 4-byte (peer
+  // wins).
+  {
+    thrift::BgpPeer p;
+    p.remote_as_4_byte() = kPeerAsn9;
+    p.local_as() = static_cast<int32_t>(kPeerLocalAsLegacyOverride);
+    p.local_addr() = kLocalAddr12.str();
+    p.peer_addr() = kPeerAddr12.str();
+    p.next_hop4() = kNextHopV4_12.str();
+    p.next_hop6() = kNextHopV6_12.str();
+    p.peer_group_name() = *pg4Byte.name();
+    testConfig.peers()->emplace_back(p);
+  }
+
+  Config config(testConfig);
+  const auto& peerToConfig = config.getPeerToConfig();
+
+  // peer7: per-peer 4-byte resolves directly.
+  EXPECT_EQ(
+      kAsn6,
+      config.getPeeringParamsForPeer(*peerToConfig.at(kPeerAddr7)).localAs);
+  // peer8: per-peer legacy resolves directly.
+  EXPECT_EQ(
+      kAsn5,
+      config.getPeeringParamsForPeer(*peerToConfig.at(kPeerAddr8)).localAs);
+  // peer9: inherits the peer-group's 4-byte value.
+  EXPECT_EQ(
+      kGroupLocalAs4Byte,
+      config.getPeeringParamsForPeer(*peerToConfig.at(kPeerAddr9)).localAs);
+  // peer10: inherits the peer-group's legacy value.
+  EXPECT_EQ(
+      kGroupLocalAsLegacy,
+      config.getPeeringParamsForPeer(*peerToConfig.at(kPeerAddr10)).localAs);
+  // peer11: per-peer 4-byte beats the peer-group's 4-byte.
+  EXPECT_EQ(
+      kPeerLocalAs4ByteOverride,
+      config.getPeeringParamsForPeer(*peerToConfig.at(kPeerAddr11)).localAs);
+  // peer12: per-peer legacy beats the peer-group's 4-byte.
+  EXPECT_EQ(
+      kPeerLocalAsLegacyOverride,
+      config.getPeeringParamsForPeer(*peerToConfig.at(kPeerAddr12)).localAs);
+}
+
+/*
+ * Both Local-AS representations (i32 and 4-byte) set at the SAME config level
+ * is an ambiguous config and must be rejected at config-construction time, the
+ * same way remote AS is.
+ */
+TEST_F(ConfigTestFixture, localASBothSetNegativeTest) {
+  {
+    // Both set at the peer level.
+    auto testConfig = defaultConfig_;
+    testConfig.peers()->clear();
+    thrift::BgpPeer p;
+    p.remote_as_4_byte() = kPeerAsn7;
+    p.local_as_4_byte() = kAsn5;
+    p.local_as() = static_cast<int32_t>(kAsn6);
+    p.local_addr() = kLocalAddr7.str();
+    p.peer_addr() = kPeerAddr7.str();
+    p.next_hop4() = kNextHopV4_7.str();
+    p.next_hop6() = kNextHopV6_7.str();
+    testConfig.peers()->emplace_back(p);
+    EXPECT_THROW(Config config(testConfig), BgpError);
+  }
+  {
+    // Both set at the peer-group level (peer omits Local-AS).
+    auto testConfig = defaultConfig_;
+    testConfig.peers()->clear();
+    thrift::PeerGroup pg;
+    pg.name() = "PEERGROUP_LOCAL_AS_CONFLICT";
+    pg.next_hop_self() = true;
+    pg.peer_tag() = kPeerTypeFa;
+    pg.bgp_peer_timers() = timers1_;
+    pg.local_as_4_byte() = kAsn5;
+    pg.local_as() = static_cast<int32_t>(kAsn6);
+    auto peerGroups = testConfig.peer_groups().to_optional();
+    peerGroups->emplace_back(pg);
+    testConfig.peer_groups().from_optional(peerGroups);
+
+    thrift::BgpPeer p;
+    p.remote_as_4_byte() = kPeerAsn8;
+    p.local_addr() = kLocalAddr8.str();
+    p.peer_addr() = kPeerAddr8.str();
+    p.next_hop4() = kNextHopV4_8.str();
+    p.next_hop6() = kNextHopV6_8.str();
+    p.peer_group_name() = *pg.name();
+    testConfig.peers()->emplace_back(p);
+    EXPECT_THROW(Config config(testConfig), BgpError);
+  }
+}
+
+/*
+ * Verify the peer > peer-group cascade for remote AS resolution, and that
+ * within a single level the 4-byte field (RFC 6793) overrides the deprecated
+ * i32 field. Precedence (high -> low):
+ *   peer.remote_as_4_byte > peer.remote_as
+ *   > peerGroup.remote_as_4_byte > peerGroup.remote_as
+ * A per-peer value always wins over the peer-group, including a per-peer legacy
+ * value over a peer-group 4-byte value.
+ */
+TEST_F(ConfigTestFixture, remoteASTest) {
+  // Utils.h only defines addresses through index 9; define 10-12 locally.
+  const auto kLocalAddr10 = folly::IPAddress("127.1.0.9");
+  const auto kPeerAddr10 = folly::IPAddress("127.10.0.1");
+  const auto kNextHopV4_10 = folly::IPAddress("127.5.0.9");
+  const auto kNextHopV6_10 = folly::IPAddress("2401:db00:e011:411:1000::31");
+  const auto kLocalAddr11 = folly::IPAddress("127.1.0.10");
+  const auto kPeerAddr11 = folly::IPAddress("127.11.0.1");
+  const auto kNextHopV4_11 = folly::IPAddress("127.5.0.10");
+  const auto kNextHopV6_11 = folly::IPAddress("2401:db00:e011:411:1000::32");
+  const auto kLocalAddr12 = folly::IPAddress("127.1.0.11");
+  const auto kPeerAddr12 = folly::IPAddress("127.12.0.1");
+  const auto kNextHopV4_12 = folly::IPAddress("127.5.0.11");
+  const auto kNextHopV6_12 = folly::IPAddress("2401:db00:e011:411:1000::33");
+  const uint32_t kGroupRemoteAs4Byte = 64600;
+  const uint32_t kGroupRemoteAsLegacy = 64601;
+  const uint32_t kPeerOverrideAsn = 64548;
+
+  auto testConfig = defaultConfig_;
+  testConfig.peers()->clear();
+
+  // Peer-group whose remote AS is set via the 4-byte field (RFC 6793).
+  thrift::PeerGroup pg4Byte;
+  pg4Byte.name() = "PEERGROUP_REMOTE_AS_4BYTE";
+  pg4Byte.next_hop_self() = true;
+  pg4Byte.peer_tag() = kPeerTypeFa;
+  pg4Byte.bgp_peer_timers() = timers1_;
+  pg4Byte.remote_as_4_byte() = kGroupRemoteAs4Byte;
+
+  // Peer-group whose remote AS is set via the deprecated i32 field.
+  thrift::PeerGroup pgLegacy;
+  pgLegacy.name() = "PEERGROUP_REMOTE_AS_LEGACY";
+  pgLegacy.next_hop_self() = true;
+  pgLegacy.peer_tag() = kPeerTypeFa;
+  pgLegacy.bgp_peer_timers() = timers1_;
+  pgLegacy.remote_as() = static_cast<int32_t>(kGroupRemoteAsLegacy);
+
+  auto peerGroups = testConfig.peer_groups().to_optional();
+  peerGroups->emplace_back(pg4Byte);
+  peerGroups->emplace_back(pgLegacy);
+  testConfig.peer_groups().from_optional(peerGroups);
+
+  // peer7: per-peer 4-byte only, no peer-group.
+  {
+    thrift::BgpPeer p;
+    p.remote_as_4_byte() = kPeerAsn7;
+    p.local_addr() = kLocalAddr7.str();
+    p.peer_addr() = kPeerAddr7.str();
+    p.next_hop4() = kNextHopV4_7.str();
+    p.next_hop6() = kNextHopV6_7.str();
+    testConfig.peers()->emplace_back(p);
+  }
+  // peer8: per-peer legacy i32 only, no peer-group.
+  {
+    thrift::BgpPeer p;
+    p.remote_as() = static_cast<int32_t>(kPeerAsn8);
+    p.local_addr() = kLocalAddr8.str();
+    p.peer_addr() = kPeerAddr8.str();
+    p.next_hop4() = kNextHopV4_8.str();
+    p.next_hop6() = kNextHopV6_8.str();
+    testConfig.peers()->emplace_back(p);
+  }
+  // peer9: no per-peer remote AS, inherits peer-group's 4-byte value.
+  {
+    thrift::BgpPeer p;
+    p.local_addr() = kLocalAddr9.str();
+    p.peer_addr() = kPeerAddr9.str();
+    p.next_hop4() = kNextHopV4_9.str();
+    p.next_hop6() = kNextHopV6_9.str();
+    p.peer_group_name() = *pg4Byte.name();
+    testConfig.peers()->emplace_back(p);
+  }
+  // peer10: no per-peer remote AS, inherits peer-group's legacy value.
+  {
+    thrift::BgpPeer p;
+    p.local_addr() = kLocalAddr10.str();
+    p.peer_addr() = kPeerAddr10.str();
+    p.next_hop4() = kNextHopV4_10.str();
+    p.next_hop6() = kNextHopV6_10.str();
+    p.peer_group_name() = *pgLegacy.name();
+    testConfig.peers()->emplace_back(p);
+  }
+  // peer11: per-peer 4-byte overrides peer-group's 4-byte.
+  {
+    thrift::BgpPeer p;
+    p.remote_as_4_byte() = kPeerOverrideAsn;
+    p.local_addr() = kLocalAddr11.str();
+    p.peer_addr() = kPeerAddr11.str();
+    p.next_hop4() = kNextHopV4_11.str();
+    p.next_hop6() = kNextHopV6_11.str();
+    p.peer_group_name() = *pg4Byte.name();
+    testConfig.peers()->emplace_back(p);
+  }
+  // peer12: per-peer legacy i32 overrides peer-group's 4-byte (peer wins).
+  {
+    thrift::BgpPeer p;
+    p.remote_as() = static_cast<int32_t>(kPeerAsn9);
+    p.local_addr() = kLocalAddr12.str();
+    p.peer_addr() = kPeerAddr12.str();
+    p.next_hop4() = kNextHopV4_12.str();
+    p.next_hop6() = kNextHopV6_12.str();
+    p.peer_group_name() = *pg4Byte.name();
+    testConfig.peers()->emplace_back(p);
+  }
+
+  Config config(testConfig);
+  const auto& peerToConfig = config.getPeerToConfig();
+
+  // peer7: per-peer 4-byte resolves directly.
+  EXPECT_EQ(
+      kPeerAsn7,
+      config.getPeeringParamsForPeer(*peerToConfig.at(kPeerAddr7)).remoteAs);
+  // peer8: per-peer legacy resolves directly.
+  EXPECT_EQ(
+      kPeerAsn8,
+      config.getPeeringParamsForPeer(*peerToConfig.at(kPeerAddr8)).remoteAs);
+  // peer9: inherits the peer-group's 4-byte value.
+  EXPECT_EQ(
+      kGroupRemoteAs4Byte,
+      config.getPeeringParamsForPeer(*peerToConfig.at(kPeerAddr9)).remoteAs);
+  // peer10: inherits the peer-group's legacy value.
+  EXPECT_EQ(
+      kGroupRemoteAsLegacy,
+      config.getPeeringParamsForPeer(*peerToConfig.at(kPeerAddr10)).remoteAs);
+  // peer11: per-peer 4-byte beats the peer-group's 4-byte.
+  EXPECT_EQ(
+      kPeerOverrideAsn,
+      config.getPeeringParamsForPeer(*peerToConfig.at(kPeerAddr11)).remoteAs);
+  // peer12: per-peer legacy beats the peer-group's 4-byte.
+  EXPECT_EQ(
+      kPeerAsn9,
+      config.getPeeringParamsForPeer(*peerToConfig.at(kPeerAddr12)).remoteAs);
+}
+
+/*
+ * Both remote-AS representations (i32 and 4-byte) set at the SAME config level
+ * is an ambiguous config and must be rejected at config-construction time.
+ */
+TEST_F(ConfigTestFixture, remoteASNegativeTest) {
+  {
+    // Both set at the peer level.
+    auto testConfig = defaultConfig_;
+    testConfig.peers()->clear();
+    thrift::BgpPeer p;
+    p.remote_as_4_byte() = kPeerAsn7;
+    p.remote_as() = static_cast<int32_t>(kPeerAsn8);
+    p.local_addr() = kLocalAddr7.str();
+    p.peer_addr() = kPeerAddr7.str();
+    p.next_hop4() = kNextHopV4_7.str();
+    p.next_hop6() = kNextHopV6_7.str();
+    testConfig.peers()->emplace_back(p);
+    EXPECT_THROW(Config config(testConfig), BgpError);
+  }
+  {
+    // Both set at the peer-group level (peer omits remote AS).
+    auto testConfig = defaultConfig_;
+    testConfig.peers()->clear();
+    thrift::PeerGroup pg;
+    pg.name() = "PEERGROUP_REMOTE_AS_CONFLICT";
+    pg.next_hop_self() = true;
+    pg.peer_tag() = kPeerTypeFa;
+    pg.bgp_peer_timers() = timers1_;
+    pg.remote_as_4_byte() = kPeerAsn7;
+    pg.remote_as() = static_cast<int32_t>(kPeerAsn8);
+    auto peerGroups = testConfig.peer_groups().to_optional();
+    peerGroups->emplace_back(pg);
+    testConfig.peer_groups().from_optional(peerGroups);
+
+    thrift::BgpPeer p;
+    p.local_addr() = kLocalAddr8.str();
+    p.peer_addr() = kPeerAddr8.str();
+    p.next_hop4() = kNextHopV4_8.str();
+    p.next_hop6() = kNextHopV6_8.str();
+    p.peer_group_name() = *pg.name();
+    testConfig.peers()->emplace_back(p);
+    EXPECT_THROW(Config config(testConfig), BgpError);
+  }
+}
+
 TEST_F(ConfigTestFixture, PeeringParamsPeerGroupName) {
   Config config(defaultConfig_);
   auto peerToConfig = config.getPeerToConfig();

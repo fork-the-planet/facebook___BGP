@@ -21,12 +21,14 @@
 #include "fboss/agent/AddressUtil.h"
 #include "neteng/fboss/bgp/cpp/adjrib/AdjRibCommon.h"
 #include "neteng/fboss/bgp/cpp/adjrib/AdjRibStats.h"
+#include "neteng/fboss/bgp/cpp/common/Consts.h"
 #include "neteng/fboss/bgp/cpp/common/FeatureFlags.h"
 #include "neteng/fboss/bgp/cpp/common/RibMessage.h"
 #include "neteng/fboss/bgp/cpp/config/ConfigStructs.h"
 #include "neteng/fboss/bgp/cpp/lib/BgpMessageSerializer.h"
 #include "neteng/fboss/bgp/cpp/lib/BgpStructs.h"
 #include "neteng/fboss/bgp/cpp/policy/PolicyManager.h"
+#include "neteng/fboss/bgp/cpp/policy/PolicyUtils.h"
 #include "neteng/fboss/bgp/cpp/stats/Stats.h"
 
 using namespace facebook::nettools::bgplib;
@@ -77,32 +79,47 @@ void tryUpdateAttrToPrefixMapImpl(
     const std::string& contextName,
     AdjRibStats& stats,
     bool isNexthopSetByPolicy) {
-  if (newPath == oldPath) {
-    // The advertisement of this prefixPathId has not changed.
-    XLOGF(
-        DBG5,
-        "{}Advertisement unchanged for {}",
-        contextName.empty() ? "" : contextName + " ",
-        prefixPathId.first.first.str());
-    return;
-  }
-
-  XLOGF(
-      DBG5,
-      "{}Advertisement changed for {}",
-      contextName.empty() ? "" : contextName + " ",
-      prefixPathId.first.first.str());
-
   auto afi = prefixPathId.first.first.isV4()
       ? nettools::bgplib::BgpUpdateAfi::AFI_IPv4
       : nettools::bgplib::BgpUpdateAfi::AFI_IPv6;
 
-  // Clean up prefixPathId's association to oldPath
-  // Note: oldPath can be nullptr (withdrawal), which is a valid map key
-  auto oldPathKey = BgpPathWithAfi{oldPath, afi, isNexthopSetByPolicy};
-  auto oldPfxSetItr = attrToPrefixMap.find(oldPathKey);
+  /*
+   * This helper applies the requested packing-list mutation unconditionally; it
+   * does NOT dedup an unchanged advertisement (newPath == oldPath). Suppressing
+   * no-op re-advertisements -- and withdrawals for prefixes that were never
+   * advertised -- is the caller's responsibility: processRibAnnouncedEntry
+   * compares the policy result before staging, and the withdraw call sites only
+   * fire when the prefix was previously announced (postAttr non-null).
+   */
+  XLOGF(
+      DBG5,
+      "{}Updating packing list for {}",
+      contextName.empty() ? "" : contextName + " ",
+      prefixPathId.first.first.str());
 
-  if (oldPfxSetItr != attrToPrefixMap.end()) {
+  /*
+   * Clean up prefixPathId from BOTH flag buckets.
+   *
+   * isNexthopSetByPolicy is part of the key {attrs, afi, isNexthopSetByPolicy},
+   * so an announce and a withdraw can stage the same prefix under DIFFERENT
+   * flags: the announce passes the real flag (true when a SetNexthop policy
+   * ran), the withdraw defaults to false. Cleaning up only the caller's flag
+   * misses the other bucket and leaves the prefix double-booked, e.g.:
+   *
+   *   attrToPrefixMap_ for Prefix A (the bug):
+   *     announcement:  {attr1,   v6, true }  -> [Prefix A]
+   *     withdrawal:    {nullptr, v6, false}  -> [Prefix A]   (A in BOTH!)
+   *
+   * Probe both flag states so A is associated to at most one path.
+   * Note: oldPath can be nullptr (withdrawal), a valid map key.
+   */
+  auto cleanupPrefixAssociationInPackingList = [&](bool isNexthopSetByPolicy) {
+    auto oldPathKey = BgpPathWithAfi{oldPath, afi, isNexthopSetByPolicy};
+    auto oldPfxSetItr = attrToPrefixMap.find(oldPathKey);
+    if (oldPfxSetItr == attrToPrefixMap.end()) {
+      return;
+    }
+
     auto& oldPfxSet = oldPfxSetItr->second;
     auto foundPfx = oldPfxSet.find(prefixPathId);
 
@@ -129,7 +146,10 @@ void tryUpdateAttrToPrefixMapImpl(
       // Clean up since this attr doesn't have any associated pfxs
       attrToPrefixMap.erase(oldPfxSetItr);
     }
-  }
+  };
+
+  cleanupPrefixAssociationInPackingList(/*isNexthopSetByPolicy=*/true);
+  cleanupPrefixAssociationInPackingList(/*isNexthopSetByPolicy=*/false);
 
   // Pack prefixPathId with the newPath
   auto newPathKey = BgpPathWithAfi{newPath, afi, isNexthopSetByPolicy};
@@ -348,6 +368,18 @@ void updateOriginAndClusterListCommon(
         newClusterList.begin(), peeringParams.localClusterId.toLongHBO());
     attrsToUpdate->setClusterList(std::move(newClusterList));
   }
+}
+
+void applyPartialDrainCommunities(
+    const std::shared_ptr<BgpPath>& attrsToUpdate) noexcept {
+  auto comms = attrsToUpdate->getCommunities().get();
+  BgpAttrCommunitiesC toAdd;
+  toAdd.push_back(kDrainCommunity);
+  BgpAttrCommunitiesC toRemove;
+  toRemove.push_back(kLiveCommunity);
+  comms = addCommunities(comms, toAdd);
+  comms = removeCommunities(comms, toRemove);
+  attrsToUpdate->setCommunities(std::move(comms));
 }
 
 void pruneLbwExtCommunitiesCommon(BgpAttrExtCommunitiesC& communities) {

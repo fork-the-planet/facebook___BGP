@@ -61,6 +61,10 @@ class NexthopInfo : public NexthopInfoBase {
     return status_.isConnected();
   }
 
+  bool isResolvedForSelection() const override {
+    return status_.isResolvedForSelection();
+  }
+
   /**
    * @brief Update the status of this nexthop
    * @param status The new status for this nexthop

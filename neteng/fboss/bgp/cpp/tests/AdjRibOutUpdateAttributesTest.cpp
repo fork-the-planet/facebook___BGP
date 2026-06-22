@@ -33,7 +33,19 @@
   FRIEND_TEST(AdjRibOutboundFixture, UpdateOriginAndClusterListRRClientTest); \
   FRIEND_TEST(                                                                \
       AdjRibOutboundFixture, UpdateOriginAndClusterListRRClientIBgpTest);     \
-  FRIEND_TEST(AdjRibOutboundFixture, UpdateGroupKeyCreationTest);
+  FRIEND_TEST(AdjRibOutboundFixture, UpdateGroupKeyCreationTest);             \
+  FRIEND_TEST(                                                                \
+      AdjRibOutboundFixture,                                                  \
+      PartialDrainCommunitySurvivesAcceptAllEgressPolicy);                    \
+  FRIEND_TEST(                                                                \
+      AdjRibOutboundFixture,                                                  \
+      PartialDrainCommunityAttachedToAllAddPathEntries);                      \
+  FRIEND_TEST(                                                                \
+      AdjRibOutboundFixture,                                                  \
+      ProcessShadowRibEntryChangeAddPath_StampsPartialDrainOnAllMultipaths);  \
+  FRIEND_TEST(                                                                \
+      AdjRibOutboundFixture,                                                  \
+      PartialDrainCacheCollisionLiveThenDrainAcceptAllPolicy);
 
 #include <folly/coro/BlockingWait.h>
 #include <folly/logging/xlog.h>
@@ -1720,7 +1732,7 @@ TEST_F(AdjRibOutboundFixture, UpdateGroupKeyCreationTest) {
 
   fm_->addTask([&] {
     auto key = UpdateGroupKey::buildUpdateGroupKey(
-        "", /* egress policy name */
+        std::nullopt, /* egress policy name (no egress policy on this peer) */
         "", /* route filter stmt name */
         std::chrono::seconds(0), /* outdelay */
         BgpSessionType::IBGP,
@@ -1744,6 +1756,337 @@ TEST_F(AdjRibOutboundFixture, UpdateGroupKeyCreationTest) {
     terminateAdjRib();
   });
   evb_.loop();
+}
+
+TEST(ApplyPartialDrainCommunities, AddsDrainOnEmpty) {
+  BgpUpdate2 inputUpdate = buildBgpUpdateAttributes(kV4Nexthop2);
+  auto attrsToUpdate = std::make_shared<facebook::bgp::BgpPath>(
+      BgpPathFields(*BgpUpdate2toBgpPathC(inputUpdate)));
+  attrsToUpdate->setCommunities(BgpAttrCommunitiesC{});
+
+  applyPartialDrainCommunities(attrsToUpdate);
+
+  const auto& comms = attrsToUpdate->getCommunities().get();
+  EXPECT_EQ(1, comms.size());
+  EXPECT_TRUE(hasCommunity(comms, kDrainCommunity));
+}
+
+TEST(ApplyPartialDrainCommunities, ReplacesLiveWithDrain) {
+  BgpUpdate2 inputUpdate = buildBgpUpdateAttributes(kV4Nexthop2);
+  auto attrsToUpdate = std::make_shared<facebook::bgp::BgpPath>(
+      BgpPathFields(*BgpUpdate2toBgpPathC(inputUpdate)));
+  BgpAttrCommunitiesC seed;
+  seed.push_back(kLiveCommunity);
+  attrsToUpdate->setCommunities(std::move(seed));
+
+  applyPartialDrainCommunities(attrsToUpdate);
+
+  const auto& comms = attrsToUpdate->getCommunities().get();
+  EXPECT_TRUE(hasCommunity(comms, kDrainCommunity));
+  EXPECT_FALSE(hasCommunity(comms, kLiveCommunity));
+}
+
+TEST(ApplyPartialDrainCommunities, PreservesUnrelatedCommunities) {
+  constexpr BgpAttrCommunityC kOtherCommunity{12345, 6789};
+  BgpUpdate2 inputUpdate = buildBgpUpdateAttributes(kV4Nexthop2);
+  auto attrsToUpdate = std::make_shared<facebook::bgp::BgpPath>(
+      BgpPathFields(*BgpUpdate2toBgpPathC(inputUpdate)));
+  BgpAttrCommunitiesC seed;
+  seed.push_back(kOtherCommunity);
+  seed.push_back(kLiveCommunity);
+  attrsToUpdate->setCommunities(std::move(seed));
+
+  applyPartialDrainCommunities(attrsToUpdate);
+
+  const auto& comms = attrsToUpdate->getCommunities().get();
+  EXPECT_EQ(2, comms.size());
+  EXPECT_TRUE(hasCommunity(comms, kOtherCommunity));
+  EXPECT_TRUE(hasCommunity(comms, kDrainCommunity));
+  EXPECT_FALSE(hasCommunity(comms, kLiveCommunity));
+}
+
+TEST(ApplyPartialDrainCommunities, IsIdempotent) {
+  BgpUpdate2 inputUpdate = buildBgpUpdateAttributes(kV4Nexthop2);
+  auto attrsToUpdate = std::make_shared<facebook::bgp::BgpPath>(
+      BgpPathFields(*BgpUpdate2toBgpPathC(inputUpdate)));
+  BgpAttrCommunitiesC seed;
+  seed.push_back(kDrainCommunity);
+  attrsToUpdate->setCommunities(std::move(seed));
+
+  applyPartialDrainCommunities(attrsToUpdate);
+  applyPartialDrainCommunities(attrsToUpdate);
+
+  const auto& comms = attrsToUpdate->getCommunities().get();
+  EXPECT_EQ(1, comms.size());
+  EXPECT_TRUE(hasCommunity(comms, kDrainCommunity));
+}
+
+/*
+ * End-to-end pipeline test: a permissive (accept-all) egress policy must
+ * preserve the partial-drain community attached on the per-peer pre-policy
+ * clone. Mirrors the production sequence in
+ * AdjRib::processRibAnnouncedEntry: clone -> applyPartialDrainCommunities ->
+ * getPostOutPolicyAttributes.
+ *
+ * Regression guard: if a future policy change introduces a community
+ * delete/rewrite that strips kDrainCommunity, the drain semantics fail
+ * silently in production. This test catches that at unit-test time.
+ */
+TEST_F(
+    AdjRibOutboundFixture,
+    PartialDrainCommunitySurvivesAcceptAllEgressPolicy) {
+  setupAdjRib(
+      setupAcceptAllPolicy(kEgressPolicyName),
+      kEgressPolicyName,
+      false /* sessionEstablished */,
+      false /* sendAddPath */);
+  adjRib_->pathIdGenerator_ = std::make_unique<PathIdGenerator>(true);
+
+  auto preAttrs = std::make_shared<BgpPath>(*buildBgpPathFields(1, 1, 1, 1));
+  replaceZerosInAsPath(preAttrs, adjRib_->peeringParams_.localAs);
+  BgpAttrCommunitiesC seed;
+  seed.push_back(kLiveCommunity);
+  preAttrs->setCommunities(std::move(seed));
+
+  auto update = RibOutAnnouncementEntry(
+      kV4Prefix1, kPlaceholderPathID, iBgpPeer_, preAttrs);
+  update.isPartialDrain = true;
+  auto adjRibEntry = adjRib_->tryInsertRibOutEntry(
+      update.prefix, update.attrs->getNexthop(), kPlaceholderPathID);
+
+  // Mirror production sequence in AdjRib::processRibAnnouncedEntry.
+  auto prePolicyAttrs = update.attrs->clone();
+  applyPartialDrainCommunities(prePolicyAttrs);
+  auto postPolicyAttrs = adjRib_->getPostOutPolicyAttributes(
+      update,
+      adjRibEntry,
+      prePolicyAttrs,
+      BgpPeerId(update.peer.addr, update.peer.routerId).str());
+
+  ASSERT_NE(nullptr, postPolicyAttrs);
+  const auto& comms = postPolicyAttrs->getCommunities().get();
+  EXPECT_TRUE(hasCommunity(comms, kDrainCommunity));
+  EXPECT_FALSE(hasCommunity(comms, kLiveCommunity));
+}
+
+/*
+ * Add-path SEND analog of PartialDrainCommunitySurvivesAcceptAllEgressPolicy.
+ *
+ * When a peer is configured for ADD_PATH SEND, partial-drain transitions
+ * stamp isPartialDrain on every multipath entry (AdjRibOut.cpp:63), and
+ * AdjRib::processRibAnnouncedEntry (AdjRibOut.cpp:862-864) attaches the
+ * drain community per-entry. This test feeds multiple add-path entries
+ * (distinct pathIdToSend) through that production sequence and asserts
+ * every entry comes out with kDrainCommunity attached and kLiveCommunity
+ * removed after a permissive (accept-all) egress policy.
+ *
+ * Regression guard for two paths the bestpath-only sibling test does not
+ * cover: (1) the sendAddPath=true session/group setup, and (2) iteration
+ * over multiple non-default path IDs.
+ */
+TEST_F(
+    AdjRibOutboundFixture,
+    PartialDrainCommunityAttachedToAllAddPathEntries) {
+  setupAdjRib(
+      setupAcceptAllPolicy(kEgressPolicyName),
+      kEgressPolicyName,
+      false /* sessionEstablished */,
+      true /* sendAddPath */);
+  adjRib_->pathIdGenerator_ = std::make_unique<PathIdGenerator>(true);
+
+  for (uint32_t pathId : {1U, 2U, 3U}) {
+    auto preAttrs = std::make_shared<BgpPath>(*buildBgpPathFields(1, 1, 1, 1));
+    replaceZerosInAsPath(preAttrs, adjRib_->peeringParams_.localAs);
+    BgpAttrCommunitiesC seed;
+    seed.push_back(kLiveCommunity);
+    preAttrs->setCommunities(std::move(seed));
+
+    auto update =
+        RibOutAnnouncementEntry(kV4Prefix1, pathId, iBgpPeer_, preAttrs);
+    update.isPartialDrain = true;
+    auto adjRibEntry = adjRib_->tryInsertRibOutEntry(
+        update.prefix, update.attrs->getNexthop(), pathId);
+
+    // Mirror production sequence in AdjRib::processRibAnnouncedEntry.
+    auto prePolicyAttrs = update.attrs->clone();
+    applyPartialDrainCommunities(prePolicyAttrs);
+    auto postPolicyAttrs = adjRib_->getPostOutPolicyAttributes(
+        update,
+        adjRibEntry,
+        prePolicyAttrs,
+        BgpPeerId(update.peer.addr, update.peer.routerId).str());
+
+    ASSERT_NE(nullptr, postPolicyAttrs) << "pathIdToSend=" << pathId;
+    const auto& comms = postPolicyAttrs->getCommunities().get();
+    EXPECT_TRUE(hasCommunity(comms, kDrainCommunity))
+        << "pathIdToSend=" << pathId;
+    EXPECT_FALSE(hasCommunity(comms, kLiveCommunity))
+        << "pathIdToSend=" << pathId;
+  }
+}
+
+/*
+ * Upstream multipath stamping test (AdjRibOut.cpp:44-96).
+ *
+ * The previous test seeds isPartialDrain directly on each
+ * RibOutAnnouncementEntry. This one instead drives the full
+ * processShadowRibEntryChange add-path branch: it builds a
+ * ShadowRibOutAnnouncementEntry whose multipaths each carry
+ * isPartialDrain=true, calls processShadowRibEntryChange, and asserts
+ * every per-pathId AdjRibEntry produced has the drain community attached
+ * to its post-policy attributes. This exercises:
+ *   1. The per-multipath stamping at AdjRibOut.cpp:63
+ *      (entry.isPartialDrain = multipath->isPartialDrain).
+ *   2. The downstream attach in processRibAnnouncedEntry (line 862-864).
+ * If a future refactor drops either step, this test fails on at least
+ * one of the three pathIds.
+ */
+TEST_F(
+    AdjRibOutboundFixture,
+    ProcessShadowRibEntryChangeAddPath_StampsPartialDrainOnAllMultipaths) {
+  setupAdjRib(
+      setupAcceptAllPolicy(kEgressPolicyName),
+      kEgressPolicyName,
+      false /* sessionEstablished */,
+      true /* sendAddPath */);
+  // setupAdjRib only applies the addPath capability via sessionEstablished;
+  // since we skip session establishment, set sendAddPath_ directly here.
+  adjRib_->sendAddPath_ = true;
+  adjRib_->pathIdGenerator_ = std::make_unique<PathIdGenerator>(true);
+  adjRib_->egressEoRsSent_ = true;
+  adjRib_->isAfiIpv4Negotiated_ = true;
+  adjRib_->isAfiIpv6Negotiated_ = true;
+  adjRib_->enableRibAllocatedPathId_ = true;
+
+  constexpr std::array<uint32_t, 3> kAddPathIds{1, 2, 3};
+
+  ShadowRibRouteInfos multipaths;
+  for (uint32_t pathId : kAddPathIds) {
+    auto attrs = std::make_shared<BgpPath>(*buildBgpPathFields(1, 1, 1, 1));
+    replaceZerosInAsPath(attrs, adjRib_->peeringParams_.localAs);
+    BgpAttrCommunitiesC seed;
+    seed.push_back(kLiveCommunity);
+    attrs->setCommunities(std::move(seed));
+    attrs->publish();
+
+    // Source peer is eBGP so the iBGP egress can announce; canAnnounce
+    // rejects iBGP-to-iBGP routes when isRrClient=false.
+    auto path = std::make_shared<ShadowRibRouteInfo>(
+        eBgpPeer_, attrs, pathId, /*isPartialDrain=*/true);
+    setShadowRibRouteState(path, SHADOWRIBROUTE_IN_UPDATE);
+    multipaths.emplace(pathId, std::move(path));
+  }
+  ShadowRibOutAnnouncementEntry srEntry(
+      kV4Prefix1, /*bestpath=*/nullptr, std::move(multipaths));
+
+  adjRib_->processShadowRibEntryChange(srEntry);
+
+  // One add-path AdjRibEntry per multipath should now exist in PathTree, each
+  // with post-policy attrs that carry kDrainCommunity (and not kLiveCommunity).
+  ASSERT_EQ(
+      kAddPathIds.size(),
+      adjRib_->adjRibOutGroup_->getPeerEntriesCountFromPathTree(
+          adjRib_->adjRibOutGroup_->PathTree_, adjRib_->getPeerOwnerKey()));
+  for (uint32_t pathId : kAddPathIds) {
+    auto adjRibEntry = adjRib_->adjRibOutGroup_->getFromPathTree(
+        adjRib_->adjRibOutGroup_->PathTree_,
+        kV4Prefix1,
+        adjRib_->getPeerOwnerKey(),
+        pathId);
+    ASSERT_NE(nullptr, adjRibEntry) << "pathIdToSend=" << pathId;
+    const auto& postAttrs = adjRibEntry->getPostAttr();
+    ASSERT_NE(nullptr, postAttrs) << "pathIdToSend=" << pathId;
+    const auto& comms = postAttrs->getCommunities().get();
+    EXPECT_TRUE(hasCommunity(comms, kDrainCommunity))
+        << "pathIdToSend=" << pathId;
+    EXPECT_FALSE(hasCommunity(comms, kLiveCommunity))
+        << "pathIdToSend=" << pathId;
+  }
+}
+
+/*
+ * Regression guard for the egress policy-cache key: a live->drain transition
+ * on the same prefix must NOT alias in AdjRibPolicyCache.
+ *
+ * The same prefix is announced twice through the production sequence
+ * (clone -> [drain attach] -> getPostOutPolicyAttributes), which routes
+ * through the AdjRibPolicyCache:
+ *   1) LIVE announce  (isPartialDrain=false): no drain attach. The post-policy
+ *      result is cached.
+ *   2) DRAIN announce (isPartialDrain=true):  applyPartialDrainCommunities
+ *      swaps kLiveCommunity -> kDrainCommunity on the clone BEFORE the lookup.
+ *
+ * The egress policy here (accept-all) does NOT match or set communities, so
+ * PolicyAttributesMask::communities == false and communities are excluded
+ * from the masked cache key; update.attrs (and thus policyActionData) is
+ * identical across both announces. Without isPartialDrain in the cache key the
+ * two announces collide and the drain announce gets a stale LIVE cache hit,
+ * silently dropping the drain community on the wire. isPartialDrain is part of
+ * PolicyCacheMaskedKey precisely to keep the two states distinct; this test
+ * fails if that keying is ever removed.
+ */
+TEST_F(
+    AdjRibOutboundFixture,
+    PartialDrainCacheCollisionLiveThenDrainAcceptAllPolicy) {
+  setupAdjRib(
+      setupAcceptAllPolicy(kEgressPolicyName),
+      kEgressPolicyName,
+      false /* sessionEstablished */,
+      false /* sendAddPath */);
+  adjRib_->pathIdGenerator_ = std::make_unique<PathIdGenerator>(true);
+
+  // RIB-side attrs are NEVER mutated by drain; only the per-peer clone is.
+  // So update.attrs carries kLiveCommunity for BOTH announces.
+  auto preAttrs = std::make_shared<BgpPath>(*buildBgpPathFields(1, 1, 1, 1));
+  replaceZerosInAsPath(preAttrs, adjRib_->peeringParams_.localAs);
+  BgpAttrCommunitiesC seed;
+  seed.push_back(kLiveCommunity);
+  preAttrs->setCommunities(std::move(seed));
+
+  auto update = RibOutAnnouncementEntry(
+      kV4Prefix1, kPlaceholderPathID, iBgpPeer_, preAttrs);
+  auto adjRibEntry = adjRib_->tryInsertRibOutEntry(
+      update.prefix, update.attrs->getNexthop(), kPlaceholderPathID);
+  const auto peerIdStr =
+      BgpPeerId(update.peer.addr, update.peer.routerId).str();
+
+  // (1) LIVE announce (isPartialDrain=false): no drain attach -> populates
+  //     the policy cache keyed with isPartialDrain=false.
+  {
+    update.isPartialDrain = false;
+    auto prePolicyAttrs = update.attrs->clone();
+    auto postPolicyAttrs = adjRib_->getPostOutPolicyAttributes(
+        update, adjRibEntry, prePolicyAttrs, peerIdStr);
+    ASSERT_NE(nullptr, postPolicyAttrs);
+    const auto& comms = postPolicyAttrs->getCommunities().get();
+    EXPECT_TRUE(hasCommunity(comms, kLiveCommunity));
+    EXPECT_FALSE(hasCommunity(comms, kDrainCommunity));
+  }
+
+  // (2) DRAIN announce, same prefix (isPartialDrain=true): drain attach on the
+  //     clone, then the same getPostOutPolicyAttributes path -> cache lookup.
+  //     The isPartialDrain flag is what reaches the cache key, mirroring the
+  //     production sequence in AdjRib::processRibAnnouncedEntry.
+  {
+    update.isPartialDrain = true;
+    auto prePolicyAttrs = update.attrs->clone();
+    applyPartialDrainCommunities(prePolicyAttrs);
+    // Sanity: the input to the policy step genuinely carries the drain
+    // community (so any failure below is the cache, not the attach).
+    ASSERT_TRUE(
+        hasCommunity(prePolicyAttrs->getCommunities().get(), kDrainCommunity));
+
+    auto postPolicyAttrs = adjRib_->getPostOutPolicyAttributes(
+        update, adjRibEntry, prePolicyAttrs, peerIdStr);
+    ASSERT_NE(nullptr, postPolicyAttrs);
+    const auto& comms = postPolicyAttrs->getCommunities().get();
+    EXPECT_TRUE(hasCommunity(comms, kDrainCommunity))
+        << "DRAIN community missing after live->drain transition: "
+           "policy-cache collision returned the stale LIVE result";
+    EXPECT_FALSE(hasCommunity(comms, kLiveCommunity))
+        << "LIVE community still present after drain: "
+           "policy-cache collision returned the stale LIVE result";
+  }
 }
 
 } // namespace facebook::bgp

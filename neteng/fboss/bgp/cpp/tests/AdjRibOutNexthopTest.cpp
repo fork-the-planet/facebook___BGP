@@ -25,12 +25,19 @@
       VerifyNormalizedNexthop_BuildAndQueueAnnouncements);                   \
   FRIEND_TEST(                                                               \
       AdjRibOutboundFixtureV4V6Nexthop,                                      \
-      VerifyNormalizedNexthop_BuildUpdateWithSizeEstimation);
+      VerifyNormalizedNexthop_BuildUpdateWithSizeEstimation);                \
+  FRIEND_TEST(                                                               \
+      AdjRibOutboundFixture,                                                 \
+      AnnounceThenImplicitWithdraw_PolicyNexthop_OrphansAnnounce);           \
+  FRIEND_TEST(                                                               \
+      AdjRibOutboundFixtureV4V6Nexthop,                                      \
+      SameAttrsDifferentNexthopFlag_StaySeparateBuckets);
 
 #include <folly/coro/BlockingWait.h>
 #include <folly/logging/xlog.h>
 
 #include "neteng/fboss/bgp/cpp/tests/AdjRibOutUtils.h"
+#include "neteng/fboss/bgp/cpp/tests/BoundedWaitUtils.h"
 
 namespace facebook::bgp {
 using namespace facebook::nettools::bgplib;
@@ -161,8 +168,10 @@ TEST_F(
   });
   fm_->addTask([&] {
     /* Each peer receives one update. */
-    auto msg1 = folly::coro::blockingWait(adjRib1->adjRibOutQueue_->pop());
-    auto msg2 = folly::coro::blockingWait(adjRib2->adjRibOutQueue_->pop());
+    auto msg1 = facebook::bgp::test::boundedBlockingPop(
+        *adjRib1->adjRibOutQueue_, "adjRib1->adjRibOutQueue_");
+    auto msg2 = facebook::bgp::test::boundedBlockingPop(
+        *adjRib2->adjRibOutQueue_, "adjRib2->adjRibOutQueue_");
 
     verifyPrefixesAndNexthopInUpdate(msg1, {kV4Prefix1}, kV4Nexthop1);
     verifyPrefixesAndNexthopInUpdate(msg2, {kV4Prefix2}, kV4Nexthop2);
@@ -612,6 +621,187 @@ TEST_F(NexthopSetByPolicyTest, iBgpPeer_NoNexthopSelf_NoFlag_KeepsOriginal) {
             true /* isV4 */, attrs, false /* isNexthopSetByPolicy */));
 
     terminateAdjRib();
+  });
+
+  evb_.loop();
+}
+
+/*
+ * AdjRib-level reproduction of the prod stale-route bug.
+ *
+ * Under egress backpressure (attrToPrefixMap_ is NOT drained between the
+ * announce and the withdraw), advertise a prefix to an iBGP peer whose egress
+ * policy sets the nexthop (SetNexthop -> isNexthopSetByPolicy=true), staging it
+ * under the packing-list key {attrs, afi, true}. Then flip the best path to an
+ * iBGP-learned route: split-horizon turns the re-announce into an implicit
+ * withdraw, which is processed with the default isNexthopSetByPolicy=false.
+ *
+ * isNexthopSetByPolicy is part of the BgpPathWithAfi key, so the flag=false
+ * withdraw must still clean up the prefix that was staged under flag=true. The
+ * fix (tryUpdateAttrToPrefixMapImpl probes BOTH flag states on cleanup)
+ * coalesces the pending announce into the withdrawal, leaving exactly one
+ * bucket. Without it, the announce is orphaned in {attrs, afi, true} alongside
+ * the withdrawal in {nullptr, afi, false}, and can be re-sent on the wire after
+ * the withdraw -- re-installing the route on the peer while the sender's entry
+ * shows it withdrawn.
+ *
+ * Driven through the real per-peer paths:
+ *   announce: processRibMessage -> processRibOutAnnouncement ->
+ *             handleRibAnnouncedEntry -> processRibAnnouncedEntry.
+ *   withdraw: processRibMessage -> processRibOutAnnouncement ->
+ *             handleRibAnnouncedEntry -> handleImplicitWithdrawal ->
+ *             processRibWithdraw -> tryInsertWithdrawal.
+ *
+ * Asserts exactly one (withdrawal) bucket: the orphaned flag=true announce
+ * bucket must be gone.
+ */
+TEST_F(
+    AdjRibOutboundFixture,
+    AnnounceThenImplicitWithdraw_PolicyNexthop_OrphansAnnounce) {
+  gflags::FlagSaver flags;
+  /*
+   * Backpressure ON: processRibMessage stages into attrToPrefixMap_ without
+   * draining, so the announce is still pending when the withdraw arrives.
+   */
+  FLAGS_enable_egress_backpressure_in_adjribout_tests = true;
+
+  /*
+   * IBGP peer with an EGRESS policy whose only action sets the nexthop, so
+   * processRibAnnouncedEntry produces isNexthopSetByPolicy=true.
+   */
+  const std::string policyName = kEgressPolicyName;
+  auto nexthopAction = createBgpPolicyNexthopAction(kV4Nexthop2);
+  auto policyManager = std::make_shared<PolicyManager>(
+      createBgpPolicies(policyName, {}, {std::move(nexthopAction)}),
+      createTestBgpGlobalConfig());
+  setupAdjRib(policyManager, policyName); // IBGP, session established
+
+  fm_->addTask([&] {
+    auto& attrToPrefixMap = adjRib_->attrToPrefixMap_;
+
+    /*
+     * 1) Announce kV4Prefix1 sourced from an eBGP peer. canAnnounce() is true
+     *    for an eBGP-sourced route to an iBGP peer, so processRibAnnouncedEntry
+     *    runs, the SetNexthop egress policy fires (isNexthopSetByPolicy=true),
+     *    and the prefix is staged into bucket {attrs, AFI_IPv4, true}.
+     *    sendWithEoR=true sets initialDump=true so processRibOutAnnouncement
+     *    is not gated on egressEoRsSent_ (which is false: we never drain).
+     */
+    auto announce = createRibMultipleAnnounce(
+        {kV4Prefix1}, kV4Nexthop3, eBgpPeer_, /*sendWithEoR=*/true);
+    adjRib_->processRibMessage(announce);
+
+    auto* entry = adjRib_->getRibEntry(/*ingress=*/false, kV4Prefix1);
+    ASSERT_NE(nullptr, entry);
+    ASSERT_TRUE(entry->isNexthopSetByPolicy())
+        << "egress SetNexthop policy did not fire on the announce";
+    auto postAttr = entry->getPostAttr();
+    ASSERT_NE(nullptr, postAttr);
+    ASSERT_EQ(1u, attrToPrefixMap.size());
+    ASSERT_TRUE(attrToPrefixMap.contains(
+        BgpPathWithAfi{
+            postAttr, BgpUpdateAfi::AFI_IPv4, /*isNexthopSetByPolicy=*/true}));
+
+    /*
+     * 2) Best path changes to an iBGP-learned route. Announcing an iBGP-sourced
+     *    route to an iBGP peer is blocked by split-horizon, so
+     *    handleRibAnnouncedEntry -> handleImplicitWithdrawal ->
+     *    processRibWithdraw -> tryInsertWithdrawal. No drain occurred between
+     *    the two processRibMessage calls (we never scheduled sendBgpUpdates),
+     *    so the announce from step 1 is still pending in attrToPrefixMap_.
+     */
+    auto ibgpAnnounce = createRibMultipleAnnounce(
+        {kV4Prefix1}, kV4Nexthop1, iBgpPeer_, /*sendWithEoR=*/true);
+    adjRib_->processRibMessage(ibgpAnnounce);
+
+    /*
+     * EXPECTED: the implicit withdraw coalesces with the staged announce ->
+     * exactly ONE withdrawal bucket. With the bug, the announce is orphaned and
+     * there are TWO buckets.
+     */
+    EXPECT_EQ(1u, attrToPrefixMap.size());
+    EXPECT_FALSE(attrToPrefixMap.contains(
+        BgpPathWithAfi{
+            postAttr, BgpUpdateAfi::AFI_IPv4, /*isNexthopSetByPolicy=*/true}))
+        << "Orphaned announce left in packing list: the implicit withdraw "
+           "dropped the isNexthopSetByPolicy flag and failed to coalesce with "
+           "the pending announce (it can be re-sent on the wire after the "
+           "withdraw, re-installing the route on the peer)";
+
+    terminateAdjRib();
+  });
+
+  evb_.loop();
+}
+
+/*
+ * Guard for the design doc's "Packing List Corner Case"
+ * (https://docs.google.com/document/d/17a71e1cX0uI-G7cONa14lLDjNwesu_uh8ce37eme3Aw,
+ * Approach 2; behavioral-matrix row "same NH, different flags -> Different
+ * buckets").
+ *
+ * Two DIFFERENT prefixes can resolve to identical post-policy attrs but differ
+ * in isNexthopSetByPolicy:
+ *   - Prefix A: an egress SetNexthop set the nexthop -> flag = true.
+ *   - Prefix B: no policy, but its bestpath nexthop is already that value ->
+ *     flag = false.
+ * isNexthopSetByPolicy is part of the BgpPathWithAfi key (hash + equality,
+ * AdjRibStructs.h), so the two prefixes MUST land in separate packing-list
+ * buckets and each is sent with the correct nexthop: policy NH honored for A
+ * (shouldApplyNexthopSelf == false), nexthop-self for B on an eBGP peer.
+ *
+ * If the flag were dropped from the key, both prefixes would collapse into one
+ * bucket and a single flag would decide the nexthop for both -- wrong for one.
+ * This test fails in that case.
+ */
+TEST_F(
+    AdjRibOutboundFixtureV4V6Nexthop,
+    SameAttrsDifferentNexthopFlag_StaySeparateBuckets) {
+  /*
+   * eBGP peer with configured local nexthop kV4Nexthop1, so nexthop-self
+   * (flag = false) resolves to kV4Nexthop1. The shared attrs carry the
+   * policy-set nexthop kV4Nexthop2.
+   */
+  auto adjRib = setupEbgpAdjRib(kV4Nexthop1, kV6Nexthop1);
+
+  BgpUpdate2 update = buildBgpUpdateAttributes(kV4Nexthop2);
+  std::shared_ptr<const BgpPath> attrs =
+      std::make_shared<facebook::bgp::BgpPath>(
+          BgpPathFields(*BgpUpdate2toBgpPathC(update)));
+
+  fm_->addTask([&] {
+    auto& packingList = adjRib->attrToPrefixMap_;
+
+    /* Prefix A: nexthop set by policy -> key flag = true. */
+    adjRib->tryUpdateAttrToPrefixMap(
+        std::make_pair(kV4Prefix1, 0u /* pathId */),
+        nullptr /* oldPath */,
+        attrs,
+        true /* isNexthopSetByPolicy */);
+    /* Prefix B: no policy -> key flag = false; SAME attrs shared_ptr. */
+    adjRib->tryUpdateAttrToPrefixMap(
+        std::make_pair(kV4Prefix2, 0u /* pathId */),
+        nullptr /* oldPath */,
+        attrs,
+        false /* isNexthopSetByPolicy */);
+
+    /* Flag is part of the key, so the two prefixes occupy two buckets. */
+    EXPECT_EQ(2, packingList.size());
+
+    for (auto& [key, prefixSet] : packingList) {
+      auto out = adjRib->buildUpdateWithSizeEstimation(key, prefixSet);
+      if (key.isNexthopSetByPolicy) {
+        /* Policy nexthop is honored (shouldApplyNexthopSelf == false). */
+        verifyPrefixesAndNexthopInUpdate(
+            FiberBgpPeer::InputMessageT(out), {kV4Prefix1}, kV4Nexthop2);
+      } else {
+        /* eBGP + flag = false -> nexthop-self (configured local nexthop). */
+        verifyPrefixesAndNexthopInUpdate(
+            FiberBgpPeer::InputMessageT(out), {kV4Prefix2}, kV4Nexthop1);
+      }
+    }
+
+    terminateSharedAdjRib(adjRib);
   });
 
   evb_.loop();

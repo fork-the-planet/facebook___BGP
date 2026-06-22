@@ -330,6 +330,10 @@ constexpr auto kQueueNameFromNeighborWatcher = "neighbor_route_change";
 // Golden VIP community
 constexpr nettools::bgplib::BgpAttrCommunityC kGoldenVipCommunity{65446, 400};
 
+// Drain and Live communities for MNH partial drain
+constexpr nettools::bgplib::BgpAttrCommunityC kDrainCommunity{65446, 10};
+constexpr nettools::bgplib::BgpAttrCommunityC kLiveCommunity{65446, 30};
+
 inline const RE2 kPortNameRegex = "(?P<port>.*)\\/\\d+$";
 // Used in dsfSwitchReachability table to indicate
 // the switch is not reachable.
