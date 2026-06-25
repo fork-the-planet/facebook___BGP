@@ -28,6 +28,7 @@
 #include "neteng/fboss/bgp/cpp/rib/RibPolicyLogger.h"
 
 DECLARE_bool(publish_rib_to_fsdb);
+DECLARE_bool(publish_partial_drain_state_to_fsdb);
 DECLARE_string(crf_policy_file);
 
 namespace facebook::bgp {
@@ -111,6 +112,13 @@ class RibDC : public RibBase {
  protected:
   void createFib() override;
 
+  /*
+   * [Exit] Destroy the DC-specific routeAttributePolicyTimer_ on the evb
+   * thread. Invoked by RibBase::stop() after coroutines are joined and before
+   * the evb loop is terminated. See RibBase::cleanupPlatform().
+   */
+  void cleanupPlatform() noexcept override;
+
   /**
    * Record a per-prefix partial-drain transition. DC-only; called from
    * RibDC::runBestPathSelection immediately after the CPS-aware
@@ -135,16 +143,17 @@ class RibDC : public RibBase {
   /*
    * DC-only end-of-pass hook. Overrides the generic
    * RibBase::onPrepareFibProgrammingComplete; publishes the partial-drain
-   * state once per pass when a transition was recorded this pass
-   * (gated on partialDrainStateChanged_), then clears the flag.
+   * state once per pass while partialDrainPublishPending_ is set, clearing the
+   * bit only once the publish lands.
    */
   void onPrepareFibProgrammingComplete() noexcept override;
   /*
-   * Publish the current partial-drain state. DC-only, called only
-   * from onPrepareFibProgrammingComplete() — never via RibBase&, so it is
-   * not a RibBase virtual.
+   * Publish the current partial-drain state. DC-only, called only from
+   * onPrepareFibProgrammingComplete() — never via RibBase&, so it is not a
+   * RibBase virtual. Returns true if the state was published, false if the
+   * publish was skipped (feature gflag off or no syncer wired).
    */
-  void publishPartialDrainState();
+  bool publishPartialDrainState();
   void postRouteFilterPolicyReplaced() override;
   void processNexthopResolutionUpdate(
       const NexthopResolutionUpdate& nexthopResolutionUpdate) noexcept override;
@@ -275,8 +284,6 @@ class RibDC : public RibBase {
   createBestPathOnlyTRibEntry(
       const std::pair<const folly::CIDRNetwork, facebook::bgp::RibEntry>&
           entry);
-  // scuba logger for rib policy
-  std::shared_ptr<rfe::ScubaData> scubaLogger_{nullptr};
   std::unique_ptr<RibPolicyLogger> ribPolicyLogger_{nullptr};
 
   /*
@@ -321,6 +328,7 @@ class RibDC : public RibBase {
    * NDP-received precondition for sending RibInInitialPathComputation.
    */
   bool firstNdpSignalSent_{false};
+  std::unique_ptr<folly::AsyncTimeout> routeAttributePolicyTimer_;
 
   /*
    * Whether CRF FILE_MODE is active. Atomic because it is accessed from two
@@ -355,12 +363,14 @@ class RibDC : public RibBase {
   int64_t partialDrainTransitionCount_{0};
 
   /*
-   * Set in runBestPathSelection() when recordPartialDrainTransition() reports
-   * a per-prefix transition this pass; consumed and cleared in
-   * onPrepareFibProgrammingComplete() to gate a single end-of-pass
-   * publish (a burst of N transitions produces one publish, not N).
+   * Dirty bit gating the device partial-drain FSDB publish. Constructed true so
+   * the baseline state is published on the first completed FIB pass (a
+   * never-drained device reports a positive is_partially_drained=false without
+   * a separate startup seed); set true again in runBestPathSelection() on each
+   * drain transition; cleared in onPrepareFibProgrammingComplete() only once a
+   * publish actually lands.
    */
-  bool partialDrainStateChanged_{false};
+  bool partialDrainPublishPending_{true};
 
 /*
  * Per-class placeholder for test code injection. Test files that need to

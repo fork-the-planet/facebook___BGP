@@ -36,6 +36,7 @@
 #include "neteng/fboss/bgp/cpp/config/ConfigManager.h"
 #include "neteng/fboss/bgp/cpp/lib/BgpStructs.h"
 #include "neteng/fboss/bgp/cpp/peer/PeerManager.h"
+#include "neteng/fboss/bgp/cpp/peer/SessionManager.h"
 #include "neteng/fboss/bgp/cpp/rib/RibBase.h"
 #include "neteng/fboss/bgp/cpp/stats/Stats.h"
 #include "neteng/fboss/bgp/cpp/watchdog/Watchdog.h"
@@ -75,7 +76,7 @@ folly::coro::Task<THealthReport> HealthValidator::generateReport() {
   modules.emplace_back(checkGlobalTaskThread());
   modules.emplace_back(checkGlobalConvergence());
   modules.emplace_back(checkSessionManager());
-  modules.emplace_back(checkPeerManager());
+  modules.emplace_back(co_await checkPeerManager());
   modules.emplace_back(co_await checkRib());
   modules.emplace_back(checkNetlinkWrapper());
   modules.emplace_back(checkNexthopTracker());
@@ -829,7 +830,54 @@ TModuleHealthReport HealthValidator::checkSessionManager() {
 /* ────────────────────────────────────────────────────────────────
  * PEER_MANAGER checks (doc 1.5.x)
  * ──────────────────────────────────────────────────────────────── */
-TModuleHealthReport HealthValidator::checkPeerManager() {
+THealthCheckResult HealthValidator::evaluatePrefixLimitDrops(
+    const std::vector<neteng::fboss::bgp::thrift::TBgpSession>& sessions) {
+  constexpr size_t kMaxListedPeers = 10;
+  std::vector<std::string> affected;
+  for (const auto& session : sessions) {
+    const int64_t preDropped =
+        session.prepolicy_rcvd_dropped_prefix_count().value_or(0);
+    if (preDropped > 0) {
+      affected.emplace_back(
+          fmt::format("{} (PR dropped {})", *session.peer_addr(), preDropped));
+    }
+  }
+
+  THealthCheckResult result;
+  result.checkId() = HealthCheckId::PEER_PREFIX_LIMIT_DROPS;
+  result.category() = HealthCheckCategory::PEER_MANAGER;
+  result.observedValue() = static_cast<double>(affected.size());
+  result.threshold() = 0.0;
+  result.timestampMs() =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count();
+
+  if (affected.empty()) {
+    result.status() = HealthCheckStatus::PASS;
+    result.message() = "No peers dropping routes due to per-peer prefix limit";
+    return result;
+  }
+
+  std::string listed;
+  for (size_t i = 0; i < std::min(affected.size(), kMaxListedPeers); ++i) {
+    if (i != 0) {
+      listed += ", ";
+    }
+    listed += affected[i];
+  }
+  if (affected.size() > kMaxListedPeers) {
+    listed += fmt::format(", +{} more", affected.size() - kMaxListedPeers);
+  }
+  result.status() = HealthCheckStatus::WARN;
+  result.message() = fmt::format(
+      "{} peer(s) dropping routes (per-peer prefix limit): {}",
+      affected.size(),
+      listed);
+  return result;
+}
+
+folly::coro::Task<TModuleHealthReport> HealthValidator::checkPeerManager() {
   TModuleHealthReport report;
   report.category() = HealthCheckCategory::PEER_MANAGER;
   auto& checks = *report.checks();
@@ -1005,8 +1053,73 @@ TModuleHealthReport HealthValidator::checkPeerManager() {
             kRibVersionLagThreshold)));
   }
 
+  /* 1.5.8 Per-peer prefix-limit drops
+   * Reports which peers are actively dropping received (PR) routes because they
+   * reached their configured per-peer prefix limit, with exact per-peer counts
+   * (reused from TBgpSession). Peer enumeration runs on the SessionManager evb
+   * and the session lookup on the PeerManager evb; both are bounded by
+   * co_runOnEvbWithTimeout so a stuck evb fails the check instead of hanging
+   * generateReport(). */
+  {
+    if (!peerMgr_) {
+      checks.emplace_back(makeResult(
+          HealthCheckId::PEER_PREFIX_LIMIT_DROPS,
+          HealthCheckCategory::PEER_MANAGER,
+          HealthCheckStatus::SKIPPED,
+          "PeerManager not available"));
+    } else {
+      /* co_getAllPeerDisplayInfos() hops onto the SessionManager evb without a
+       * timeout, so call the synchronous accessor under the same bounded wait
+       * used for getSessionInfos below. */
+      auto sessionMgr = peerMgr_->getSessionManager();
+      auto peersResult = co_await co_runOnEvbWithTimeout(
+          sessionMgr->getEventBase(),
+          [sessionMgr]() { return sessionMgr->getAllPeerDisplayInfos(); },
+          kHealthCheckModuleTimeout);
+      if (peersResult.hasException()) {
+        checks.emplace_back(makeResult(
+            HealthCheckId::PEER_PREFIX_LIMIT_DROPS,
+            HealthCheckCategory::PEER_MANAGER,
+            HealthCheckStatus::FAIL,
+            peersResult.exception().is_compatible_with<folly::FutureTimeout>()
+                ? fmt::format(
+                      "SessionManager evb unresponsive (timeout after {}s)",
+                      kHealthCheckModuleTimeout.count())
+                : fmt::format(
+                      "getAllPeerDisplayInfos() failed: {}",
+                      peersResult.exception().what())));
+      } else {
+        auto result = co_await co_runOnEvbWithTimeout(
+            peerMgr_->getEventBase(),
+            [this, peers = std::move(peersResult.value())]() {
+              return peerMgr_->getSessionInfos(peers);
+            },
+            kHealthCheckModuleTimeout);
+        if (result.hasValue()) {
+          checks.emplace_back(evaluatePrefixLimitDrops(result.value()));
+        } else if (result.exception()
+                       .is_compatible_with<folly::FutureTimeout>()) {
+          checks.emplace_back(makeResult(
+              HealthCheckId::PEER_PREFIX_LIMIT_DROPS,
+              HealthCheckCategory::PEER_MANAGER,
+              HealthCheckStatus::FAIL,
+              fmt::format(
+                  "PeerManager evb unresponsive (timeout after {}s)",
+                  kHealthCheckModuleTimeout.count())));
+        } else {
+          checks.emplace_back(makeResult(
+              HealthCheckId::PEER_PREFIX_LIMIT_DROPS,
+              HealthCheckCategory::PEER_MANAGER,
+              HealthCheckStatus::FAIL,
+              fmt::format(
+                  "getSessionInfos() failed: {}", result.exception().what())));
+        }
+      }
+    }
+  }
+
   report.overallStatus() = computeOverallStatus(checks);
-  return report;
+  co_return report;
 }
 
 /* ────────────────────────────────────────────────────────────────

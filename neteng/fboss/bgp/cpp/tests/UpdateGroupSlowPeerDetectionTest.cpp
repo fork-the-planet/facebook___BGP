@@ -64,19 +64,10 @@ class UpdateGroupSlowPeerDetectionTest : public ::testing::Test {
     changeTracker_ =
         std::make_shared<ChangeTracker<ShadowRibEntry>>("test_tracker");
 
-    groupConsumer_ = std::make_shared<AdjRibOutGroupConsumer>(
-        changeTracker_,
-        group_,
-        "test_group_consumer",
-        *evb_,
-        addPathBitmap_,
-        nonAddPathBitmap_);
-    groupConsumer_->registerWithTracker();
-    groupConsumer_->setBitmap();
-
-    group_->setChangeListConsumer(groupConsumer_);
     group_->setChangeListTracker(
         changeTracker_, addPathBitmap_, nonAddPathBitmap_);
+    group_->registerGroupConsumer();
+    groupConsumer_ = group_->getChangeListConsumer();
 
     // Publish a CL item so group consumer has a non-null marker
     auto entry = std::make_unique<ShadowRibEntry>();
@@ -610,18 +601,10 @@ TEST_F(
   auto customChangeTracker =
       std::make_shared<ChangeTracker<ShadowRibEntry>>("custom_tracker");
   ConsumerBitmap customAddPath, customNonAddPath;
-  auto customConsumer = std::make_shared<AdjRibOutGroupConsumer>(
-      customChangeTracker,
-      customGroup,
-      "custom_consumer",
-      *evb_,
-      customAddPath,
-      customNonAddPath);
-  customConsumer->registerWithTracker();
-  customConsumer->setBitmap();
-  customGroup->setChangeListConsumer(customConsumer);
   customGroup->setChangeListTracker(
       customChangeTracker, customAddPath, customNonAddPath);
+  customGroup->registerGroupConsumer();
+  auto customConsumer = customGroup->getChangeListConsumer();
 
   auto entry = std::make_unique<ShadowRibEntry>();
   entry->prefix = folly::CIDRNetwork{folly::IPAddress("10.0.1.0"), 24};

@@ -17,12 +17,14 @@
 #pragma once
 
 #include <fmt/format.h>
+#include <folly/Function.h>
 #include <folly/container/F14Map.h>
 #include <folly/container/F14Set.h>
 #include <folly/coro/AsyncScope.h>
 #include <folly/logging/xlog.h>
 #include <chrono>
 #include <deque>
+#include <memory>
 #include <optional>
 
 #include <folly/coro/Task.h>
@@ -71,7 +73,7 @@ struct PostPolicyInfo;
  * advertised routes
  *
  */
-class AdjRibOutGroup {
+class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
  public:
   explicit AdjRibOutGroup(
       folly::EventBase& evb,
@@ -264,6 +266,84 @@ class AdjRibOutGroup {
       const folly::CIDRNetwork& prefix,
       const AdjRibOutOwnerKey& peerOwnerKey) noexcept;
 
+  /*
+   * Resolve the lite RIB-OUT entry visible to a peer at a single radix node,
+   * applying the same version gate as getRibEntrySharedOrPeer but on an
+   * already-iterated owner map (no per-prefix re-lookup). Returns:
+   *   - the peer's own entry when present (diverged peer, or standalone /
+   *     update-group disabled),
+   *   - else, only when this group has update-group enabled, the shared group
+   *     entry when the peer still shares it (in-sync, or detached with the
+   *     group entry at/below its detach version),
+   *   - else nullptr (update group disabled, or a post-detach group entry the
+   *     peer never saw -> the "missing" per-peer entry is expected, not a bug).
+   *
+   * When enableUpdateGroup_ is false the group owner key is never consulted —
+   * group-key entries only exist while update groups are enabled (writes go
+   * under the peer key otherwise), so this keeps that intent explicit rather
+   * than relying on the empty group key.
+   *
+   * sharingVersion: for a detached peer pass getDetachedRibVersion(); for a
+   * non-detached peer pass the group's getLastSeenRibVersion() (shares all).
+   */
+  const AdjRibEntry* FOLLY_NULLABLE resolveLiteEntryForPeer(
+      const LiteOwnerMap& ownerMap,
+      const AdjRibOutOwnerKey& peerOwnerKey,
+      uint64_t sharingVersion) const noexcept {
+    auto peerItr = ownerMap.find(peerOwnerKey);
+    if (peerItr != ownerMap.end()) {
+      return peerItr->second.get();
+    }
+    if (!enableUpdateGroup_) {
+      return nullptr;
+    }
+    auto groupItr = ownerMap.find(getGroupOwnerKey());
+    if (groupItr != ownerMap.end() &&
+        !isEntryNotShared(sharingVersion, groupItr->second->getRibVersion())) {
+      return groupItr->second.get();
+    }
+    return nullptr;
+  }
+
+  /*
+   * Path-tree counterpart of resolveLiteEntryForPeer: invoke
+   * cb(uint32_t pathId, const AdjRibEntry& entry) for each path entry visible
+   * to the peer at a single radix node. Peer-owned paths are emitted as-is;
+   * only when this group has update-group enabled, a group-owned path is also
+   * emitted when the peer does not already own that pathId and still shares the
+   * group entry (version gate). Divergence is per (prefix, pathId), matching
+   * getRibEntrySharedOrPeer.
+   */
+  template <typename Callback>
+  void resolvePathEntriesForPeer(
+      const PathOwnerMap& ownerMap,
+      const AdjRibOutOwnerKey& peerOwnerKey,
+      uint64_t sharingVersion,
+      Callback&& cb) const {
+    auto peerItr = ownerMap.find(peerOwnerKey);
+    if (peerItr != ownerMap.end()) {
+      for (const auto& [pathId, entry] : peerItr->second) {
+        cb(pathId, *entry);
+      }
+    }
+    if (!enableUpdateGroup_) {
+      return;
+    }
+    auto groupItr = ownerMap.find(getGroupOwnerKey());
+    if (groupItr == ownerMap.end()) {
+      return;
+    }
+    for (const auto& [pathId, entry] : groupItr->second) {
+      if (peerItr != ownerMap.end() &&
+          peerItr->second.find(pathId) != peerItr->second.end()) {
+        continue;
+      }
+      if (!isEntryNotShared(sharingVersion, entry->getRibVersion())) {
+        cb(pathId, *entry);
+      }
+    }
+  }
+
   AdjRibEntry* FOLLY_NULLABLE getAdjRibEntryFromPathNodeItr(
       const AdjRibPathTree::Iterator& itr,
       const AdjRibOutOwnerKey& ownerKey,
@@ -298,9 +378,31 @@ class AdjRibOutGroup {
    * Change list consumer activation/deactivation
    * Same pattern as AdjRib for consistency
    */
-  void scheduleConsumeTimer() noexcept;
-  void activateChangeListConsumer() noexcept;
+  void scheduleChangeListConsumeTimer() noexcept;
+
+  /*
+   * Cancel (without destroying) the group's change list consume timer, leaving
+   * the group frozen until the timer is rescheduled via
+   * scheduleChangeListConsumeTimer.
+   */
+  void cancelChangeListConsumeTimer() noexcept;
+
+  /*
+   * Create (if not already set) the group's change list consumer, register it
+   * with the tracker, and create the consume timer. The consumer is created
+   * lazily here — after the initial RIB dump — rather than at peer
+   * establishment. Requires setChangeListTracker() to have wired the tracker
+   * and bitmaps first.
+   */
+  void registerGroupConsumer() noexcept;
   void deactivateChangeListConsumer() noexcept;
+
+  /*
+   * Create the group's change list consume (MRAI) timer for the currently set
+   * changeListConsumer_. Shared by registerGroupConsumer() and the consumer
+   * swap in promoteDetachedPeerToSync().
+   */
+  void createChangeListConsumeTimer() noexcept;
 
   void clearPackingList() {
     attrToPrefixMap_.clear();
@@ -335,11 +437,9 @@ class AdjRibOutGroup {
    * Cancel MRAI timer if running
    * Used during group cleanup
    */
-  void cancelChangeListConsumeTimer() noexcept {
-    if (changeListConsumeTimer_) {
-      changeListConsumeTimer_->cancelTimeout();
-      changeListConsumeTimer_.reset();
-    }
+  void resetChangeListConsumeTimer() noexcept {
+    cancelChangeListConsumeTimer();
+    changeListConsumeTimer_.reset();
   }
 
   /*
@@ -435,16 +535,9 @@ class AdjRibOutGroup {
   }
 
   /*
-   * Save initialized changeListConsumer for this group
-   */
-  void setChangeListConsumer(
-      std::shared_ptr<AdjRibOutGroupConsumer>& changeListConsumer) noexcept {
-    changeListConsumer_ = changeListConsumer;
-  }
-
-  /*
-   * Set the change list tracker and consumer bitmaps for detached peer support.
-   * Called by PeerManager when setting up the group's change list consumer.
+   * Set the change list tracker and consumer bitmaps for detached peer
+   * support. Called by PeerManager when setting up the group's change list
+   * consumer.
    */
   void setChangeListTracker(
       std::shared_ptr<ChangeTracker<ShadowRibEntry>>& tracker,
@@ -453,6 +546,11 @@ class AdjRibOutGroup {
     changeListTracker_ = tracker;
     addPathConsumerBitmap_ = &addPathBitmap;
     nonAddPathConsumerBitmap_ = &nonAddPathBitmap;
+  }
+
+  const std::shared_ptr<ChangeTracker<ShadowRibEntry>>& getChangeListTracker()
+      const noexcept {
+    return changeListTracker_;
   }
 
   /*
@@ -490,11 +588,22 @@ class AdjRibOutGroup {
       bool sendWithEoR = false) noexcept;
 
   /*
-   * Notify all in-sync peers to send their own EoR markers
-   * Groups don't build/distribute EoR PDUs - they just set a flag on each peer
-   * Peers send EoRs via existing sendPendingEoRs() logic with backpressure
+   * Mark every currently in-sync peer as owing the group's pending per-AFI
+   * EoRs. Reads the group's egressEoRPending flags (set just before this call
+   * in processRibOutAnnouncement) and sets the matching per-peer
+   * EGRESS_EOR_PENDING flags, which become the single source of truth for
+   * what each peer still owes.
    */
-  void notifyPeersToSendEoR() noexcept;
+  void setEgressEorsPendingSyncPeers() noexcept;
+
+  /*
+   * Distribute the group's pending per-AFI EoR markers to all in-sync peers.
+   * Drains one AFI at a time (waitForAllPendingPushes between AFIs) and
+   * clears each group per-AFI pending flag once committed. Returns the number
+   * of EoR PDUs built (one per AFI distributed) so the caller can fold it
+   * into its BGP message count.
+   */
+  folly::coro::Task<uint32_t> distributePendingEoRs() noexcept;
 
   /*
    * Try to insert withdrawal for a prefix in the group's packing list
@@ -509,8 +618,8 @@ class AdjRibOutGroup {
 
   /*
    * Get post-policy attributes and metadata for the group
-   * Similar to AdjRib::getPostOutPolicyAttributesAndInfo but operates at group
-   * level Made public for testing
+   * Similar to AdjRib::getPostOutPolicyAttributesAndInfo but operates at
+   * group level Made public for testing
    */
   std::pair<const std::shared_ptr<const BgpPath>, const PostPolicyInfo>
   getPostOutPolicyAttributesAndInfo(
@@ -548,18 +657,20 @@ class AdjRibOutGroup {
       const std::shared_ptr<nettools::bgplib::BgpUpdate2>& message,
       const std::shared_ptr<const BgpPath>& postOutAttrs,
       nettools::bgplib::BgpUpdateAfi afi,
-      bool sendWithEoR,
       bool isNexthopSetByPolicy = false) noexcept;
 
   /*
    * Try to push message to a peer's bounded queue
-   * Returns PUSH_OK if immediate push succeeded, PUSH_PENDING if deferred
+   * Returns PUSH_OK if immediate push succeeded, PUSH_PENDING if deferred,
+   * PUSH_FAILED if scheduling failed.
+   * onResolved (optional) runs once when the push resolves; not on
+   * PUSH_FAILED.
    */
   PushResult tryPushToPeer(
       const nettools::bgplib::FiberBgpPeer::InputMessageT& message,
       const std::shared_ptr<AdjRib>& adjRib,
       uint64_t bitPos,
-      bool sendWithEoR) noexcept;
+      folly::Function<void() noexcept> onResolved = {}) noexcept;
 
   /*
    * Wait for all pending pushes to complete (all bits clear)
@@ -609,6 +720,13 @@ class AdjRibOutGroup {
     return adjRibBlockedBitmap_;
   }
 
+  /* True while the group still owes any AFI's EoR marker to its in-sync
+   * peers.
+   */
+  bool egressEoRsPending() const noexcept {
+    return egressEoRPendingV4_ || egressEoRPendingV6_;
+  }
+
   /*
    * Register a peer with this update group
    * Assigns bit position and updates tracking structures
@@ -625,20 +743,20 @@ class AdjRibOutGroup {
   void unregisterPeer(const std::shared_ptr<AdjRib>& adjRib) noexcept;
 
   /*
-   * Handle detached peer termination
-   * Called when a peer in DETACHED state goes down
-   * @param bit - The bit position of the peer in the group
+   * Erase a detached peer's diverged per-peer RIB-OUT entries from the
+   * group's trees; group-owned entries the peer still shares are left in
+   * place (only counted for logging). Must be called before removePeer()
+   * clears the bit.
    */
-  void handleDetachedPeerDown(const std::shared_ptr<AdjRib>& adjRib) noexcept;
+  void cleanUpDetachedRibEntries(
+      const std::shared_ptr<AdjRib>& adjRib) noexcept;
 
   /*
    * Mark a peer as blocked due to TCP backpressure.
    * Sets bitmap bit, checks frequency threshold, schedules duration timer.
    * @param adjRib - The peer that just became blocked
    */
-  void markPeerBlocked(
-      const std::shared_ptr<AdjRib>& adjRib,
-      bool sendWithEoR = false) noexcept;
+  void markPeerBlocked(const std::shared_ptr<AdjRib>& adjRib) noexcept;
 
   /*
    * Mark a peer as unblocked (queue space available).
@@ -653,15 +771,25 @@ class AdjRibOutGroup {
    */
   bool hasBlockedPeers() const noexcept;
 
+  /* Why a peer was detached from the group; selects the cumulative
+   * AdjRibStats counter bumped by detachPeer. */
+  enum class DetachReason {
+    Blocking, // Slow/blocked peer (backpressure)
+    Policy, // Egress policy re-evaluation / group move
+  };
+
   /*
    * Detach a peer from the group (core detachment logic).
    * Copies egress prefix counts, clones packing list, marks detached,
    * sets version fields, clears blocked bitmap, cancels slow peer timer,
-   * registers detached CL consumer, propagates EoR state.
+   * registers detached CL consumer, propagates EoR state, and bumps the
+   * cumulative AdjRibStats detachment counter for `reason`.
    * Does NOT handle slow-peer-specific logic (stats, last-synced guard,
    * state transitions).
    */
-  void detachPeer(const std::shared_ptr<AdjRib>& adjRib) noexcept;
+  void detachPeer(
+      const std::shared_ptr<AdjRib>& adjRib,
+      DetachReason reason) noexcept;
 
   /*
    * Detach a slow peer from the group.
@@ -669,11 +797,11 @@ class AdjRibOutGroup {
    * then handles slow-peer-specific cleanup: stats, last-synced guard,
    * EoR, state transition JOINED_BLOCKED -> DETACHED_BLOCKED.
    * Skips detachment if the peer is the last synced member.
+   * EoR pending state is handled inside detachPeer (copies the group's
+   * per-AFI egress EoR pending flags onto the peer).
    * @param adjRib - The peer to detach
    */
-  void detachSlowPeer(
-      const std::shared_ptr<AdjRib>& adjRib,
-      bool sendWithEoR = false) noexcept;
+  void detachSlowPeer(const std::shared_ptr<AdjRib>& adjRib) noexcept;
 
   /*
    * Mark a peer as detached from the group (with possibly different
@@ -685,6 +813,23 @@ class AdjRibOutGroup {
    * Clear diverged state for a peer (on rejoin).
    */
   void markPeerInSync(const std::shared_ptr<AdjRib>& adjRib) noexcept;
+
+  /*
+   * Recover the group after its last SYNC peer leaves, leaving only detached
+   * peers. Clears the packing list, freezes the consume timer, and tries to
+   * restore a SYNC peer; if none can be promoted immediately the group stays
+   * frozen until a detached peer catches up or finishes draining.
+   */
+  void handleNoSyncPeers() noexcept;
+
+  /*
+   * Promote a detached peer (ahead of / caught up with the frozen group) to
+   * SYNC: move its RIB-OUT entries to the group owner key, re-create the
+   * group's change list consumer joined at the peer's CL position, adopt the
+   * peer's RIB version, tear down the peer's detached-mode processing, and
+   * mark it in sync.
+   */
+  void promoteDetachedPeerToSync(std::shared_ptr<AdjRib> adjRib) noexcept;
 
   /*
    * Get the set of detached peers.
@@ -704,24 +849,28 @@ class AdjRibOutGroup {
   /*
    * Check for detached peers ready to rejoin and accept them back into
    * the group. DFP peers (IS_DETACHED_FAST_PEER flag set) are accepted
-   * directly — no collapse needed. DSP peers are only accepted when the
-   * group consumer is at the end of the CL, and go through
-   * tryAcceptPeersToGroup for collapse verification.
-   * Called ONLY after PL drain completes (WAITING -> IDLE transition).
+   * directly — no collapse needed. DSP peers are accepted when their change
+   * list marker matches the group consumer's marker (same position on the CL,
+   * verified by isReadyToRejoinGroup) — not only when the group is at the end
+   * of the CL — and go through tryAcceptPeersToGroup for collapse
+   * verification. Called ONLY after PL drain completes (WAITING -> IDLE
+   * transition).
    */
   void checkAndAcceptReadyToJoinPeers() noexcept;
 
   /*
    * Called by a DSP peer that has transitioned to DETACHED_READY_TO_JOIN
    * to proactively trigger its own rejoin without waiting for the next group
-   * PL drain. Only accepts the peer if the group consumer is also at end of CL.
+   * PL drain. Only accepts the peer if its change list marker matches the
+   * group consumer's marker (same position on the CL, verified by
+   * isReadyToRejoinGroup).
    * @param adjRib - The peer attempting to rejoin
    */
-  void checkAndAcceptDSPPeer(const std::shared_ptr<AdjRib>& adjRib) noexcept;
+  void maybeAcceptDSPPeer(const std::shared_ptr<AdjRib>& adjRib) noexcept;
 
   /*
    * Test-only: defer DRJ acceptance for a specific peer.
-   * When deferred, checkAndAcceptReadyToJoinPeers and checkAndAcceptDSPPeer
+   * When deferred, checkAndAcceptReadyToJoinPeers and maybeAcceptDSPPeer
    * skip the peer, keeping it in DETACHED_READY_TO_JOIN.
    * On release (defer=false), triggers acceptance for the peer.
    */
@@ -755,6 +904,10 @@ class AdjRibOutGroup {
    */
   const UpdateGroupKey& getGroupKey() const noexcept {
     return groupKey_;
+  }
+
+  void setGroupKey(const UpdateGroupKey& key) noexcept {
+    groupKey_ = key;
   }
 
   /*
@@ -796,7 +949,8 @@ class AdjRibOutGroup {
 
   /*
    * Set the last seen RIB version for this group.
-   * Called after initial dump completes and when consuming change list updates.
+   * Called after initial dump completes and when consuming change list
+   * updates.
    */
   void setLastSeenRibVersion(uint64_t version) noexcept {
     lastSeenRibVersion_ = version;
@@ -807,8 +961,6 @@ class AdjRibOutGroup {
    * A peer is in-sync if its bit is set in adjRibSyncBitmap_.
    * Used to determine whether to return group's or peer's cached RIB version.
    */
-  bool isGroupConsumerReady() const noexcept;
-
   bool isPeerInSync(uint64_t bitPos) const noexcept {
     return BitmapUtils::isBitSet(adjRibSyncBitmap_, bitPos);
   }
@@ -818,18 +970,45 @@ class AdjRibOutGroup {
   }
 
   /*
+   * Number of detached peers that diverged after running with the group
+   * (transitioned JOINED -> BLOCKED -> detached). Equivalent to the number of
+   * detached peers whose detachedRibVersion is non-zero; DETACHED_INIT_DUMP
+   * peers (detachedRibVersion == 0) are excluded.
+   */
+  size_t getNumPeersDetachedAfterJoin() const noexcept {
+    return numPeersDetachedAfterJoin_;
+  }
+
+  /*
+   * Decrement numPeersDetachedAfterJoin_ when a peer leaves the
+   * detached set (goes down or rejoins). Called from
+   * AdjRib::deactivateDetachedModeProcessing() — the single point where a
+   * detached peer's processing is torn down. Logs an error on underflow.
+   */
+  void decrementPeersDetachedAfterJoin() noexcept;
+
+  /*
    * Clone a RIB-OUT entry for a specific peer.
    * Creates an entry keyed by effectiveOwnerKey, shallow copying all
    * relevant fields from the source entry.
    */
-  AdjRibEntry* copyEntryForPeer(
+  AdjRibEntry* copyEntryForOwner(
       const folly::CIDRNetwork& prefix,
       uint32_t pathId,
-      const std::shared_ptr<AdjRib>& peer,
       const AdjRibOutOwnerKey& effectiveOwnerKey,
       const AdjRibEntry* entryToCopy) noexcept;
 
  private:
+  /*
+   * Promote a peer's RIB-OUT entries to group entries. Walks the
+   * RIB-OUT tree: entries with the peer's owner key are moved to the
+   * group owner key; entries with only the group owner key are deleted.
+   */
+  void promoteDetachedPeerPathEntries(
+      const std::shared_ptr<AdjRib>& adjRib) noexcept;
+  void promoteDetachedPeerLiteEntries(
+      const std::shared_ptr<AdjRib>& adjRib) noexcept;
+
   void setSyncBit(uint64_t bit) noexcept {
     if (!BitmapUtils::isBitSet(adjRibSyncBitmap_, bit)) {
       ++numInSyncPeers_;
@@ -876,9 +1055,9 @@ class AdjRibOutGroup {
 
   /*
    * Iterate all detached peers and clone the group entry to any peer
-   * that was sharing it (per shouldClone{Path,Lite}ForPeer). Called BEFORE the
-   * group mutates or removes an entry.
-   * Takes the already-looked-up iterator to avoid redundant tree lookups.
+   * that was sharing it (per shouldClone{Path,Lite}ForPeer). Called BEFORE
+   * the group mutates or removes an entry. Takes the already-looked-up
+   * iterator to avoid redundant tree lookups.
    */
   void lazyClonePathForDetachedPeers(
       const folly::CIDRNetwork& prefix,
@@ -982,8 +1161,8 @@ class AdjRibOutGroup {
 
   /*
    * Unique string to represent the name of the group.
-   *  - If enableUpdateGroup_ = true, group name is set as the string version of
-   * UpdateGroupKey;
+   *  - If enableUpdateGroup_ = true, group name is set as the string version
+   * of UpdateGroupKey;
    *  - If enableUpdateGroup_ = false, group name is set from the input
    * parameter, which can be either retrieved from PeeringParams or PeerAddr
    * string.
@@ -991,8 +1170,8 @@ class AdjRibOutGroup {
   std::string groupName_;
 
   /*
-   * Unique integer value to identify the update-group. This id will be assigned
-   * to only one group.
+   * Unique integer value to identify the update-group. This id will be
+   * assigned to only one group.
    */
   uint64_t groupId_;
 
@@ -1052,9 +1231,20 @@ class AdjRibOutGroup {
 
   /*
    * Cached count of set bits in adjRibSyncBitmap_, maintained incrementally
-   * when bits are set/cleared to avoid O(bitmap-size) popcount on every query.
+   * when bits are set/cleared to avoid O(bitmap-size) popcount on every
+   * query.
    */
   size_t numInSyncPeers_{0};
+
+  /*
+   * Count of detached peers that diverged after running with the group
+   * (transitioned JOINED -> BLOCKED -> detached). Maintained incrementally:
+   * incremented in detachPeer() when a peer's detachedRibVersion goes from 0
+   * to non-zero, decremented when a counted peer goes down or rejoins.
+   * Equivalent to the number of detached peers whose detachedRibVersion is
+   * non-zero (excludes DETACHED_INIT_DUMP peers).
+   */
+  size_t numPeersDetachedAfterJoin_{0};
 
   /*
    * Current state of the update group (UNINITIALIZED, IDLE, READY, WAITING).
@@ -1066,7 +1256,8 @@ class AdjRibOutGroup {
   /*
    * Mapping from bit position (from bitmap) to actual AdjRib object pointer.
    * Bitmaps are efficient but we need to get the actual peer object from bit
-   * position to perform operations like sending updates, checking config, etc.
+   * position to perform operations like sending updates, checking config,
+   * etc.
    */
   std::unordered_map<uint64_t, std::shared_ptr<AdjRib>> bitToAdjRibs_;
 
@@ -1078,8 +1269,9 @@ class AdjRibOutGroup {
 
   /*
    * Group-level packing list: maps BGP path attributes to list of prefixes.
-   * This is the key optimization - one packing list serves N peers instead of N
-   * lists, reducing memory by N and CPU by N since we build it once per group.
+   * This is the key optimization - one packing list serves N peers instead of
+   * N lists, reducing memory by N and CPU by N since we build it once per
+   * group.
    */
   AttrToPrefixMap attrToPrefixMap_;
 
@@ -1147,14 +1339,15 @@ class AdjRibOutGroup {
 
   /*
    * Policy cache for egress policy
-   * Caches policy evaluation results to avoid re-running policy for same attrs
+   * Caches policy evaluation results to avoid re-running policy for same
+   * attrs
    */
   std::shared_ptr<AdjRibPolicyCache> policyCache_{nullptr};
 
   /*
-   * Bitmap tracking which peers are currently blocked due to TCP backpressure.
-   * bit=1 means peer is blocked, bit=0 means peer is not blocked.
-   * Managed by markPeerBlocked()/markPeerUnblocked().
+   * Bitmap tracking which peers are currently blocked due to TCP
+   * backpressure. bit=1 means peer is blocked, bit=0 means peer is not
+   * blocked. Managed by markPeerBlocked()/markPeerUnblocked().
    */
   ConsumerBitmap adjRibBlockedBitmap_;
 
@@ -1177,16 +1370,23 @@ class AdjRibOutGroup {
   folly::coro::CancellableAsyncScope asyncScope_;
 
   /**
-   * Flag tracking whether peers in this group have pending EoR markers to send.
-   * Set to true after packing list drains, signaling peers should send their
-   * EoRs.
+   * Per-AFI flags tracking whether the group still owes that AFI's EoR marker
+   * to its in-sync peers. Set when the packing list drains; each is cleared
+   * once the group has committed that AFI's EoR to all in-sync peers. These
+   * gate whether distributePendingEoRs runs. The authoritative per-peer state
+   * lives in each AdjRib's EGRESS_EOR_PENDING flags, which are marked when
+   * the EoR becomes owed and cleared per-peer by markEgressEoRSent; a
+   * detaching peer is NOT re-derived from these group flags (that would set
+   * already-committed AFIs back to pending and duplicate the EoR).
    */
-  bool egressEoRsPending_{false};
+  bool egressEoRPendingV4_{false};
+  bool egressEoRPendingV6_{false};
 
   /**
-   * Guard flag to prevent concurrent execution of buildAndSendGroupBgpMessages.
-   * Only one instance should run at a time to maintain BGP UPDATE ordering.
-   * Single-threaded on evb_, so no atomic needed.
+   * Guard flag to prevent concurrent execution of
+   * buildAndSendGroupBgpMessages. Only one instance should run at a time to
+   * maintain BGP UPDATE ordering. Single-threaded on evb_, so no atomic
+   * needed.
    */
   bool packingInProgress_{false};
 
@@ -1207,7 +1407,8 @@ class AdjRibOutGroup {
 
   /**
    * Epoch time (ms) when initial RIB dump completed for this group.
-   * Set once in buildInitialDumpFromShadowRib() when transitioning to WAITING.
+   * Set once in buildInitialDumpFromShadowRib() when transitioning to
+   * WAITING.
    */
   std::optional<int64_t> initialDumpCompletionTimeMs_{std::nullopt};
 

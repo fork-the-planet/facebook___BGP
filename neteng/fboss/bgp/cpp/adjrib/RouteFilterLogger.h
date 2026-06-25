@@ -16,44 +16,49 @@
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <folly/IPAddress.h>
 
-namespace facebook {
-namespace rfe {
-class ScubaData;
-} // namespace rfe
+namespace facebook::bgp {
 
-namespace bgp {
-
+/**
+ * Logs the result of evaluating a route filter statement against a prefix.
+ * Abstract so the logging backend is not part of the public interface; the
+ * concrete implementation lives in the build-specific source set and is built
+ * through RouteFilterLoggerFactory. OSS builds have no implementation.
+ */
 class RouteFilterLogger {
  public:
-  explicit RouteFilterLogger(
-      const std::string& deviceName,
-      const std::string& statementName,
-      const std::string& peerName,
-      std::shared_ptr<rfe::ScubaData> scubaLogger)
-      : deviceName_(deviceName),
-        statementName_(statementName),
-        peerName_(peerName),
-        scubaLogger_(std::move(scubaLogger)) {}
-  ~RouteFilterLogger() = default;
+  virtual ~RouteFilterLogger() = default;
 
-  size_t log(
+  virtual size_t log(
       bool egress,
       const folly::CIDRNetwork& prefix,
       bool allow,
       bool permissive,
-      const std::vector<std::string>& communities);
-
- private:
-  const std::string deviceName_;
-  const std::string statementName_;
-  const std::string peerName_;
-  std::shared_ptr<rfe::ScubaData> scubaLogger_{nullptr};
+      const std::vector<std::string>& communities) = 0;
 };
 
-} // namespace bgp
-} // namespace facebook
+/**
+ * Builds RouteFilterLogger instances that share a single logging backend, so
+ * constructing a logger per route filter statement does not allocate a new
+ * backend each time.
+ */
+class RouteFilterLoggerFactory {
+ public:
+  virtual ~RouteFilterLoggerFactory() = default;
+
+  virtual std::unique_ptr<RouteFilterLogger> create(
+      const std::string& deviceName,
+      const std::string& statementName,
+      const std::string& peerName) const = 0;
+};
+
+// Returns nullptr when route filter logging is unavailable (e.g. OSS builds).
+std::unique_ptr<RouteFilterLoggerFactory> createRouteFilterLoggerFactory();
+
+} // namespace facebook::bgp

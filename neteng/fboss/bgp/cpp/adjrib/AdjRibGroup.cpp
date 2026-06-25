@@ -34,6 +34,7 @@
 #include "neteng/fboss/bgp/cpp/adjrib/WellKnownCommunityFilter.h"
 #include "neteng/fboss/bgp/cpp/changeTracker/ConsumerBitmap.h"
 #include "neteng/fboss/bgp/cpp/common/Consts.h"
+#include "neteng/fboss/bgp/cpp/common/Utils.h"
 #include "neteng/fboss/bgp/cpp/policy/PolicyManager.h"
 #include "neteng/fboss/bgp/cpp/stats/Stats.h"
 
@@ -393,21 +394,36 @@ uint32_t AdjRibOutGroup::getPeerEntriesCountFromLiteTree(
  *
  * @return void
  */
-void AdjRibOutGroup::activateChangeListConsumer() noexcept {
-  if (!changeListConsumer_) {
-    XLOGF(
-        ERR,
-        "changeListConsumer is not initialized and hence cannot be registered for group {}",
-        groupDescriptor_);
-    return;
-  }
-
+void AdjRibOutGroup::registerGroupConsumer() noexcept {
   if (changeListConsumeTimer_) {
     XLOGF(
         ERR,
         "update group {} has already been registered to changeListTracker",
         groupDescriptor_);
     return;
+  }
+
+  /*
+   * Create the group's change list consumer on first registration (after the
+   * initial RIB dump). The tracker and bitmaps must already be wired via
+   * setChangeListTracker().
+   */
+  if (!changeListConsumer_) {
+    if (!changeListTracker_ || !addPathConsumerBitmap_ ||
+        !nonAddPathConsumerBitmap_) {
+      XLOGF(
+          ERR,
+          "Cannot create change list consumer for group {}: tracker/bitmaps not set",
+          groupDescriptor_);
+      return;
+    }
+    changeListConsumer_ = std::make_shared<AdjRibOutGroupConsumer>(
+        changeListTracker_,
+        shared_from_this(),
+        fmt::format("UpdateGroup-{}", groupName_),
+        evb_,
+        *addPathConsumerBitmap_,
+        *nonAddPathConsumerBitmap_);
   }
 
   XLOGF(
@@ -418,76 +434,66 @@ void AdjRibOutGroup::activateChangeListConsumer() noexcept {
   changeListConsumer_->setPolledMode();
   changeListConsumer_->setBitmap();
 
+  createChangeListConsumeTimer();
+}
+
+void AdjRibOutGroup::createChangeListConsumeTimer() noexcept {
   changeListConsumeTimer_ = folly::AsyncTimeout::make(evb_, [this]() noexcept {
     /*
-     * Start a polled cycle to consume available changes.
-     * We use asyncScope_.add(co_withExecutor(...)) to track the coroutine
-     * rather than running the work inline in the timer callback. This enqueues
-     * the coroutine as a new EventBase callback, allowing already-pending
-     * callbacks (peer session events, socket reads, other timers) to drain
-     * first — important under scale when many peers flap simultaneously.
-     * Tracking via asyncScope_ ensures the coroutine is cancelled during
-     * group destruction, preventing use-after-free.
+     * The callback runs the change list consumption inline in the timer
+     * callback. TODO(T274212842): consider running change list consumption as a
+     * cancellable coroutine on packing timer expiry instead.
+     *
+     * Guard against use-after-reset: the MRAI timer is scheduled, but before it
+     * fires other EventBase callbacks may run — including session termination
+     * paths that call deactivateChangeListConsumer() and nullify
+     * changeListConsumer_. Under scale with mass peer flaps, this window is
+     * wide enough to hit consistently.
      */
-    asyncScope_.add(co_withExecutor(
-        &evb_, folly::coro::co_invoke([this]() -> folly::coro::Task<void> {
-          /*
-           * Guard against use-after-reset: the MRAI timer fires and
-           * enqueues this coroutine, but between scheduling and execution,
-           * other EventBase callbacks may run — including session
-           * termination paths that call deactivateChangeListConsumer()
-           * and nullify changeListConsumer_. Under scale with mass peer
-           * flaps, this window is wide enough to hit consistently.
-           */
-          if (!changeListConsumer_) {
-            XLOGF(
-                WARN,
-                "Group {}: CL consume timer fired but "
-                "changeListConsumer_ is null, skipping",
-                groupDescriptor_);
-            co_return;
-          }
-          // Use iterator-based interface for consuming change items
-          auto previousRibVersion = lastSeenRibVersion_;
-          {
-            ScopedProfile profile("AdjRibOutGroup::consumeChangeList");
-            changeListConsumer_->iterateChanges();
-          }
-          if (changeListConsumer_->isStale(kConsumerStalenessThreshold) &&
-              !changeListConsumer_->isStalenessLogged()) {
-            XLOGF(
-                WARN,
-                "Group {}: change list consumer stale for {}ms, marker has not advanced",
-                groupDescriptor_,
-                changeListConsumer_->stalenessDuration().count());
-            changeListConsumer_->markStalenessLogged();
-          }
-          XLOGF(
-              DBG2,
-              "Group {}: Updating cached RIB version from {} to {}",
-              groupDescriptor_,
-              previousRibVersion,
-              lastSeenRibVersion_);
+    if (!changeListConsumer_) {
+      XLOGF(
+          WARN,
+          "Group {}: CL consume timer fired but "
+          "changeListConsumer_ is null, skipping",
+          groupDescriptor_);
+      return;
+    }
+    // Use iterator-based interface for consuming change items
+    auto previousRibVersion = lastSeenRibVersion_;
+    {
+      ScopedProfile profile("AdjRibOutGroup::consumeChangeList");
+      changeListConsumer_->iterateChanges();
+    }
+    if (changeListConsumer_->isStale(kConsumerStalenessThreshold) &&
+        !changeListConsumer_->isStalenessLogged()) {
+      XLOGF(
+          WARN,
+          "Group {}: change list consumer stale for {}ms, marker has not advanced",
+          groupDescriptor_,
+          changeListConsumer_->stalenessDuration().count());
+      changeListConsumer_->markStalenessLogged();
+    }
+    XLOGF(
+        DBG2,
+        "Group {}: Updating cached RIB version from {} to {}",
+        groupDescriptor_,
+        previousRibVersion,
+        lastSeenRibVersion_);
 
-          if (changeListConsumeTimer_) {
-            changeListConsumeTimer_->scheduleTimeout(
-                std::chrono::milliseconds(mraiInterval_));
-          }
-          /* Trigger message building if packing list has entries */
-          if (!attrToPrefixMap_.empty() &&
-              (state_ == UpdateGroupState::READY ||
-               state_ == UpdateGroupState::IDLE)) {
-            state_ = UpdateGroupState::WAITING;
-            asyncScope_.add(
-                folly::coro::co_withExecutor(
-                    &evb_, buildAndSendGroupBgpMessages(false)));
-          }
-          co_return;
-        })));
+    scheduleChangeListConsumeTimer();
+    /* Trigger message building if packing list has entries */
+    if (!attrToPrefixMap_.empty() &&
+        (state_ == UpdateGroupState::READY ||
+         state_ == UpdateGroupState::IDLE)) {
+      state_ = UpdateGroupState::WAITING;
+      asyncScope_.add(
+          folly::coro::co_withExecutor(
+              &evb_, buildAndSendGroupBgpMessages(false)));
+    }
   });
 }
 
-void AdjRibOutGroup::scheduleConsumeTimer() noexcept {
+void AdjRibOutGroup::scheduleChangeListConsumeTimer() noexcept {
   if (!changeListConsumeTimer_) {
     XLOGF(
         ERR,
@@ -500,6 +506,12 @@ void AdjRibOutGroup::scheduleConsumeTimer() noexcept {
   }
   changeListConsumeTimer_->scheduleTimeout(
       std::chrono::milliseconds(mraiInterval_));
+}
+
+void AdjRibOutGroup::cancelChangeListConsumeTimer() noexcept {
+  if (changeListConsumeTimer_) {
+    changeListConsumeTimer_->cancelTimeout();
+  }
 }
 
 /*
@@ -515,10 +527,7 @@ void AdjRibOutGroup::deactivateChangeListConsumer() noexcept {
   // cleanup any pending attrToPrefixMap_
   clearPackingList();
 
-  if (changeListConsumeTimer_) {
-    changeListConsumeTimer_->cancelTimeout();
-    changeListConsumeTimer_.reset();
-  }
+  resetChangeListConsumeTimer();
 
   /*
    * Always deregister the consumer, even if timer wasn't active.
@@ -733,8 +742,8 @@ AdjRibOutGroup::buildAndScheduleSendInitialDumpFromShadowRib() {
     }
   }
 
-  activateChangeListConsumer();
-  scheduleConsumeTimer();
+  registerGroupConsumer();
+  scheduleChangeListConsumeTimer();
 }
 
 /*
@@ -1066,11 +1075,16 @@ void AdjRibOutGroup::processRibOutAnnouncement(
   }
 
   /*
-   * Set egressEoRsPending_ before scheduling async send, mirroring
-   * AdjRib::handleRibAnnouncedEntries which sets the flag at intake time.
+   * Set the per-AFI egress EoR pending flags before scheduling async send,
+   * mirroring AdjRib::handleRibAnnouncedEntries which sets the flags at intake
+   * time. Only the AFIs negotiated by the group are set. Then mark every
+   * currently in-sync peer as owing the same AFIs so the per-peer
+   * EGRESS_EOR_PENDING flags are the single source of truth from this point on.
    */
   if (announcement.sendWithEoR) {
-    egressEoRsPending_ = true;
+    egressEoRPendingV4_ = groupKey_.afiIpv4Negotiated;
+    egressEoRPendingV6_ = groupKey_.afiIpv6Negotiated;
+    setEgressEorsPendingSyncPeers();
   }
 
   /*
@@ -1079,6 +1093,46 @@ void AdjRibOutGroup::processRibOutAnnouncement(
   asyncScope_.add(
       folly::coro::co_withExecutor(
           &evb_, buildAndSendGroupBgpMessages(announcement.sendWithEoR)));
+}
+
+/*
+ * @brief  Mark every currently in-sync peer as owing the group's pending
+ *         per-AFI EoRs.
+ *
+ * Called at the instant EoR becomes owed (processRibOutAnnouncement), right
+ * after the group's egressEoRPending flags are set, so the per-peer
+ * EGRESS_EOR_PENDING flags are the single source of truth from this point on.
+ * markEgressEoRSent clears a peer's flag the moment its EoR push resolves, so a
+ * peer that detaches at any later point (route-distribution drain or EoR
+ * distribution) already carries exactly the AFIs it still owes: no duplicate
+ * (an already-committed AFI is never set again) and no miss (an uncommitted AFI
+ * stays set). Peers that join after this point are intentionally not marked --
+ * they run their own init dump rather than inheriting this group's EoR.
+ *
+ * @return void
+ */
+void AdjRibOutGroup::setEgressEorsPendingSyncPeers() noexcept {
+  uint64_t markedPeers = 0;
+  for (const auto& [bitPos, adjRib] : bitToAdjRibs_) {
+    if (!BitmapUtils::isBitSet(adjRibSyncBitmap_, bitPos)) {
+      continue;
+    }
+    if (!adjRib) {
+      XLOGF(
+          WARN,
+          "Group {} has null AdjRib at bit {} while marking EoR pending",
+          groupDescriptor_,
+          bitPos);
+      continue;
+    }
+    adjRib->setEgressEoRsPending(egressEoRPendingV4_, egressEoRPendingV6_);
+    ++markedPeers;
+  }
+  XLOGF(
+      INFO,
+      "Group {} marked {} in-sync peers with pending EoR",
+      groupDescriptor_,
+      markedPeers);
 }
 
 /*
@@ -1765,9 +1819,7 @@ folly::coro::Task<void> AdjRibOutGroup::buildAndSendGroupBgpMessages(
    * of attrToPrefixMap_ while we're iterating it.
    * Timer will be rescheduled when we exit.
    */
-  if (changeListConsumeTimer_) {
-    changeListConsumeTimer_->cancelTimeout();
-  }
+  cancelChangeListConsumeTimer();
 
   /*
    * RAII guard to ensure cleanup even if exception occurs:
@@ -1778,10 +1830,7 @@ folly::coro::Task<void> AdjRibOutGroup::buildAndSendGroupBgpMessages(
    */
   auto guard = folly::makeGuard([this]() {
     packingInProgress_ = false;
-    if (changeListConsumeTimer_) {
-      changeListConsumeTimer_->scheduleTimeout(
-          std::chrono::milliseconds(mraiInterval_));
-    }
+    scheduleChangeListConsumeTimer();
 
     /*
      * Transition to IDLE if packing list is now empty.
@@ -1867,41 +1916,14 @@ folly::coro::Task<void> AdjRibOutGroup::buildAndSendGroupBgpMessages(
       // Distribute to all in-sync peers
       // This suspends if any peer queue is full (backpressure)
       co_await distributeMessageToInSyncPeers(
-          update, attr, afi, sendWithEoR, isNhSetByPolicy);
+          update, attr, afi, isNhSetByPolicy);
     }
   }
 
-  /*
-   * EoR handling after packing list drain, mirroring AdjRib::sendBgpUpdates:
-   *   if (egressEoRsPending_) { sendPendingEoRs(); }
-   *
-   * 1. Notify in-sync peers to set their per-peer egressEoRsPending_ flags
-   * 2. Call sendPendingEoRs() on each peer to actually send EoR markers
-   * 3. Clear group egressEoRsPending_ flag
-   */
-  if (egressEoRsPending_) {
-    notifyPeersToSendEoR();
-
-    XLOGF(
-        INFO,
-        "Group {} processing pending EoRs for in-sync peers",
-        groupDescriptor_);
-    for (const auto& [bitPos, adjRib] : bitToAdjRibs_) {
-      if (!BitmapUtils::isBitSet(adjRibSyncBitmap_, bitPos)) {
-        continue;
-      }
-      if (!adjRib) {
-        XLOGF(
-            WARN,
-            "Group {} has null AdjRib at bit {} when sending EoRs",
-            groupDescriptor_,
-            bitPos);
-        continue;
-      }
-      co_await adjRib->sendPendingEoRs();
-    }
-    egressEoRsPending_ = false;
-    XLOGF(INFO, "Group {} completed sending pending EoRs", groupDescriptor_);
+  /* Distribute pending EoRs after the packing list drains; fold the EoR PDU
+   * count into msgCount so the summary log below reflects total messages. */
+  if (egressEoRPendingV4_ || egressEoRPendingV6_) {
+    msgCount += co_await distributePendingEoRs();
   }
 
   XLOGF(
@@ -1916,52 +1938,67 @@ folly::coro::Task<void> AdjRibOutGroup::buildAndSendGroupBgpMessages(
 }
 
 /*
- * @brief  Notify all in-sync peers to send their own EoR markers
+ * @brief  Distribute the group's pending per-AFI EoR markers to in-sync peers.
  *
- * Lightweight EoR notification approach:
- * - Groups don't build/distribute EoR PDUs
- * - Instead, set egressEoRsPending flag on each in-sync peer
- * - Peers send their own EoRs via existing sendPendingEoRs() logic
- * - Handles per-peer AFI negotiation and backpressure automatically
+ * Queues each in-sync peer's EoR PDU through tryPushToPeer;
+ * each EoR push carries an onResolved continuation (markEgressEoRSent) that
+ * handles the per-peer EoR-sent bookkeeping: it clears the peer's
+ * EGRESS_EOR_PENDING_<afi> flag when the PDU lands, and once no AFI flags
+ * remain (!egressEoRsPending()) fires onEgressEoRSent on the LAST EoR to land.
  *
- * @return void
+ * In-sync peers are marked as owing EoR when the EoR becomes owed
+ * (processRibOutAnnouncement), not here, and markEgressEoRSent clears each
+ * peer's flag as its push resolves. The group's own per-AFI
+ * flag (cleared after waitForAllPendingPushes) only gates whether this
+ * distribution needs to run for this batch of sync peers.
+ *
+ * Returns the number of EoR PDUs built (one per AFI distributed).
  */
-void AdjRibOutGroup::notifyPeersToSendEoR() noexcept {
-  uint32_t notifiedCount = 0;
+folly::coro::Task<uint32_t> AdjRibOutGroup::distributePendingEoRs() noexcept {
+  uint32_t eorMsgCount = 0;
+  /*
+   * In-sync peers were already marked as owing EoR when the EoR became owed
+   * (processRibOutAnnouncement), and markEgressEoRSent clears each peer's flag
+   * as its push resolves, so no marking is needed here -- the per-peer
+   * EGRESS_EOR_PENDING flags are the single source of truth.
+   */
+  XLOGF(INFO, "Group {} processing pending EoRs", groupDescriptor_);
 
-  // Iterate through actual map keys, not range 0..size()
-  for (const auto& [bitPos, adjRib] : bitToAdjRibs_) {
-    if (!BitmapUtils::isBitSet(adjRibSyncBitmap_, bitPos)) {
-      continue;
+  auto distributeEoRs = [&](nettools::bgplib::BgpUpdateAfi afi) {
+    auto eorMessage = buildEndOfRib(afi);
+    for (const auto& [bitPos, adjRib] : bitToAdjRibs_) {
+      if (!BitmapUtils::isBitSet(adjRibSyncBitmap_, bitPos) || !adjRib) {
+        continue;
+      }
+      /* On land, finalize this peer's EoR for this AFI. */
+      tryPushToPeer(eorMessage, adjRib, bitPos, [adjRib, afi]() noexcept {
+        adjRib->markEgressEoRSent(afi);
+      });
     }
+  };
 
-    if (!adjRib) {
-      XLOGF(
-          WARN,
-          "Group {} has null AdjRib at bit {} for EoR notification",
-          groupDescriptor_,
-          bitPos);
-      continue;
-    }
+  if (egressEoRPendingV4_) {
+    distributeEoRs(nettools::bgplib::BgpUpdateAfi::AFI_IPv4);
+    eorMsgCount++;
 
-    // Set the peer's egressEoRsPending flag
-    // Peer will send EoRs via its existing sendPendingEoRs() logic
-    adjRib->setEgressEoRsPending();
-    notifiedCount++;
+    co_await waitForAllPendingPushes();
 
-    XLOGF(
-        DBG3,
-        "Group {} notified peer {} at bit {} to send EoR",
-        groupDescriptor_,
-        adjRib->getPeerName(),
-        bitPos);
+    /* Committed v4 to all in-sync peers; clear after the wait so a peer
+     * detaching during the wait does not miss sending v4 if it failed
+     * to push during deferredPushToPeer.
+     */
+    egressEoRPendingV4_ = false;
+  }
+  if (egressEoRPendingV6_) {
+    distributeEoRs(nettools::bgplib::BgpUpdateAfi::AFI_IPv6);
+    eorMsgCount++;
+    co_await waitForAllPendingPushes();
+    egressEoRPendingV6_ = false;
   }
 
-  XLOGF(
-      INFO,
-      "Group {} notified {} in-sync peers to send EoR markers",
-      groupDescriptor_,
-      notifiedCount);
+  XLOGF(INFO, "Group {} completed sending pending EoRs", groupDescriptor_);
+
+  co_return eorMsgCount;
 }
 
 /*
@@ -1976,7 +2013,6 @@ folly::coro::Task<void> AdjRibOutGroup::distributeMessageToInSyncPeers(
     const std::shared_ptr<nettools::bgplib::BgpUpdate2>& message,
     const std::shared_ptr<const BgpPath>& postOutAttrs,
     nettools::bgplib::BgpUpdateAfi afi,
-    bool sendWithEoR,
     bool isNexthopSetByPolicy) noexcept {
   if (!message) {
     XLOGF(
@@ -2076,7 +2112,7 @@ folly::coro::Task<void> AdjRibOutGroup::distributeMessageToInSyncPeers(
     }
 
     // Try to push to this peer
-    auto result = tryPushToPeer(peerMessage, adjRib, bitPos, sendWithEoR);
+    auto result = tryPushToPeer(peerMessage, adjRib, bitPos);
 
     if (result == PushResult::PUSH_OK) {
       pushOkCount++;
@@ -2118,16 +2154,22 @@ folly::coro::Task<void> AdjRibOutGroup::distributeMessageToInSyncPeers(
  * Checks if peer's queue is blocked. If not, pushes immediately.
  * If blocked, schedules a deferred push coroutine and returns PUSH_PENDING.
  *
+ * onResolved (optional) runs once when the message resolves into the peer's
+ * queue (inline, deferred, or no-queue); not run on PUSH_FAILED. Empty for
+ * route distribution; the EoR phase supplies one to finalize the peer's EoR.
+ *
  * @param  message - Message to push (InputMessageT variant)
  * @param  adjRib - Peer's AdjRib
  * @param  bitPos - Peer's bit position in bitmap
- * @return PUSH_OK if pushed, PUSH_PENDING if deferred
+ * @param  onResolved - Optional continuation; run only when the push resolves
+ * @return PUSH_OK if pushed, PUSH_PENDING if deferred, PUSH_FAILED if
+ *         scheduling failed
  */
 AdjRibOutGroup::PushResult AdjRibOutGroup::tryPushToPeer(
     const nettools::bgplib::FiberBgpPeer::InputMessageT& message,
     const std::shared_ptr<AdjRib>& adjRib,
     uint64_t bitPos,
-    bool sendWithEoR) noexcept {
+    folly::Function<void() noexcept> onResolved) noexcept {
   auto boundedQueue = adjRib->getBoundedAdjRibOutQueue();
   if (!boundedQueue) {
     XLOGF(
@@ -2136,7 +2178,8 @@ AdjRibOutGroup::PushResult AdjRibOutGroup::tryPushToPeer(
         groupDescriptor_,
         adjRib->getPeerName(),
         bitPos);
-    return PushResult::PUSH_OK; // Consider it done to avoid blocking group
+    /* No queue; return push failed. */
+    return PushResult::PUSH_FAILED;
   }
 
   /* Check if queue is blocked */
@@ -2144,7 +2187,7 @@ AdjRibOutGroup::PushResult AdjRibOutGroup::tryPushToPeer(
     /*
      * Queue full - mark peer blocked (sets bitmap, checks slow peer criteria)
      */
-    markPeerBlocked(adjRib, sendWithEoR);
+    markPeerBlocked(adjRib);
 
     XLOGF(
         DBG3,
@@ -2154,7 +2197,7 @@ AdjRibOutGroup::PushResult AdjRibOutGroup::tryPushToPeer(
         bitPos);
 
     // Schedule deferred push on the peer's asyncScope
-    if (!adjRib->scheduleDeferredPushToPeer(message)) {
+    if (!adjRib->scheduleDeferredPushToPeer(message, std::move(onResolved))) {
       /* Scheduling failed (asyncScope null or cancelled). Clear the
        * blocked state we just set so waitForAllPushesToComplete doesn't
        * hang on a bit that will never be cleared. */
@@ -2171,8 +2214,11 @@ AdjRibOutGroup::PushResult AdjRibOutGroup::tryPushToPeer(
 
     return PushResult::PUSH_PENDING;
   } else {
-    // Queue has space - push immediately
+    // Queue has space - push immediately, then run the continuation
     boundedQueue->push(message);
+    if (onResolved) {
+      onResolved();
+    }
 
     XLOGF(
         DBG5,
@@ -2338,6 +2384,18 @@ void AdjRibOutGroup::registerPeer(const std::shared_ptr<AdjRib>& adjRib) {
     adjRib->setPeerState(PeerUpdateState::DETACHED_INIT_DUMP);
     adjRib->setAdjRibFlag(AdjRib::DETACHED_INIT_DUMP_PEER);
 
+    /*
+     * Reset the stale per-peer CL consumer set during AdjRib construction,
+     * mirroring the INIT branch above. It was never
+     * registered with the ChangeTracker, so leaving it in place makes
+     * registerDetachedConsumer() short-circuit on its `if
+     * (changeListConsumer_)` guard when PeerManager::processRibDumpReq
+     * registers this detached peer. That skips creation of
+     * changeListConsumeTimer_, so detached CL consumption would never start for
+     * a peer entering a running group.
+     */
+    adjRib->resetChangeListConsumer();
+
     // Schedule individual initial dump for this peer
     // This will be done by PeerManager after registerPeer returns
   }
@@ -2357,8 +2415,35 @@ void AdjRibOutGroup::unregisterPeer(
     return;
   }
 
-  // Get bit position from adjRib
+  /*
+   * Cancel any pending deferred push coroutines for this peer
+   * Note: asyncScope_ manages all group coroutines, cannot selectively cancel
+   * per-peer. Clearing adjRibBlockedBitmap_ bit is sufficient - deferred push
+   * coroutines hold shared_ptr<AdjRib> and will handle cleanup gracefully.
+   * When coroutine wakes up, it will find bit cleared and return safely.
+   */
+
+  /* Get bit position from adjRib. */
   uint64_t bit = adjRib->getGroupBitPosition();
+
+  if (adjRib->isDetachedPeer()) {
+    XLOGF(
+        INFO,
+        "Group {}: Cleaning up detached peer {} at bit {}",
+        groupDescriptor_,
+        adjRib->getPeerName(),
+        bit);
+    /*
+     * It's important to deactivate detached mode processing AFTER cleaning
+     * up the entries that depend on the detachedRibVersion. This is because
+     * deactivation will set the detachedRibVersion to 0, but
+     * cleanUpDetachedRibEntries depends on the detachedRibVersion for
+     * counting.
+     */
+    cleanUpDetachedRibEntries(adjRib);
+    adjRib->deactivateDetachedModeProcessing();
+  }
+
   XLOGF(
       DBG1,
       "Group {}: Peer {} at bit {} State Transition: {} -> {}",
@@ -2368,18 +2453,6 @@ void AdjRibOutGroup::unregisterPeer(
       adjRib->getPeerState(),
       PeerUpdateState::DOWN);
   adjRib->setPeerState(PeerUpdateState::DOWN);
-
-  /*
-   * Cancel any pending deferred push coroutines for this peer
-   * Note: asyncScope_ manages all group coroutines, cannot selectively cancel
-   * per-peer. Clearing adjRibBlockedBitmap_ bit is sufficient - deferred push
-   * coroutines hold shared_ptr<AdjRib> and will handle cleanup gracefully.
-   * When coroutine wakes up, it will find bit cleared and return safely.
-   */
-
-  if (adjRib->isDetachedPeer()) {
-    adjRib->deactivateDetachedModeProcessing();
-  }
 
   adjRib->resetPeerBlockInfo();
   removePeer(adjRib);
@@ -2391,106 +2464,114 @@ void AdjRibOutGroup::unregisterPeer(
       adjRib->getPeerName(),
       bit);
 
-  // TODO: 1. Handle last peer in a group going down.
-  // TODO: 2. Handle last SYNC peer in a group going down.
+  /*
+   * Note: We don't call maybeDestroyUpdateGroup() here because
+   * the group might still have other members.
+   */
 }
 
 /*
- * Handle detached peer termination
- * Called when a peer in DETACHED state goes down
+ * Erase a detached peer's diverged (lazily-cloned) per-peer RIB-OUT entries
+ * from the group's trees.
+ * For diverged entries (peer owner key): erased from the tree.
+ * For shared entries (group owner key, ribVersion <= detachedRibVersion): left
+ * in place — they remain owned by the group — and only counted for the log line
+ * below (the peer was sharing these before detachment).
  *
- * Detached peers operate independently like AdjRib without update groups.
- * Normal AdjRib cleanup (handled by terminateSession() after this call):
- *   - Change list consumer deactivation
- *   - Packing list cleanup (stored in AdjRib)
- *   - MRAI timer cancellation
- *
- * This function handles UPDATE GROUP SPECIFIC cleanup only:
- *   - Clear peer's bit from group bitmaps
- *   - Remove from group's tracking maps
- *   - Delete per-peer RIB-OUT entries from group's trees
- *   - Clear bit position association
+ * Must be called after capturing detachedRibVersion but before removePeer()
+ * clears the peer's bit position.
  */
-void AdjRibOutGroup::handleDetachedPeerDown(
+void AdjRibOutGroup::cleanUpDetachedRibEntries(
     const std::shared_ptr<AdjRib>& adjRib) noexcept {
-  uint64_t bit = adjRib->getGroupBitPosition();
-  XLOGF(
-      DBG1,
-      "Group {}: Peer {} at bit {} State Transition: {} -> {}",
-      groupDescriptor_,
-      adjRib->getPeerName(),
-      bit,
-      adjRib->getPeerState(),
-      PeerUpdateState::DOWN);
-  adjRib->setPeerState(PeerUpdateState::DOWN);
-
-  /*
-   * Clean up detached mode state (CL consumer, timers, RIB version)
-   */
-  adjRib->deactivateDetachedModeProcessing();
-
-  /*
-   * Delete per-peer RIB-OUT entries from GROUP's trees
-   * When a peer detaches, its RIB-OUT entries are cloned to use peer owner key
-   * These cloned entries live in the GROUP's PathTree_/LiteTree_, not AdjRib
-   * We must delete them here since they're group-owned data
-   */
   auto peerOwnerKey = adjRib->getPeerOwnerKey();
+  auto groupOwnerKey = getGroupOwnerKey();
+  auto detachedRibVersion = adjRib->getDetachedRibVersion();
+  uint64_t bit = adjRib->getGroupBitPosition();
   size_t deletedCount = 0;
+  size_t sharedCount = 0;
 
   if (adjRib->sendAddPath()) {
     /* Clean up PathTree entries with peer owner key */
+    std::vector<AdjRibPathTree::Iterator> emptyPathNodes;
     for (auto itr = PathTree_.begin(); itr != PathTree_.end(); ++itr) {
       auto& ownerMap = itr->value();
       auto erased = ownerMap.erase(peerOwnerKey);
       if (erased > 0) {
         deletedCount++;
+        if (ownerMap.empty()) {
+          emptyPathNodes.push_back(itr);
+        }
+      } else {
+        auto groupIt = ownerMap.find(groupOwnerKey);
+        if (groupIt != ownerMap.end()) {
+          for (const auto& [_, entry] : groupIt->second) {
+            if (!isEntryNotShared(detachedRibVersion, entry->getRibVersion())) {
+              sharedCount++;
+            }
+          }
+        }
       }
+    }
+    for (auto& itr : emptyPathNodes) {
+      PathTree_.erase(itr);
     }
 
     XLOGF(
         INFO,
-        "Group {}: Deleted {} PathTree entries for detached peer {} at bit {}",
+        "Group {}: Deleted {} PathTree entries, left {} shared with group for detached peer {} at bit {}",
         groupDescriptor_,
         deletedCount,
+        sharedCount,
         adjRib->getPeerName(),
         bit);
   } else {
     /* Clean up LiteTree entries with peer owner key */
+    std::vector<AdjRibLiteTree::Iterator> emptyLiteNodes;
     for (auto itr = LiteTree_.begin(); itr != LiteTree_.end(); ++itr) {
       auto& ownerMap = itr->value();
       auto erased = ownerMap.erase(peerOwnerKey);
       if (erased > 0) {
         deletedCount++;
+        if (ownerMap.empty()) {
+          emptyLiteNodes.push_back(itr);
+        }
+      } else {
+        auto groupIt = ownerMap.find(groupOwnerKey);
+        if (groupIt != ownerMap.end() &&
+            !isEntryNotShared(
+                detachedRibVersion, groupIt->second->getRibVersion())) {
+          sharedCount++;
+        }
       }
+    }
+    for (auto& itr : emptyLiteNodes) {
+      LiteTree_.erase(itr);
     }
 
     XLOGF(
         INFO,
-        "Group {}: Deleted {} LiteTree entries for detached peer {} at bit {}",
+        "Group {}: Deleted {} LiteTree entries, left {} shared with group for detached peer {} at bit {}",
         groupDescriptor_,
         deletedCount,
+        sharedCount,
         adjRib->getPeerName(),
         bit);
   }
+}
 
-  adjRib->resetPeerBlockInfo();
-  removePeer(adjRib);
-
-  XLOGF(
-      INFO,
-      "Group {}: Successfully cleaned up detached peer {} from bit {}",
-      groupDescriptor_,
-      adjRib->getPeerName(),
-      bit);
-
-  /*
-   * Note: We don't call maybeDestroyUpdateGroup() here because:
-   * 1. terminateSession() doesn't call it for detached peers
-   * 2. The group might still have other members
-   * 3. TODO: If this was the last member, the group will be destroyed
-   * when the last non-detached peer leaves
-   */
+void AdjRibOutGroup::decrementPeersDetachedAfterJoin() noexcept {
+  if (numPeersDetachedAfterJoin_ == 0) {
+    /*
+     * Underflow: a peer is leaving the detached set but the counter is already
+     * zero. This indicates an increment/decrement accounting bug.
+     */
+    XLOGF(
+        ERR,
+        "Group {}: numPeersDetachedAfterJoin_ underflow on decrement",
+        groupDescriptor_);
+    return;
+  }
+  --numPeersDetachedAfterJoin_;
 }
 
 void AdjRibOutGroup::removePeer(
@@ -2514,8 +2595,7 @@ void AdjRibOutGroup::removePeer(
  * Sets bitmap bit, checks frequency threshold, schedules duration timer.
  */
 void AdjRibOutGroup::markPeerBlocked(
-    const std::shared_ptr<AdjRib>& adjRib,
-    bool sendWithEoR) noexcept {
+    const std::shared_ptr<AdjRib>& adjRib) noexcept {
   uint64_t bitPos = adjRib->getGroupBitPosition();
 
   BitmapUtils::setBit(adjRibBlockedBitmap_, bitPos);
@@ -2553,7 +2633,7 @@ void AdjRibOutGroup::markPeerBlocked(
         adjRib->getPeerName(),
         bitPos,
         info.blockCount);
-    detachSlowPeer(adjRib, sendWithEoR);
+    detachSlowPeer(adjRib);
     return;
   }
 
@@ -2613,7 +2693,8 @@ bool AdjRibOutGroup::hasBlockedPeers() const noexcept {
  * The caller determines the appropriate target state.
  */
 void AdjRibOutGroup::detachPeer(
-    const std::shared_ptr<AdjRib>& adjRib) noexcept {
+    const std::shared_ptr<AdjRib>& adjRib,
+    DetachReason reason) noexcept {
   uint64_t bit = adjRib->getGroupBitPosition();
 
   XLOGF(
@@ -2645,7 +2726,7 @@ void AdjRibOutGroup::detachPeer(
   // 7. Register detached consumer at group's CL position
   if (changeListTracker_ && changeListConsumer_ && addPathConsumerBitmap_ &&
       nonAddPathConsumerBitmap_) {
-    adjRib->registerDetachedConsumer(
+    adjRib->registerDetachedConsumerAtGroupPosition(
         changeListTracker_,
         changeListConsumer_,
         *addPathConsumerBitmap_,
@@ -2660,9 +2741,24 @@ void AdjRibOutGroup::detachPeer(
         bit);
   }
 
-  // 8. Set EoR state if the group has pending EoR
-  if (egressEoRsPending_) {
-    adjRib->setEgressEoRsPending();
+  /*
+   * 8. EoR pending state needs no action here. In-sync peers are marked as
+   * owing EoR when the EoR becomes owed (processRibOutAnnouncement), and
+   * markEgressEoRSent clears each AFI the instant that peer's push resolves, so
+   * the peer already carries exactly the AFIs it still owes. Copying the
+   * group's coarser "owed to all in-sync peers" flags here would set an AFI
+   * this peer was already committed back to pending and make its detached
+   * sendPendingEoRs emit a duplicate EoR.
+   */
+
+  // 9. Record this detachment in the peer's cumulative per-reason counters
+  switch (reason) {
+    case DetachReason::Blocking:
+      adjRib->incrementTimesDetachedByBlocking();
+      break;
+    case DetachReason::Policy:
+      adjRib->incrementTimesDetachedByPolicy();
+      break;
   }
 
   XLOGF(
@@ -2680,8 +2776,7 @@ void AdjRibOutGroup::detachPeer(
  * Detach a slow peer from the group.
  */
 void AdjRibOutGroup::detachSlowPeer(
-    const std::shared_ptr<AdjRib>& adjRib,
-    bool sendWithEoR) noexcept {
+    const std::shared_ptr<AdjRib>& adjRib) noexcept {
   uint64_t bit = adjRib->getGroupBitPosition();
   BgpStats::incrSlowPeerDetectionCount();
 
@@ -2717,12 +2812,23 @@ void AdjRibOutGroup::detachSlowPeer(
       adjRib->getPeerName(),
       bit);
 
-  detachPeer(adjRib);
+  detachPeer(adjRib, DetachReason::Blocking);
 
-  // Slow-peer-specific: set EoR if caller requires it
-  if (sendWithEoR) {
-    adjRib->setEgressEoRsPending();
+  /*
+   * Count this peer toward numPeersDetachedAfterJoin_ (the number of
+   * detached peers with a non-zero detachedRibVersion). detachPeer set the
+   * peer's detachedRibVersion to the group's lastSeenRibVersion_.
+   */
+  if (adjRib->getDetachedRibVersion() != 0) {
+    ++numPeersDetachedAfterJoin_;
   }
+
+  /*
+   * EoR pending state needs no slow-peer-specific handling: the peer was marked
+   * as owing EoR when the EoR became owed and markEgressEoRSent clears each AFI
+   * as it commits, so the peer already carries exactly the AFIs it still owes
+   * (see detachPeer step 8).
+   */
 
   // Slow-peer-specific: transition JOINED_BLOCKED -> DETACHED_BLOCKED
   XLOGF(
@@ -2788,7 +2894,6 @@ void AdjRibOutGroup::checkAndAcceptReadyToJoinPeers() noexcept {
       groupDescriptor_,
       detachedPeers_.empty() ? "Skipping" : "Checking",
       detachedPeers_.size());
-  bool groupAtEndOfCL = changeListConsumer_ && changeListConsumer_->isReady();
 
   std::vector<std::shared_ptr<AdjRib>> dfpPeers;
   std::vector<std::shared_ptr<AdjRib>> dspCandidates;
@@ -2804,8 +2909,26 @@ void AdjRibOutGroup::checkAndAcceptReadyToJoinPeers() noexcept {
 
     if (adjRib->isAdjRibFlagSet(AdjRib::IS_DETACHED_FAST_PEER)) {
       dfpPeers.push_back(adjRib);
-    } else if (groupAtEndOfCL && adjRib->isReadyToRejoinGroup()) {
+    } else if (adjRib->isReadyToRejoinGroup()) {
+      // isReadyToRejoinGroup verifies the peer's marker matches the group's.
       dspCandidates.push_back(adjRib);
+    } else if (adjRib->getLastSeenRibVersion() > lastSeenRibVersion_) {
+      /*
+       * Peer is ahead of the group on the CL.
+       * Do not reschedule packing timers — the peer must wait for the
+       * group to catch up before it can start consuming.
+       */
+      XLOGF(
+          DBG1,
+          "Group {}: Peer {} at bit {} ahead of group on CL "
+          "(peer rv {} > group rv {}), keeping in {} "
+          "without rescheduling packing timers",
+          groupDescriptor_,
+          adjRib->getPeerName(),
+          adjRib->getGroupBitPosition(),
+          adjRib->getLastSeenRibVersion(),
+          lastSeenRibVersion_,
+          adjRib->getPeerState());
     } else {
       /*
        * Peers that were in DETACHED_READY_TO_JOIN state must resume consuming
@@ -2846,6 +2969,7 @@ void AdjRibOutGroup::checkAndAcceptReadyToJoinPeers() noexcept {
         peer->getPeerState(),
         PeerUpdateState::JOINED_RUNNING);
     peer->setPeerState(PeerUpdateState::JOINED_RUNNING);
+    peer->incrementTimesRejoined();
     XLOGF(
         INFO,
         "Group {}: Peer {} at bit {} successfully rejoined group",
@@ -2864,17 +2988,28 @@ void AdjRibOutGroup::checkAndAcceptReadyToJoinPeers() noexcept {
   }
 }
 
-bool AdjRibOutGroup::isGroupConsumerReady() const noexcept {
-  return changeListConsumer_ && changeListConsumer_->isReady();
-}
-
 /*
- * Called by a DSP peer to proactively trigger its own rejoin.
- * Only accepts if the group consumer is at end of CL.
+ * Called by a DSP peer to proactively trigger its own rejoin once its marker
+ * has caught up to the group's marker (verified by isReadyToRejoinGroup).
  */
-void AdjRibOutGroup::checkAndAcceptDSPPeer(
+void AdjRibOutGroup::maybeAcceptDSPPeer(
     const std::shared_ptr<AdjRib>& adjRib) noexcept {
   if (FOLLY_UNLIKELY(adjRib->testOnlyDeferDrjAcceptance)) {
+    return;
+  }
+  /*
+   * Only accept the DSP peer once the group's packing list is drained.
+   * If the group still has undistributed entries, collapsing the peer against
+   * the group's RIB-OUT now would surface spurious discrepancies for entries
+   * the group has not yet absorbed. The peer stays DETACHED_READY_TO_JOIN and
+   * is picked up by checkAndAcceptReadyToJoinPeers once the group drains.
+   */
+  if (!attrToPrefixMap_.empty()) {
+    XLOGF(
+        DBG2,
+        "Group {}: deferring DSP rejoin of peer {} - group packing list not empty",
+        groupDescriptor_,
+        adjRib->getPeerName());
     return;
   }
   auto bit = adjRib->getGroupBitPosition();
@@ -2997,6 +3132,7 @@ std::vector<std::shared_ptr<AdjRib>> AdjRibOutGroup::tryAcceptPeersToGroup(
         peer->getPeerState(),
         PeerUpdateState::JOINED_RUNNING);
     peer->setPeerState(PeerUpdateState::JOINED_RUNNING);
+    peer->incrementTimesRejoined();
     XLOGF(
         INFO,
         "Group {}: Peer {} at bit {} successfully rejoined group",
@@ -3066,31 +3202,261 @@ bool AdjRibOutGroup::shouldCloneLiteForPeer(
   return true;
 }
 
-AdjRibEntry* AdjRibOutGroup::copyEntryForPeer(
+AdjRibEntry* AdjRibOutGroup::copyEntryForOwner(
     const folly::CIDRNetwork& prefix,
     uint32_t pathId,
-    const std::shared_ptr<AdjRib>& peer,
     const AdjRibOutOwnerKey& effectiveOwnerKey,
     const AdjRibEntry* entryToCopy) noexcept {
-  auto peerEntry = addRibEntry(prefix, effectiveOwnerKey, pathId);
+  auto newEntry = addRibEntry(prefix, effectiveOwnerKey, pathId);
 
-  peerEntry->flags_ = entryToCopy->flags_;
-  peerEntry->setPreOut(entryToCopy->getPreOut());
-  peerEntry->setPostAttr(entryToCopy->getPostAttr());
+  newEntry->flags_ = entryToCopy->flags_;
+  newEntry->setPreOut(entryToCopy->getPreOut());
+  newEntry->setPostAttr(entryToCopy->getPostAttr());
   if (entryToCopy->getPostOutPolicy()) {
-    peerEntry->setPostOutPolicy(*entryToCopy->getPostOutPolicy());
+    newEntry->setPostOutPolicy(*entryToCopy->getPostOutPolicy());
   }
-  peerEntry->setRibVersion(entryToCopy->getRibVersion());
+  newEntry->setRibVersion(entryToCopy->getRibVersion());
+
+  return newEntry;
+}
+
+void AdjRibOutGroup::handleNoSyncPeers() noexcept {
+  XLOGF(
+      INFO,
+      "Group {}: No SYNC peers remaining, {} detached peers in group",
+      groupDescriptor_,
+      detachedPeers_.size());
+
+  /*
+   * Without any sync peers, we should stop update processing and distribution.
+   * TODO(Juliette): buildAndSendGroupBgpUpdates also needs to be
+   * cancellation aware; need to adjust the guard in that method.
+   */
+  clearPackingList();
+
+  cancelChangeListConsumeTimer();
+
+  /*
+   * Promote any immediately-viable peers which have drained their packing list
+   * and are at the same marker as the group.
+   */
+  checkAndAcceptReadyToJoinPeers();
+  if (numInSyncPeers_ > 0) {
+    scheduleChangeListConsumeTimer();
+    return;
+  }
+
+  /*
+   * No peer was immediately promotable. Now we may have peers behind
+   * and ahead of the group marker on the changelist.
+   *
+   * We prefer to let peers behind the group marker to be promoted
+   * because they are likelier to share the same view of the RIB-OUT
+   * as the group.
+   *
+   * The group stays frozen until the first peer to reach the
+   * group marker rejoins.
+   */
+  if (numPeersDetachedAfterJoin_ > 0) {
+    XLOGF(
+        INFO,
+        "Group {}: Paused group consume timer, waiting for peers to catch up due to no sync peers",
+        groupDescriptor_);
+  } else {
+    /*
+     * We only have peers ahead of the group on the changelist (DEP-A)
+     * which are guaranteed to have their own per peer entries. They may
+     * have a different RIB-OUT from the group.
+     *
+     * Promote one DEP-A that has finished draining (DETACHED_READY_TO_JOIN);
+     * If none are ready, then the group stays frozen until the first DEP-A
+     * finishes draining and promotes itself.
+     */
+    for (const auto& peer : detachedPeers_) {
+      if (peer->getPeerState() == PeerUpdateState::DETACHED_READY_TO_JOIN) {
+        promoteDetachedPeerToSync(peer);
+        scheduleChangeListConsumeTimer();
+        return;
+      }
+    }
+    XLOGF(
+        INFO,
+        "Group {}: Paused group consume timer, waiting for a detached peer ahead of the group to finish draining and promote itself",
+        groupDescriptor_);
+  }
+}
+
+void AdjRibOutGroup::promoteDetachedPeerToSync(
+    std::shared_ptr<AdjRib> adjRib) noexcept {
+  XLOGF(
+      INFO,
+      "Group {}: Promoting detached peer {} at bit {} to SYNC",
+      groupDescriptor_,
+      adjRib->getPeerName(),
+      adjRib->getGroupBitPosition());
+
+  /*
+   * 1. Capture the peer's change list consumer before mutating any state. The
+   * group must rejoin the changelist at the peer's CL position; without it we
+   * cannot adopt that position, so abort before moving any RIB-OUT entries
+   * rather than leaving the group diverged. Step 5
+   * (deactivateDetachedModeProcessing) later resets it.
+   */
+  auto peerConsumer = adjRib->getChangeListConsumer();
+  if (!peerConsumer) {
+    XLOGF(
+        ERR,
+        "Group {}: Cannot promote peer {} to SYNC: peer has no CL consumer; aborting before moving RIB-OUT entries",
+        groupDescriptor_,
+        adjRib->getPeerName());
+    // TODO: bump a failed-promotion error stat (number of failed promotions).
+    return;
+  }
+
+  if (!changeListTracker_ || !addPathConsumerBitmap_ ||
+      !nonAddPathConsumerBitmap_) {
+    XLOGF(
+        ERR,
+        "Group {}: Cannot promote peer {} to SYNC: tracker/bitmaps not set; aborting before moving RIB-OUT entries",
+        groupDescriptor_,
+        adjRib->getPeerName());
+    // TODO: bump a failed-promotion error stat (number of failed promotions).
+    return;
+  }
+
+  /*
+   * 2. Reset the group's change list consumer and re-create it joined at the
+   * promoted peer's CL position so the group adopts the peer's advanced
+   * position.
+   */
+  resetChangeListConsumer();
+  registerGroupConsumer();
+  changeListTracker_->joinConsumer(peerConsumer, changeListConsumer_);
+
+  /*
+   * 3. Promote the peer's RIB-OUT entries to the group owner key. The peer's
+   * diverged view becomes the new group truth.
+   */
+  if (adjRib->sendAddPath()) {
+    promoteDetachedPeerPathEntries(adjRib);
+  } else {
+    promoteDetachedPeerLiteEntries(adjRib);
+  }
+
+  /*
+   * 4. Adopt the promoted peer's RIB version as the group's cached version
+   * (read before markPeerInSync, after which the peer reads the group's).
+   */
+  setLastSeenRibVersion(adjRib->getLastSeenRibVersion());
+
+  /* 5. Tear down the peer's detached-mode processing (resets its CL consumer).
+   */
+  adjRib->deactivateDetachedModeProcessing();
+
+  /* 6. Mark the peer in sync (sets sync bit, removes it from detachedPeers_).
+   */
+  adjRib->setPeerState(PeerUpdateState::JOINED_RUNNING);
+  adjRib->incrementTimesRejoined();
+  markPeerInSync(adjRib);
+}
+
+/*
+ * Promote a detached peer's RIB-OUT entries to group entries in the PathTree.
+ * For each prefix node: the existing group entry (if any) is deleted, then the
+ * peer's entry, if present, is re-keyed under the group owner key — the
+ * detached peer's diverged view becomes the new group truth. Empty nodes are
+ * cleaned up after the walk. Used for add-path peers (groupKey_.sendAddPath).
+ */
+void AdjRibOutGroup::promoteDetachedPeerPathEntries(
+    const std::shared_ptr<AdjRib>& adjRib) noexcept {
+  auto peerOwnerKey = adjRib->getPeerOwnerKey();
+  auto groupOwnerKey = getGroupOwnerKey();
+  std::vector<AdjRibPathTree::Iterator> emptyNodes;
+  size_t promotedCount = 0;
+
+  for (auto itr = PathTree_.begin(); itr != PathTree_.end(); ++itr) {
+    auto& ownerMap = itr->value();
+    auto peerIt = ownerMap.find(peerOwnerKey);
+    if (peerIt != ownerMap.end()) {
+      /*
+       * Take ownership of the peer's path map before any erase: F14 may
+       * relocate other elements on erase/insert, so we must not hold a
+       * reference into the map across those operations.
+       */
+      auto promoted = std::move(peerIt->second);
+      promotedCount += promoted.size();
+      ownerMap.erase(peerOwnerKey);
+      ownerMap.erase(groupOwnerKey);
+      ownerMap[groupOwnerKey] = std::move(promoted);
+    } else {
+      ownerMap.erase(groupOwnerKey);
+    }
+    if (ownerMap.empty()) {
+      emptyNodes.push_back(itr);
+    }
+  }
+
+  for (auto& itr : emptyNodes) {
+    PathTree_.erase(itr);
+  }
 
   XLOGF(
-      DBG3,
-      "Group {}: Cloned entry for {} to peer {} at bit {}",
+      INFO,
+      "Group {}: Promoted {} PathTree entries from detached peer {} at bit {}",
       groupDescriptor_,
-      folly::IPAddress::networkToString(prefix),
-      peer->getPeerName(),
-      peer->getGroupBitPosition());
+      promotedCount,
+      adjRib->getPeerName(),
+      adjRib->getGroupBitPosition());
+}
 
-  return peerEntry;
+/*
+ * Promote a detached peer's RIB-OUT entries to group entries in the LiteTree.
+ * For each prefix node: the existing group entry (if any) is deleted, then the
+ * peer's entry, if present, is re-keyed under the group owner key — the
+ * detached peer's diverged view becomes the new group truth. Empty nodes are
+ * cleaned up after the walk. Used for non-addPath peers
+ * (!groupKey_.sendAddPath).
+ */
+void AdjRibOutGroup::promoteDetachedPeerLiteEntries(
+    const std::shared_ptr<AdjRib>& adjRib) noexcept {
+  auto peerOwnerKey = adjRib->getPeerOwnerKey();
+  auto groupOwnerKey = getGroupOwnerKey();
+  std::vector<AdjRibLiteTree::Iterator> emptyNodes;
+  size_t promotedCount = 0;
+
+  for (auto itr = LiteTree_.begin(); itr != LiteTree_.end(); ++itr) {
+    auto& ownerMap = itr->value();
+    auto peerIt = ownerMap.find(peerOwnerKey);
+    if (peerIt != ownerMap.end()) {
+      /*
+       * Take ownership of the peer's entry before any erase: F14 may
+       * relocate other elements on erase/insert, so we must not hold a
+       * reference into the map across those operations.
+       */
+      auto promoted = std::move(peerIt->second);
+      ownerMap.erase(peerOwnerKey);
+      ownerMap.erase(groupOwnerKey);
+      ownerMap[groupOwnerKey] = std::move(promoted);
+      ++promotedCount;
+    } else {
+      ownerMap.erase(groupOwnerKey);
+    }
+    if (ownerMap.empty()) {
+      emptyNodes.push_back(itr);
+    }
+  }
+
+  for (auto& itr : emptyNodes) {
+    LiteTree_.erase(itr);
+  }
+
+  XLOGF(
+      INFO,
+      "Group {}: Promoted {} LiteTree entries from detached peer {} at bit {}",
+      groupDescriptor_,
+      promotedCount,
+      adjRib->getPeerName(),
+      adjRib->getGroupBitPosition());
 }
 
 void AdjRibOutGroup::lazyClonePathForDetachedPeers(
@@ -3101,8 +3467,14 @@ void AdjRibOutGroup::lazyClonePathForDetachedPeers(
   for (const auto& adjRib : detachedPeers_) {
     if (shouldClonePathForPeer(
             radixNodeItr, pathId, adjRib, groupEntry->getRibVersion())) {
-      copyEntryForPeer(
-          prefix, pathId, adjRib, adjRib->getPeerOwnerKey(), groupEntry);
+      copyEntryForOwner(prefix, pathId, adjRib->getPeerOwnerKey(), groupEntry);
+      XLOGF(
+          DBG3,
+          "Group {}: Cloned path entry for {} to peer {} at bit {}",
+          groupDescriptor_,
+          folly::IPAddress::networkToString(prefix),
+          adjRib->getPeerName(),
+          adjRib->getGroupBitPosition());
     }
   }
 }
@@ -3115,8 +3487,14 @@ void AdjRibOutGroup::lazyCloneLiteForDetachedPeers(
   for (const auto& adjRib : detachedPeers_) {
     if (shouldCloneLiteForPeer(
             radixNodeItr, adjRib, groupEntry->getRibVersion())) {
-      copyEntryForPeer(
-          prefix, pathId, adjRib, adjRib->getPeerOwnerKey(), groupEntry);
+      copyEntryForOwner(prefix, pathId, adjRib->getPeerOwnerKey(), groupEntry);
+      XLOGF(
+          DBG3,
+          "Group {}: Cloned lite entry for {} to peer {} at bit {}",
+          groupDescriptor_,
+          folly::IPAddress::networkToString(prefix),
+          adjRib->getPeerName(),
+          adjRib->getGroupBitPosition());
     }
   }
 }

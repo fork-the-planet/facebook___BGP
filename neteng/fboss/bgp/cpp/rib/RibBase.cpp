@@ -247,31 +247,50 @@ void RibBase::run() noexcept {
 }
 
 /**
- * @brief Clean up the RIB module resources.
+ * @brief Shutdown the Rib module. Template method; see header for the fixed
+ * step order and rationale.
  */
-void RibBase::stopRoutine() noexcept {
-  // cleanup
-  evb_.runInEventBaseThreadAndWait([&]() {
+void RibBase::stop() noexcept {
+  cancelAndJoinTasks();
+  cleanupCommon();
+  cleanupPlatform();
+
+  /*
+   * Terminate the evb loop LAST: cleanupCommon() and cleanupPlatform() reset
+   * evb-bound timers via runImmediatelyOrRunInEventBaseThreadAndWait, which
+   * would deadlock if the loop were already stopped.
+   */
+  evb_.terminateLoopSoon();
+}
+
+/**
+ * @brief [Exit] Step 1: cancel and join all Rib coroutines.
+ *
+ * After this returns no coroutine in asyncScope_ is running, so resources they
+ * may access (timers, data structures) can be destroyed safely in the steps
+ * that follow.
+ */
+void RibBase::cancelAndJoinTasks() noexcept {
+  XLOG(INFO, "[Exit] Cancel and stop all coroutines");
+  folly::coro::blockingWait(asyncScope_.cancelAndJoinAsync());
+}
+
+/**
+ * @brief [Exit] Step 2: common (platform-agnostic) teardown.
+ *
+ * Resets core timers and stops the FIB on the evb thread, destroys the FIB,
+ * and clears heavy data structures. MUST run only after cancelAndJoinTasks().
+ * Does NOT terminate the evb loop — stop() does that after cleanupPlatform().
+ */
+void RibBase::cleanupCommon() noexcept {
+  evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
     fibBatchTimer_.reset();
-    routeAttributePolicyTimer_.reset();
     if (fib_) {
       fib_->stop();
     }
   });
 
-  // Destruct fib_ obj to wait for all coroutines to stop/finish
   fib_.reset();
-  // terminate evb to deterministically shutdown Rib evb.
-  evb_.terminateLoopSoon();
-}
-
-/**
- * @brief Cancel the coroutines and stops the Rib module.
- */
-void RibBase::stop() noexcept {
-  XLOG(INFO, "[Exit] Cancel and stop all coroutines");
-  folly::coro::blockingWait(asyncScope_.cancelAndJoinAsync());
-  stopRoutine();
 
   /**
    * Clear heavy data structures during controlled shutdown to prevent

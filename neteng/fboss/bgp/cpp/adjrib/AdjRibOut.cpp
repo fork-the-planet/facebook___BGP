@@ -193,7 +193,8 @@ void AdjRib::scheduleSendBgpUpdates(bool tryPullNewChangeItems) noexcept {
 }
 
 bool AdjRib::scheduleDeferredPushToPeer(
-    nettools::bgplib::FiberBgpPeer::InputMessageT message) noexcept {
+    nettools::bgplib::FiberBgpPeer::InputMessageT message,
+    folly::Function<void() noexcept> onResolved) noexcept {
   /*
    * A null asyncScope_ is unexpected here — the scope should exist whenever a
    * push can be scheduled. Log it as an error to surface the bug. A requested
@@ -220,14 +221,17 @@ bool AdjRib::scheduleDeferredPushToPeer(
    * during teardown would throw bad_weak_ptr since the destructor
    * has already zeroed the refcount. */
   asyncScope_->add(co_withExecutor(
-      &evb_, deferredPushToPeer(std::move(message), shared_from_this())));
+      &evb_,
+      deferredPushToPeer(
+          std::move(message), shared_from_this(), std::move(onResolved))));
   setAdjRibFlag(SCHEDULED_PUSH_TO_PEER);
   return true;
 }
 
 folly::coro::Task<void> AdjRib::deferredPushToPeer(
     nettools::bgplib::FiberBgpPeer::InputMessageT message,
-    std::shared_ptr<AdjRib> self) noexcept {
+    std::shared_ptr<AdjRib> self,
+    folly::Function<void() noexcept> onResolved) noexcept {
   bool pushed = false;
 
   /* RAII guard: Always clear blocked state and log when coroutine exits.
@@ -250,6 +254,10 @@ folly::coro::Task<void> AdjRib::deferredPushToPeer(
 
   if (boundedAdjRibOutQueue_ && co_await boundedAdjRibOutQueue_->waitToPush()) {
     pushed = boundedAdjRibOutQueue_->push(message);
+    /* Run the continuation only on a successful push. */
+    if (pushed && onResolved) {
+      onResolved();
+    }
   }
 }
 
@@ -407,7 +415,7 @@ folly::coro::Task<void> AdjRib::sendBgpUpdates(
   }
 
   /* Queue EoRs if we just finished sending RIB initial announcement. */
-  if (egressEoRsPending_) {
+  if (egressEoRsPending()) {
     auto [writeBlocked, numEoRs] = co_await sendPendingEoRs();
     backpressured |= writeBlocked;
     eorCnt = numEoRs;
@@ -442,28 +450,85 @@ AdjRib::sendPendingEoRs() noexcept {
 
   uint16_t bgpMessageCnt{0};
   bool backpressured = false;
-  /* Send out to FiberBgpPeerManager to send via socket */
-  if (isAfiIpv4Negotiated_) {
+  /*
+   * Send only the AFIs still pending. When the group already queued one AFI's
+   * EoR before this peer detached, its flag is already cleared, so the detached
+   * peer sends just the remaining AFI — no duplicate, no missing EoR. This is
+   * the peer's own synchronous send path: every owed AFI is pushed here, so we
+   * finalize unconditionally via onEgressEoRSent at the end.
+   */
+  if (isAdjRibFlagSet(EGRESS_EOR_PENDING_V4)) {
     backpressured |= co_await waitForQueueSpace();
     bgpMessageCnt++;
     boundedAdjRibOutQueue_->push(buildEndOfRib(BgpUpdateAfi::AFI_IPv4));
+    clearAdjRibFlag(EGRESS_EOR_PENDING_V4);
   }
-  if (isAfiIpv6Negotiated_) {
+  if (isAdjRibFlagSet(EGRESS_EOR_PENDING_V6)) {
     backpressured |= co_await waitForQueueSpace();
     bgpMessageCnt++;
     boundedAdjRibOutQueue_->push(buildEndOfRib(BgpUpdateAfi::AFI_IPv6));
+    clearAdjRibFlag(EGRESS_EOR_PENDING_V6);
   }
-  /* Send out egressEoR notification to peer manager for initialization. */
-  fromAdjRibQ_.push({*remotePeerId_, EgressEoR{}});
 
-  /* Mark egressEoR being sent as a one-time flag for initialization */
+  onEgressEoRSent();
+
+  co_return std::make_pair(backpressured, bgpMessageCnt);
+}
+
+/*
+ * One-time per-session bookkeeping once the peer's egress EoR PDUs have been
+ * queued. Sets egressEoRsSent_, records the time, logs the event, and notifies
+ * the peer manager for init. Does NOT touch the egress queue.
+ */
+void AdjRib::onEgressEoRSent() noexcept {
+  /*
+   * One-time per session: if the bookkeeping already ran (e.g. the group
+   * finalized this AFI via markEgressEoRSent and the detached peer's
+   * sendPendingEoRs then finalizes the rest), skip so we record the time, log,
+   * and notify the peer manager at most once.
+   */
+  if (egressEoRsSent_) {
+    return;
+  }
   egressEoRsSent_ = true;
-  /* We finished sending EoR; set it as no longer pending. */
-  egressEoRsPending_ = false;
   eorSentTime_ = getCurrentTimeMs();
   logPeerEvent("SESSION_EOR_SENT", BGP_LOG_SRC());
 
-  co_return std::make_pair(backpressured, bgpMessageCnt);
+  /* Send out egressEoR notification to peer manager for initialization. */
+  fromAdjRibQ_.push({*remotePeerId_, EgressEoR{}});
+}
+
+/*
+ * Finalize a single AFI's egress EoR once its PDU has landed in the peer's
+ * egress queue. The group's EoR push supplies this as the onResolved
+ * continuation to tryPushToPeer, so it runs on immediate push or from
+ * deferredPushToPeer for a backpressured peer. The continuation carries the
+ * AFI, so clear exactly this AFI's EGRESS_EOR_PENDING flag, then fire the
+ * one-time bookkeeping if no AFI's EoR is still pending (this was the last).
+ *
+ * Only AFI_IPv4 and AFI_IPv6 carry egress EoR state. Match each AFI explicitly
+ * rather than treating "not IPv4" as IPv6: an unexpected AFI (e.g. AFI_LS, or a
+ * future value) must not silently clear the v6 flag and fire onEgressEoRSent
+ * early. It is a programming error to reach here with any other AFI.
+ */
+void AdjRib::markEgressEoRSent(nettools::bgplib::BgpUpdateAfi afi) noexcept {
+  if (afi == nettools::bgplib::BgpUpdateAfi::AFI_IPv4) {
+    clearAdjRibFlag(EGRESS_EOR_PENDING_V4);
+  } else if (afi == nettools::bgplib::BgpUpdateAfi::AFI_IPv6) {
+    clearAdjRibFlag(EGRESS_EOR_PENDING_V6);
+  } else {
+    XLOGF(
+        DFATAL,
+        "Peer {}: markEgressEoRSent called with unsupported AFI {}; expected "
+        "AFI_IPv4 or AFI_IPv6",
+        getPeerName(),
+        static_cast<int>(afi));
+    return;
+  }
+
+  if (!egressEoRsPending()) {
+    onEgressEoRSent();
+  }
 }
 
 /**
@@ -695,7 +760,8 @@ void AdjRib::buildAndQueueEoRs(uint64_t& bgpMessageCnt) noexcept {
 
   // mark egressEoR being sent as a one-time flag for initialization
   egressEoRsSent_ = true;
-  egressEoRsPending_ = false;
+  clearEgressEoRPendingV4();
+  clearEgressEoRPendingV6();
   eorSentTime_ = getCurrentTimeMs();
   logPeerEvent("SESSION_EOR_SENT", BGP_LOG_SRC());
 
@@ -731,7 +797,7 @@ void AdjRib::processRibOutAnnouncement(
   }
   scheduleOutDelayTimer();
   if (announcement.sendWithEoR) {
-    egressEoRsPending_ = true;
+    setEgressEoRsPending(isAfiIpv4Negotiated_, isAfiIpv6Negotiated_);
   }
   if (!enableEgressQueueBackpressure_) {
     buildAndSendBgpMessages(announcement.sendWithEoR);
@@ -1578,12 +1644,52 @@ bool AdjRib::isDFP() const {
 
 /*
  * DSP (Detached Slow Peer) readiness check.
- * Returns true if peer has READY marker on the changelist and all pending
- * packing list items have been drained.
+ * Returns true if the peer has drained its packing list and its change list
+ * marker has caught up to the group's marker (same position on the change
+ * list). We compare markers rather than requiring both consumers to be at the
+ * end of the change list: when the group is frozen mid-list (e.g. after the
+ * last sync peer went down), its consumer marker is non-null, and a DSP that
+ * catches up to that frozen marker must be able to rejoin without waiting for
+ * the group to reach the end.
  */
 bool AdjRib::isReadyToRejoinGroup() const {
-  return attrToPrefixMap_.empty() && changeListConsumer_ &&
-      changeListConsumer_->isReady();
+  if (!attrToPrefixMap_.empty()) {
+    XLOGF(
+        DBG2,
+        "Peer {} not ready to rejoin group: packing list not empty",
+        getPeerName());
+    return false;
+  }
+  if (!changeListConsumer_) {
+    XLOGF(
+        DBG2,
+        "Peer {} not ready to rejoin group: changeListConsumer is null",
+        getPeerName());
+    return false;
+  }
+  if (!adjRibOutGroup_) {
+    XLOGF(
+        DBG2,
+        "Peer {} not ready to rejoin group: adjRibOutGroup is null",
+        getPeerName());
+    return false;
+  }
+  if (!adjRibOutGroup_->getChangeListConsumer()) {
+    XLOGF(
+        DBG2,
+        "Peer {} not ready to rejoin group: group changeListConsumer is null",
+        getPeerName());
+    return false;
+  }
+  if (changeListConsumer_->getMarker() !=
+      adjRibOutGroup_->getChangeListConsumer()->getMarker()) {
+    XLOGF(
+        DBG2,
+        "Peer {} not ready to rejoin group: marker not at group's marker",
+        getPeerName());
+    return false;
+  }
+  return true;
 }
 
 bool AdjRib::isDetachedPeer() const {
@@ -1629,10 +1735,27 @@ void AdjRib::maybeTransitionDetachedReadyToJoin() noexcept {
 
     setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
     cancelPackingTimers();
-    // DSP can initiate rejoin if the group is ready/IDLE
-    if (adjRibOutGroup_->isGroupConsumerReady()) {
-      adjRibOutGroup_->checkAndAcceptDSPPeer(shared_from_this());
-    }
+
+    adjRibOutGroup_->maybeAcceptDSPPeer(shared_from_this());
+  } else if (
+      adjRibOutGroup_ &&
+      lastSeenRibVersion_ > adjRibOutGroup_->getLastSeenRibVersion()) {
+    /*
+     * Peer is ahead of the group on the CL. Transition to
+     * DETACHED_READY_TO_JOIN and wait for the group to catch up.
+     * The group handles acceptance in checkAndAcceptReadyToJoinPeers.
+     */
+    XLOGF(
+        DBG1,
+        "Group {}: Peer {} at bit {} ahead of group on CL, "
+        "State Transition: {} -> {}",
+        adjRibOutGroup_->getGroupDescriptor(),
+        getPeerName(),
+        getGroupBitPosition(),
+        peerState_,
+        PeerUpdateState::DETACHED_READY_TO_JOIN);
+    setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+    cancelPackingTimers();
   } else {
     reschedulePackingTimers();
   }
@@ -1661,6 +1784,9 @@ void AdjRib::deactivateDetachedModeProcessing() {
   XLOGF(DBG1, "Peer {}: Deactivating detached mode processing", getPeerName());
   resetChangeListConsumer();
   cancelPackingTimers();
+  if (adjRibOutGroup_ && getDetachedRibVersion() > 0) {
+    adjRibOutGroup_->decrementPeersDetachedAfterJoin();
+  }
   setDetachedRibVersion(0);
 }
 

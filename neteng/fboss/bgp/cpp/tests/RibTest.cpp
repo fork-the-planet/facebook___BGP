@@ -131,7 +131,7 @@
 #include "neteng/fboss/bgp/cpp/lib/fibers/Utils.h"
 #include "neteng/fboss/bgp/cpp/rib/RibBase.h"
 #include "neteng/fboss/bgp/cpp/rib/RibDC.h"
-#include "neteng/fboss/bgp/cpp/rib/RibPolicyLogger.h"
+#include "neteng/fboss/bgp/cpp/rib/facebook/RibPolicyLogger.h"
 #include "neteng/fboss/bgp/cpp/tests/BoundedWaitUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/MockScubaData.h"
 #include "neteng/fboss/bgp/cpp/tests/PolicyUtils.h"
@@ -6178,8 +6178,7 @@ TEST_F(RibFixture, EnableUnicastRouteLoggingTest) {
 }
 
 TEST_F(RibFixture, ScubaLoggingTest) {
-  // Ensure scuba logger and ribPolicyLogger is not created
-  EXPECT_EQ(nullptr, rib_->scubaLogger_);
+  // Ensure ribPolicyLogger is not created
   EXPECT_EQ(nullptr, rib_->ribPolicyLogger_);
 }
 
@@ -6946,9 +6945,8 @@ TEST_F(RibNexthopTrackingFixture, GetNexthopInfoForNexthop) {
 TEST_F(RibFixture, ReplaceRouteFilterPolicyLoggingTest) {
   // Replace the real scuba logger with mock
   auto mockScuba = std::make_shared<MockScubaData>();
-  rib_->scubaLogger_ = mockScuba;
   rib_->ribPolicyLogger_ =
-      std::make_unique<RibPolicyLogger>("test_device", mockScuba);
+      std::make_unique<ScubaRibPolicyLogger>("test_device", mockScuba);
 
   rib_policy::TRouteFilterPolicy tRouteFilterPolicy;
   tRouteFilterPolicy.version() = 12345;
@@ -6990,9 +6988,8 @@ TEST_F(RibFixture, ReplaceRouteFilterPolicyLoggingTest) {
 // Test that setPathSelectionPolicy logs the correct policy versions
 TEST_F(RibFixture, ReplacePathSelectionPolicyLoggingTest) {
   auto mockScuba = std::make_shared<MockScubaData>();
-  rib_->scubaLogger_ = mockScuba;
   rib_->ribPolicyLogger_ =
-      std::make_unique<RibPolicyLogger>("test_device", mockScuba);
+      std::make_unique<ScubaRibPolicyLogger>("test_device", mockScuba);
 
   // Create test policies with specific versions
   rib_policy::TPathSelectionPolicy tPathSelectionPolicy;

@@ -72,9 +72,9 @@
       UpdateGroupDetachLifecycleTest,                                          \
       AcceptDSPFailsWhenPostDetachEntryNotCloned);                             \
   FRIEND_TEST(                                                                 \
-      UpdateGroupDetachLifecycleTest, CheckAndAcceptDSPPeerGroupNotReady);     \
+      UpdateGroupDetachLifecycleTest, DSPPeerRejoinsWhenGroupConsumerReady);   \
   FRIEND_TEST(                                                                 \
-      UpdateGroupDetachLifecycleTest, CheckAndAcceptDSPPeerConsumerNotReady);  \
+      UpdateGroupDetachLifecycleTest, DSPPeerRejoinsWhenPeerConsumerReady);    \
   FRIEND_TEST(                                                                 \
       UpdateGroupDetachedPeerTest,                                             \
       CanAnnounceDelegatesToGroupWhenUpdateGroupEnabled);                      \
@@ -92,7 +92,22 @@
   FRIEND_TEST(                                                                 \
       UpdateGroupDetachLifecycleTest,                                          \
       CollapseIncrementsStatsOnAnnouncementDiscrepancy);                       \
-  FRIEND_TEST(UpdateGroupDetachLifecycleTest, DetachPeerSetsAllExpectedState);
+  FRIEND_TEST(UpdateGroupDetachLifecycleTest, DetachPeerSetsAllExpectedState); \
+  FRIEND_TEST(                                                                 \
+      UpdateGroupDetachedPeerTest,                                             \
+      UnregisterDetachedPeerCleansUpPerPeerLiteTreeEntries);                   \
+  FRIEND_TEST(                                                                 \
+      UpdateGroupDetachedPeerTest,                                             \
+      UnregisterDetachedPeerCleansUpPerPeerPathTreeEntries);                   \
+  FRIEND_TEST(                                                                 \
+      UpdateGroupDetachLifecycleTest,                                          \
+      PeerAheadOfGroupTransitionsToReadyToJoin);                               \
+  FRIEND_TEST(                                                                 \
+      UpdateGroupDetachLifecycleTest,                                          \
+      PeerAheadOfGroupDoesNotProceedOnChangelist);                             \
+  FRIEND_TEST(                                                                 \
+      UpdateGroupDetachLifecycleTest,                                          \
+      DSPRejoinDeferredUntilGroupPackingListDrains);
 
 #define AdjRibOutGroup_TEST_FRIENDS                                            \
   friend class UpdateGroupDetachedPeerTest;                                    \
@@ -145,6 +160,8 @@
   FRIEND_TEST(                                                                 \
       UpdateGroupDetachedPeerTest, RibWalkDetachCopiesEgressEoRsPending);      \
   FRIEND_TEST(                                                                 \
+      UpdateGroupDetachedPeerTest, DetachDoesNotResendCommittedEgressEoR);     \
+  FRIEND_TEST(                                                                 \
       UpdateGroupDetachedPeerTest,                                             \
       CollapseLiteSkipsRibVersionCheckForInitDumpPeer);                        \
   FRIEND_TEST(                                                                 \
@@ -177,7 +194,24 @@
   FRIEND_TEST(                                                                 \
       UpdateGroupDetachLifecycleTest,                                          \
       CollapseIncrementsStatsOnAnnouncementDiscrepancy);                       \
-  FRIEND_TEST(UpdateGroupDetachLifecycleTest, DetachPeerSetsAllExpectedState);
+  FRIEND_TEST(UpdateGroupDetachLifecycleTest, DetachPeerSetsAllExpectedState); \
+  FRIEND_TEST(                                                                 \
+      UpdateGroupDetachLifecycleTest,                                          \
+      PeerAheadOfGroupTransitionsToReadyToJoin);                               \
+  FRIEND_TEST(                                                                 \
+      UpdateGroupDetachLifecycleTest,                                          \
+      PeerAheadOfGroupDoesNotProceedOnChangelist);                             \
+  FRIEND_TEST(                                                                 \
+      UpdateGroupDetachLifecycleTest,                                          \
+      DSPRejoinDeferredUntilGroupPackingListDrains);                           \
+  FRIEND_TEST(                                                                 \
+      UpdateGroupDetachedPeerTest, PromoteLiteMovesPeerEntryToGroupKey);       \
+  FRIEND_TEST(UpdateGroupDetachedPeerTest, PromoteLiteDeletesGroupOnlyEntry);  \
+  FRIEND_TEST(                                                                 \
+      UpdateGroupDetachedPeerTest, PromoteLitePeerOnlyEntryMovedToGroupKey);   \
+  FRIEND_TEST(                                                                 \
+      UpdateGroupDetachedPeerTest, PromotePathMovesPeerPathsToGroupKey);       \
+  FRIEND_TEST(UpdateGroupDetachedPeerTest, PromotePathDeletesGroupOnlyEntry);
 
 #include <fmt/core.h>
 #include <folly/coro/BlockingWait.h>
@@ -205,6 +239,18 @@ int64_t getNumSlowPeersCounter() {
   fb303::ThreadCachedServiceData::get()->publishStats();
   return fb303::ThreadCachedServiceData::get()->getCounter(
       BgpStats::kSlowPeerDetectionCount + ".sum");
+}
+
+bool logMessagesContain(
+    const std::vector<std::pair<folly::LogMessage, const folly::LogCategory*>>&
+        messages,
+    const std::string& searchStr) {
+  for (const auto& [msg, cat] : messages) {
+    if (msg.getMessage().find(searchStr) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
 }
 } // namespace
 
@@ -531,20 +577,10 @@ TEST_F(UpdateGroupDetachedPeerTest, DetachPeerInMultiPeerGroup) {
   ConsumerBitmap addPathBitmap;
   ConsumerBitmap nonAddPathBitmap;
 
-  // Create and register group consumer
-  auto groupConsumer = std::make_shared<AdjRibOutGroupConsumer>(
-      changeTracker,
-      group_,
-      "test_group_consumer",
-      *evb_,
-      addPathBitmap,
-      nonAddPathBitmap);
-  groupConsumer->registerWithTracker();
-  groupConsumer->setBitmap();
-
-  // Wire the tracker and consumer into the group
-  group_->setChangeListConsumer(groupConsumer);
+  // Wire the tracker and let the group create + register its own consumer
   group_->setChangeListTracker(changeTracker, addPathBitmap, nonAddPathBitmap);
+  group_->registerGroupConsumer();
+  auto groupConsumer = group_->getChangeListConsumer();
 
   // Publish items to the change list so the group consumer has a non-null
   // marker
@@ -618,6 +654,118 @@ TEST_F(UpdateGroupDetachedPeerTest, DetachPeerInMultiPeerGroup) {
   groupConsumer.reset();
 }
 
+/*
+ * numPeersDetachedAfterJoin_ counter tests
+ */
+
+TEST_F(UpdateGroupDetachedPeerTest, DetachedAfterJoinCountInitiallyZero) {
+  EXPECT_EQ(group_->getNumPeersDetachedAfterJoin(), 0);
+}
+
+TEST_F(UpdateGroupDetachedPeerTest, DetachSlowPeerIncrementsDetachedAfterJoin) {
+  auto adjRib0 = createAndRegisterPeer(0);
+  auto adjRib1 = createAndRegisterPeer(1);
+  // Two in-sync members so detachSlowPeer does not skip (last-synced guard).
+  group_->markPeerInSync(adjRib0);
+  group_->markPeerInSync(adjRib1);
+  group_->setLastSeenRibVersion(42);
+
+  EXPECT_EQ(group_->getNumPeersDetachedAfterJoin(), 0);
+  group_->detachSlowPeer(adjRib0);
+  EXPECT_EQ(group_->getNumPeersDetachedAfterJoin(), 1);
+  EXPECT_NE(adjRib0->getDetachedRibVersion(), 0);
+}
+
+TEST_F(UpdateGroupDetachedPeerTest, DeactivateDecrementsDetachedAfterJoin) {
+  auto adjRib0 = createAndRegisterPeer(0);
+  auto adjRib1 = createAndRegisterPeer(1);
+  group_->markPeerInSync(adjRib0);
+  group_->markPeerInSync(adjRib1);
+  group_->setLastSeenRibVersion(42);
+  group_->detachSlowPeer(adjRib0);
+  ASSERT_EQ(group_->getNumPeersDetachedAfterJoin(), 1);
+
+  // Tearing down detached-mode processing (peer-down / rejoin) decrements.
+  adjRib0->deactivateDetachedModeProcessing();
+  EXPECT_EQ(group_->getNumPeersDetachedAfterJoin(), 0);
+}
+
+TEST_F(UpdateGroupDetachedPeerTest, InitDumpPeerDeactivateDoesNotDecrement) {
+  auto adjRib0 = createAndRegisterPeer(0);
+  auto adjRib1 = createAndRegisterPeer(1);
+  group_->markPeerInSync(adjRib0);
+  group_->markPeerInSync(adjRib1);
+  group_->setLastSeenRibVersion(42);
+  group_->detachSlowPeer(adjRib0);
+  ASSERT_EQ(group_->getNumPeersDetachedAfterJoin(), 1);
+
+  // An init-dump peer has detachedRibVersion 0 and was never counted, so
+  // deactivating it must leave the counter untouched.
+  auto initDumpPeer = createAndRegisterPeer(2);
+  ASSERT_EQ(initDumpPeer->getDetachedRibVersion(), 0);
+  initDumpPeer->deactivateDetachedModeProcessing();
+  EXPECT_EQ(group_->getNumPeersDetachedAfterJoin(), 1);
+}
+
+TEST_F(UpdateGroupDetachedPeerTest, RejoinDecrementsDetachedAfterJoin) {
+  auto adjRib0 = createAndRegisterPeer(0);
+  auto adjRib1 = createAndRegisterPeer(1);
+  group_->markPeerInSync(adjRib0);
+  group_->markPeerInSync(adjRib1);
+  group_->setLastSeenRibVersion(42);
+
+  // Detach a slow peer -> counted.
+  group_->detachSlowPeer(adjRib0);
+  ASSERT_EQ(group_->getNumPeersDetachedAfterJoin(), 1);
+
+  // Drive a clean rejoin: with no diverged entries, collapse finds no
+  // discrepancy, so the peer is accepted back into the group. Acceptance
+  // deactivates detached processing, which decrements the counter.
+  adjRib0->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+  auto accepted = group_->tryAcceptPeersToGroup({adjRib0});
+
+  EXPECT_EQ(accepted.size(), 1);
+  EXPECT_EQ(adjRib0->getPeerState(), PeerUpdateState::JOINED_RUNNING);
+  EXPECT_EQ(group_->getNumPeersDetachedAfterJoin(), 0);
+}
+
+/*
+ * Cumulative per-reason detachment counters (AdjRibStats)
+ */
+
+TEST_F(UpdateGroupDetachedPeerTest, DetachReasonCountsInitiallyZero) {
+  auto adjRib0 = createAndRegisterPeer(0);
+  EXPECT_EQ(adjRib0->getStats().getNumTimesDetachedByBlocking(), 0);
+  EXPECT_EQ(adjRib0->getStats().getNumTimesDetachedByPolicy(), 0);
+}
+
+TEST_F(UpdateGroupDetachedPeerTest, DetachSlowPeerIncrementsBlockingCount) {
+  auto adjRib0 = createAndRegisterPeer(0);
+  auto adjRib1 = createAndRegisterPeer(1);
+  // Two in-sync members so detachSlowPeer does not skip (last-synced guard).
+  group_->markPeerInSync(adjRib0);
+  group_->markPeerInSync(adjRib1);
+  group_->setLastSeenRibVersion(42);
+
+  group_->detachSlowPeer(adjRib0);
+
+  // Blocking detach bumps only the detached peer's blocking counter.
+  EXPECT_EQ(adjRib0->getStats().getNumTimesDetachedByBlocking(), 1);
+  EXPECT_EQ(adjRib0->getStats().getNumTimesDetachedByPolicy(), 0);
+}
+
+TEST_F(UpdateGroupDetachedPeerTest, DetachPeerPolicyIncrementsPolicyCount) {
+  auto adjRib0 = createAndRegisterPeer(0);
+  group_->markPeerInSync(adjRib0);
+  group_->setLastSeenRibVersion(42);
+
+  group_->detachPeer(adjRib0, AdjRibOutGroup::DetachReason::Policy);
+
+  // Policy detach bumps only the detached peer's policy counter.
+  EXPECT_EQ(adjRib0->getStats().getNumTimesDetachedByPolicy(), 1);
+  EXPECT_EQ(adjRib0->getStats().getNumTimesDetachedByBlocking(), 0);
+}
+
 TEST_F(UpdateGroupDetachedPeerTest, RegisterDetachedConsumerSkipsIfAlreadySet) {
   auto adjRib = createAndRegisterPeer(0);
 
@@ -637,7 +785,7 @@ TEST_F(UpdateGroupDetachedPeerTest, RegisterDetachedConsumerSkipsIfAlreadySet) {
   groupConsumer->setBitmap();
 
   // Register once
-  adjRib->registerDetachedConsumer(
+  adjRib->registerDetachedConsumerAtGroupPosition(
       changeTracker, groupConsumer, addPathBitmap, nonAddPathBitmap);
   auto firstConsumer = adjRib->getDetachedConsumer();
   ASSERT_NE(firstConsumer, nullptr);
@@ -645,15 +793,28 @@ TEST_F(UpdateGroupDetachedPeerTest, RegisterDetachedConsumerSkipsIfAlreadySet) {
   auto& messages = subscribeToLogMessages("", folly::LogLevel::WARN);
   messages.clear();
 
-  // Register again — should be a no-op
-  adjRib->registerDetachedConsumer(
+  // Register again — should be a no-op. registerDetachedConsumer reports
+  // failure (consumer already exists, WARN) and the wrapper logs an error and
+  // skips the join, leaving the existing consumer untouched.
+  adjRib->registerDetachedConsumerAtGroupPosition(
       changeTracker, groupConsumer, addPathBitmap, nonAddPathBitmap);
   EXPECT_EQ(adjRib->getDetachedConsumer(), firstConsumer);
 
-  ASSERT_EQ(messages.size(), 1);
-  EXPECT_THAT(
-      messages[0].first.getMessage(),
-      HasSubstr("already has a detached consumer"));
+  ASSERT_EQ(messages.size(), 2);
+  bool foundAlreadyRegistered = false;
+  bool foundJoinSkipped = false;
+  for (const auto& [msg, cat] : messages) {
+    if (msg.getMessage().find("already has a detached consumer") !=
+        std::string::npos) {
+      foundAlreadyRegistered = true;
+    }
+    if (msg.getMessage().find("failed to register detached consumer") !=
+        std::string::npos) {
+      foundJoinSkipped = true;
+    }
+  }
+  EXPECT_TRUE(foundAlreadyRegistered);
+  EXPECT_TRUE(foundJoinSkipped);
 
   // Clean up
   adjRib->deactivateDetachedModeProcessing();
@@ -668,40 +829,17 @@ TEST_F(UpdateGroupDetachedPeerTest, RegisterDetachedConsumerSkipsNullTracker) {
   std::shared_ptr<ChangeTracker<ShadowRibEntry>> nullTracker;
   ConsumerBitmap addPathBitmap;
   ConsumerBitmap nonAddPathBitmap;
-  std::shared_ptr<AdjRibOutGroupConsumer> groupConsumer;
 
   auto& messages = subscribeToLogMessages("", folly::LogLevel::ERR);
   messages.clear();
 
   adjRib->registerDetachedConsumer(
-      nullTracker, groupConsumer, addPathBitmap, nonAddPathBitmap);
+      nullTracker, addPathBitmap, nonAddPathBitmap);
   EXPECT_EQ(adjRib->getDetachedConsumer(), nullptr);
 
   ASSERT_EQ(messages.size(), 1);
   EXPECT_THAT(
       messages[0].first.getMessage(), HasSubstr("null changeListTracker"));
-}
-
-TEST_F(
-    UpdateGroupDetachedPeerTest,
-    RegisterDetachedConsumerSkipsNullGroupConsumer) {
-  auto adjRib = createAndRegisterPeer(0);
-
-  auto changeTracker =
-      std::make_shared<ChangeTracker<ShadowRibEntry>>("test_tracker");
-  ConsumerBitmap addPathBitmap;
-  ConsumerBitmap nonAddPathBitmap;
-  std::shared_ptr<AdjRibOutGroupConsumer> nullGroupConsumer;
-
-  auto& messages = subscribeToLogMessages("", folly::LogLevel::ERR);
-  messages.clear();
-
-  adjRib->registerDetachedConsumer(
-      changeTracker, nullGroupConsumer, addPathBitmap, nonAddPathBitmap);
-  EXPECT_EQ(adjRib->getDetachedConsumer(), nullptr);
-
-  ASSERT_EQ(messages.size(), 1);
-  EXPECT_THAT(messages[0].first.getMessage(), HasSubstr("null groupConsumer"));
 }
 
 TEST_F(
@@ -713,6 +851,74 @@ TEST_F(
   adjRib->deactivateDetachedModeProcessing();
   EXPECT_EQ(adjRib->getDetachedConsumer(), nullptr);
   EXPECT_EQ(0, adjRib->getDetachedRibVersion());
+}
+
+/*
+ * Regression test: a peer entering an already-running update group takes the
+ * DETACHED_INIT_DUMP branch of registerPeer(). Its per-peer CL consumer, set
+ * during session establishment but never registered with the ChangeTracker,
+ * must be reset here. Otherwise registerDetachedConsumer() (called later from
+ * PeerManager::processRibDumpReq) short-circuits on its
+ * `if (changeListConsumer_)` guard, changeListConsumeTimer_ is never created,
+ * and detached CL consumption never starts. Mirrors the INIT-branch reset
+ * (inspired by D100483403).
+ */
+TEST_F(
+    UpdateGroupDetachedPeerTest,
+    RegisterPeerInRunningGroupResetsStaleConsumer) {
+  /*
+   * Build a peer directly so we exercise the real registerPeer() flow;
+   * createAndRegisterPeer() bypasses it via setBitToAdjRibForTesting().
+   */
+  auto peerId = nettools::bgplib::BgpPeerId(
+      folly::IPAddress(fmt::format(kPeerIpFmt, 1)),
+      folly::IPAddressV4("255.0.0.1").toLongHBO());
+  auto adjRib = std::make_shared<AdjRib>(
+      peerId,
+      PeeringParams(),
+      *evb_,
+      ribInQ_,
+      observerQ_,
+      std::make_shared<folly::coro::Baton>(),
+      nullptr /* policyManager */,
+      std::make_shared<std::atomic<bool>>(false));
+  adjRib->setUpdateGroup(group_);
+  peers_.push_back(adjRib);
+
+  /*
+   * Simulate session establishment: a per-peer CL consumer that was never
+   * registered with the ChangeTracker.
+   */
+  auto changeTracker =
+      std::make_shared<ChangeTracker<ShadowRibEntry>>("test_tracker");
+  ConsumerBitmap addPathBitmap;
+  ConsumerBitmap nonAddPathBitmap;
+  auto staleConsumer = std::make_shared<AdjRibOutConsumer>(
+      changeTracker,
+      adjRib,
+      "ChangeList Consumer",
+      *evb_,
+      addPathBitmap,
+      nonAddPathBitmap);
+  adjRib->setChangeListConsumer(staleConsumer);
+  ASSERT_NE(adjRib->getChangeListConsumer(), nullptr);
+
+  // Group is already running -> registerPeer takes the DETACHED_INIT_DUMP
+  // branch
+  group_->setState(UpdateGroupState::READY);
+  group_->registerPeer(adjRib);
+
+  // Peer entered detached-init-dump state...
+  EXPECT_EQ(adjRib->getPeerState(), PeerUpdateState::DETACHED_INIT_DUMP);
+  EXPECT_TRUE(adjRib->isAdjRibFlagSet(AdjRib::DETACHED_INIT_DUMP_PEER));
+  EXPECT_TRUE(group_->getDetachedPeers().contains(adjRib));
+
+  /*
+   * ...and the stale consumer was reset, so registerDetachedConsumer() can
+   * later create the bounded detached consumer and its consume timer instead
+   * of short-circuiting.
+   */
+  EXPECT_EQ(adjRib->getChangeListConsumer(), nullptr);
 }
 
 /*
@@ -863,7 +1069,7 @@ TEST_F(
   ASSERT_FALSE(groupConsumer->isReady());
 
   // Register detached consumer — it joins at group's position (before item)
-  adjRib->registerDetachedConsumer(
+  adjRib->registerDetachedConsumerAtGroupPosition(
       changeTracker, groupConsumer, addPathBitmap, nonAddPathBitmap);
   auto detachedConsumer = adjRib->getDetachedConsumer();
   ASSERT_NE(detachedConsumer, nullptr);
@@ -903,7 +1109,7 @@ TEST_F(
   groupConsumer->registerWithTracker();
   groupConsumer->setBitmap();
 
-  adjRib->registerDetachedConsumer(
+  adjRib->registerDetachedConsumerAtGroupPosition(
       changeTracker, groupConsumer, addPathBitmap, nonAddPathBitmap);
 
   // Non-empty detached PL
@@ -955,7 +1161,7 @@ TEST_F(
 
   // Register detached consumer — it joins at group's position (before the
   // published item), so it has unconsumed items
-  adjRib->registerDetachedConsumer(
+  adjRib->registerDetachedConsumerAtGroupPosition(
       changeTracker, groupConsumer, addPathBitmap, nonAddPathBitmap);
   auto detachedConsumer = adjRib->getDetachedConsumer();
   ASSERT_NE(detachedConsumer, nullptr);
@@ -994,18 +1200,9 @@ TEST_F(UpdateGroupDetachedPeerTest, IsReadyToRejoinGroupReturnsTrue) {
   ConsumerBitmap addPathBitmap;
   ConsumerBitmap nonAddPathBitmap;
 
-  auto groupConsumer = std::make_shared<AdjRibOutGroupConsumer>(
-      changeTracker,
-      group_,
-      "test_group_consumer",
-      *evb_,
-      addPathBitmap,
-      nonAddPathBitmap);
-  groupConsumer->registerWithTracker();
-  groupConsumer->setBitmap();
-
-  group_->setChangeListConsumer(groupConsumer);
   group_->setChangeListTracker(changeTracker, addPathBitmap, nonAddPathBitmap);
+  group_->registerGroupConsumer();
+  auto groupConsumer = group_->getChangeListConsumer();
 
   // Publish and consume an item so group consumer reaches ready state
   ShadowRibEntry entry;
@@ -1017,7 +1214,7 @@ TEST_F(UpdateGroupDetachedPeerTest, IsReadyToRejoinGroupReturnsTrue) {
   ASSERT_TRUE(groupConsumer->isReady());
 
   // Register detached consumer — joins at group's ready position
-  adjRib->registerDetachedConsumer(
+  adjRib->registerDetachedConsumerAtGroupPosition(
       changeTracker, groupConsumer, addPathBitmap, nonAddPathBitmap);
   auto detachedConsumer = adjRib->getDetachedConsumer();
   ASSERT_NE(detachedConsumer, nullptr);
@@ -1051,17 +1248,9 @@ TEST_F(UpdateGroupDetachedPeerTest, ActivateDSPTransitionsToReadyToJoin) {
   ConsumerBitmap addPathBitmap;
   ConsumerBitmap nonAddPathBitmap;
 
-  auto groupConsumer = std::make_shared<AdjRibOutGroupConsumer>(
-      changeTracker,
-      group_,
-      "test_group_consumer",
-      *evb_,
-      addPathBitmap,
-      nonAddPathBitmap);
-  groupConsumer->registerWithTracker();
-  groupConsumer->setBitmap();
-  group_->setChangeListConsumer(groupConsumer);
   group_->setChangeListTracker(changeTracker, addPathBitmap, nonAddPathBitmap);
+  group_->registerGroupConsumer();
+  auto groupConsumer = group_->getChangeListConsumer();
 
   // Publish a CL item and consume it so group consumer is ready
   ShadowRibEntry entry;
@@ -1073,7 +1262,7 @@ TEST_F(UpdateGroupDetachedPeerTest, ActivateDSPTransitionsToReadyToJoin) {
   EXPECT_TRUE(groupConsumer->isReady());
 
   // Register detached consumer — joins at group's ready position
-  adjRib->registerDetachedConsumer(
+  adjRib->registerDetachedConsumerAtGroupPosition(
       changeTracker, groupConsumer, addPathBitmap, nonAddPathBitmap);
   EXPECT_TRUE(adjRib->getDetachedConsumer()->isReady());
 
@@ -1083,7 +1272,8 @@ TEST_F(UpdateGroupDetachedPeerTest, ActivateDSPTransitionsToReadyToJoin) {
   // Pump the evb so sendBgpUpdates runs and DFP check triggers
   evb_->loopOnce();
 
-  // DSP: peer and group both ready -> checkAndAcceptDSPPeer accepts immediately
+  // DSP: peer and group both ready -> maybeAcceptDSPPeer accepts
+  // immediately
   EXPECT_EQ(adjRib->getPeerState(), PeerUpdateState::JOINED_RUNNING);
   EXPECT_TRUE(group_->isPeerInSync(0));
 
@@ -1105,17 +1295,9 @@ TEST_F(UpdateGroupDetachedPeerTest, ActivateDSPStartsTimerLoop) {
   ConsumerBitmap addPathBitmap;
   ConsumerBitmap nonAddPathBitmap;
 
-  auto groupConsumer = std::make_shared<AdjRibOutGroupConsumer>(
-      changeTracker,
-      group_,
-      "test_group_consumer",
-      *evb_,
-      addPathBitmap,
-      nonAddPathBitmap);
-  groupConsumer->registerWithTracker();
-  groupConsumer->setBitmap();
-  group_->setChangeListConsumer(groupConsumer);
   group_->setChangeListTracker(changeTracker, addPathBitmap, nonAddPathBitmap);
+  group_->registerGroupConsumer();
+  auto groupConsumer = group_->getChangeListConsumer();
 
   // Publish an item but DON'T consume it — group consumer stays pended.
   // Detached consumer joins pended too (not ready = DSP).
@@ -1126,7 +1308,7 @@ TEST_F(UpdateGroupDetachedPeerTest, ActivateDSPStartsTimerLoop) {
   changeTracker->publishChange(trackable.get());
 
   // Register detached consumer at group's position (pended, not ready)
-  adjRib->registerDetachedConsumer(
+  adjRib->registerDetachedConsumerAtGroupPosition(
       changeTracker, groupConsumer, addPathBitmap, nonAddPathBitmap);
 
   // Simulate prior block history
@@ -1164,20 +1346,12 @@ TEST_F(UpdateGroupDetachedPeerTest, ActivateDFPTransitionsViaIsDFPPath) {
   ConsumerBitmap addPathBitmap;
   ConsumerBitmap nonAddPathBitmap;
 
-  auto groupConsumer = std::make_shared<AdjRibOutGroupConsumer>(
-      changeTracker,
-      group_,
-      "test_group_consumer",
-      *evb_,
-      addPathBitmap,
-      nonAddPathBitmap);
-  groupConsumer->registerWithTracker();
-  groupConsumer->setBitmap();
-  group_->setChangeListConsumer(groupConsumer);
   group_->setChangeListTracker(changeTracker, addPathBitmap, nonAddPathBitmap);
+  group_->registerGroupConsumer();
+  auto groupConsumer = group_->getChangeListConsumer();
 
-  // Publish an item but DON'T consume it — group consumer stays pended.
-  // This means isReadyToRejoinGroup() will return false (consumer not ready).
+  // Publish an item but DON'T consume it — group consumer stays pended, so the
+  // peer's detached consumer joins pended (not ready), asserted below.
   ShadowRibEntry entry;
   entry.prefix = folly::CIDRNetwork{folly::IPAddress("10.0.0.0"), 24};
   auto trackable =
@@ -1185,7 +1359,7 @@ TEST_F(UpdateGroupDetachedPeerTest, ActivateDFPTransitionsViaIsDFPPath) {
   changeTracker->publishChange(trackable.get());
 
   // Register detached consumer at group's position (pended, not ready)
-  adjRib->registerDetachedConsumer(
+  adjRib->registerDetachedConsumerAtGroupPosition(
       changeTracker, groupConsumer, addPathBitmap, nonAddPathBitmap);
   EXPECT_FALSE(adjRib->getDetachedConsumer()->isReady());
 
@@ -1205,7 +1379,6 @@ TEST_F(UpdateGroupDetachedPeerTest, ActivateDFPTransitionsViaIsDFPPath) {
       nullptr,
       constAttrs);
 
-  EXPECT_FALSE(adjRib->isReadyToRejoinGroup());
   EXPECT_TRUE(adjRib->isDFP());
 
   // Activate detached mode processing — schedules sendBgpUpdates on evb
@@ -1269,17 +1442,9 @@ TEST_F(
   ConsumerBitmap addPathBitmap;
   ConsumerBitmap nonAddPathBitmap;
 
-  auto groupConsumer = std::make_shared<AdjRibOutGroupConsumer>(
-      changeTracker,
-      group_,
-      "test_group_consumer",
-      *evb_,
-      addPathBitmap,
-      nonAddPathBitmap);
-  groupConsumer->registerWithTracker();
-  groupConsumer->setBitmap();
-  group_->setChangeListConsumer(groupConsumer);
   group_->setChangeListTracker(changeTracker, addPathBitmap, nonAddPathBitmap);
+  group_->registerGroupConsumer();
+  auto groupConsumer = group_->getChangeListConsumer();
 
   // Publish a CL item and consume it so group consumer is ready
   ShadowRibEntry entry;
@@ -1290,7 +1455,7 @@ TEST_F(
   groupConsumer->iterateChanges();
 
   // Register detached consumer — joins at group's ready position
-  adjRib->registerDetachedConsumer(
+  adjRib->registerDetachedConsumerAtGroupPosition(
       changeTracker, groupConsumer, addPathBitmap, nonAddPathBitmap);
 
   // Set peer to DETACHED_BLOCKED state
@@ -1302,7 +1467,8 @@ TEST_F(
   // Pump the evb so sendBgpUpdates runs and DFP check triggers
   evb_->loopOnce();
 
-  // DSP: peer and group both ready -> checkAndAcceptDSPPeer accepts immediately
+  // DSP: peer and group both ready -> maybeAcceptDSPPeer accepts
+  // immediately
   EXPECT_EQ(adjRib->getPeerState(), PeerUpdateState::JOINED_RUNNING);
   EXPECT_TRUE(group_->isPeerInSync(0));
 
@@ -1383,12 +1549,12 @@ TEST_F(UpdateGroupDetachedPeerTest, ShouldCloneTrueWhenPeerWasSharingEntry) {
 }
 
 /*
- * copyEntryForPeer() tests
+ * copyEntryForOwner() tests
  */
 
 TEST_F(UpdateGroupDetachedPeerTest, CopyEntryForPeerCopiesAllFields) {
   auto adjRib = createAndRegisterPeer(0);
-  // Register a second peer so the group has >1 member and copyEntryForPeer
+  // Register a second peer so the group has >1 member and copyEntryForOwner
   // stores the cloned entry under the peer owner key (not the group key).
   auto adjRib1 = createAndRegisterPeer(1);
   auto groupOwnerKey = group_->getGroupOwnerKey();
@@ -1409,8 +1575,8 @@ TEST_F(UpdateGroupDetachedPeerTest, CopyEntryForPeerCopiesAllFields) {
   groupEntry->setStale(true);
 
   // Clone the entry to the peer
-  group_->copyEntryForPeer(
-      kV4Prefix1, kPlaceholderPathID, adjRib, peerOwnerKey, groupEntry);
+  group_->copyEntryForOwner(
+      kV4Prefix1, kPlaceholderPathID, peerOwnerKey, groupEntry);
 
   // Verify peer entry was created with all fields copied
   auto peerEntry =
@@ -1434,8 +1600,8 @@ TEST_F(UpdateGroupDetachedPeerTest, CopyEntryForPeerUsesGroupKeyWhenOnlyPeer) {
   srcEntry.setRibVersion(42);
 
   // Caller passes the group owner key when the peer is the only member.
-  group_->copyEntryForPeer(
-      kV4Prefix1, kPlaceholderPathID, adjRib, groupOwnerKey, &srcEntry);
+  group_->copyEntryForOwner(
+      kV4Prefix1, kPlaceholderPathID, groupOwnerKey, &srcEntry);
 
   auto entry =
       group_->getFromLiteTree(group_->LiteTree_, kV4Prefix1, groupOwnerKey);
@@ -1446,6 +1612,431 @@ TEST_F(UpdateGroupDetachedPeerTest, CopyEntryForPeerUsesGroupKeyWhenOnlyPeer) {
   auto peerEntry =
       group_->getFromLiteTree(group_->LiteTree_, kV4Prefix1, peerOwnerKey);
   EXPECT_EQ(peerEntry, nullptr);
+}
+
+/*
+ * promoteDetachedPeerLiteEntries() / promoteDetachedPeerPathEntries() tests
+ */
+
+TEST_F(UpdateGroupDetachedPeerTest, PromoteLiteMovesPeerEntryToGroupKey) {
+  auto adjRib = createAndRegisterPeer(0);
+  auto groupOwnerKey = group_->getGroupOwnerKey();
+  auto peerOwnerKey = adjRib->getPeerOwnerKey();
+
+  // Group has a stale entry; the detached peer has a diverged entry.
+  auto groupEntry = group_->addToLiteTree(
+      group_->LiteTree_, kV4Prefix1, groupOwnerKey, kPlaceholderPathID);
+  groupEntry->setRibVersion(10);
+  auto peerEntry = group_->addToLiteTree(
+      group_->LiteTree_, kV4Prefix1, peerOwnerKey, kPlaceholderPathID);
+  peerEntry->setRibVersion(99);
+
+  auto& messages = subscribeToLogMessages("", folly::LogLevel::INFO);
+  messages.clear();
+
+  group_->promoteDetachedPeerLiteEntries(adjRib);
+
+  // The peer's entry (same object) is promoted under the group key; the stale
+  // group entry is deleted and the peer key no longer exists.
+  auto promoted =
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix1, groupOwnerKey);
+  ASSERT_NE(promoted, nullptr);
+  EXPECT_EQ(promoted, peerEntry);
+  EXPECT_EQ(promoted->getRibVersion(), 99);
+  EXPECT_EQ(
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix1, peerOwnerKey),
+      nullptr);
+
+  // One entry was promoted: the logged count reflects it.
+  EXPECT_TRUE(logMessagesContain(messages, "Promoted 1 LiteTree entries"));
+}
+
+TEST_F(UpdateGroupDetachedPeerTest, PromoteLiteDeletesGroupOnlyEntry) {
+  auto adjRib = createAndRegisterPeer(0);
+  auto groupOwnerKey = group_->getGroupOwnerKey();
+  auto peerOwnerKey = adjRib->getPeerOwnerKey();
+
+  // Only a group entry exists (peer was sharing it, has no own entry).
+  group_->addToLiteTree(
+      group_->LiteTree_, kV4Prefix1, groupOwnerKey, kPlaceholderPathID);
+
+  auto& messages = subscribeToLogMessages("", folly::LogLevel::INFO);
+  messages.clear();
+
+  group_->promoteDetachedPeerLiteEntries(adjRib);
+
+  // Group-only entry is deleted and the emptied node is cleaned up.
+  EXPECT_EQ(
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix1, groupOwnerKey),
+      nullptr);
+  EXPECT_EQ(
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix1, peerOwnerKey),
+      nullptr);
+
+  // Nothing was promoted (only a group entry deleted): count is zero.
+  EXPECT_TRUE(logMessagesContain(messages, "Promoted 0 LiteTree entries"));
+}
+
+TEST_F(UpdateGroupDetachedPeerTest, PromoteLitePeerOnlyEntryMovedToGroupKey) {
+  auto adjRib = createAndRegisterPeer(0);
+  auto groupOwnerKey = group_->getGroupOwnerKey();
+  auto peerOwnerKey = adjRib->getPeerOwnerKey();
+
+  // Only a peer entry exists (no group entry at this prefix).
+  auto peerEntry = group_->addToLiteTree(
+      group_->LiteTree_, kV4Prefix1, peerOwnerKey, kPlaceholderPathID);
+  peerEntry->setRibVersion(99);
+
+  auto& messages = subscribeToLogMessages("", folly::LogLevel::INFO);
+  messages.clear();
+
+  group_->promoteDetachedPeerLiteEntries(adjRib);
+
+  auto promoted =
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix1, groupOwnerKey);
+  ASSERT_NE(promoted, nullptr);
+  EXPECT_EQ(promoted, peerEntry);
+  EXPECT_EQ(
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix1, peerOwnerKey),
+      nullptr);
+
+  // One entry was promoted: the logged count reflects it.
+  EXPECT_TRUE(logMessagesContain(messages, "Promoted 1 LiteTree entries"));
+}
+
+TEST_F(UpdateGroupDetachedPeerTest, PromotePathMovesPeerPathsToGroupKey) {
+  auto adjRib = createAndRegisterPeer(0);
+  auto groupOwnerKey = group_->getGroupOwnerKey();
+  auto peerOwnerKey = adjRib->getPeerOwnerKey();
+
+  // Group has one path; the detached peer has two diverged paths.
+  group_->addToPathTree(group_->PathTree_, kV4Prefix1, groupOwnerKey, 1);
+  auto peerPath1 =
+      group_->addToPathTree(group_->PathTree_, kV4Prefix1, peerOwnerKey, 1);
+  peerPath1->setRibVersion(99);
+  auto peerPath2 =
+      group_->addToPathTree(group_->PathTree_, kV4Prefix1, peerOwnerKey, 2);
+  peerPath2->setRibVersion(99);
+
+  auto& messages = subscribeToLogMessages("", folly::LogLevel::INFO);
+  messages.clear();
+
+  group_->promoteDetachedPeerPathEntries(adjRib);
+
+  // Both peer paths (same objects) are promoted under the group key, replacing
+  // the group's path map; the peer key no longer exists.
+  EXPECT_EQ(
+      group_->getFromPathTree(group_->PathTree_, kV4Prefix1, groupOwnerKey, 1),
+      peerPath1);
+  EXPECT_EQ(
+      group_->getFromPathTree(group_->PathTree_, kV4Prefix1, groupOwnerKey, 2),
+      peerPath2);
+  EXPECT_EQ(
+      group_->getFromPathTree(group_->PathTree_, kV4Prefix1, peerOwnerKey, 1),
+      nullptr);
+  EXPECT_EQ(
+      group_->getFromPathTree(group_->PathTree_, kV4Prefix1, peerOwnerKey, 2),
+      nullptr);
+
+  // Count is by pathId: two paths were promoted (not one node).
+  EXPECT_TRUE(logMessagesContain(messages, "Promoted 2 PathTree entries"));
+}
+
+TEST_F(UpdateGroupDetachedPeerTest, PromotePathDeletesGroupOnlyEntry) {
+  auto adjRib = createAndRegisterPeer(0);
+  auto groupOwnerKey = group_->getGroupOwnerKey();
+  auto peerOwnerKey = adjRib->getPeerOwnerKey();
+
+  // Only a group path exists (peer was sharing it).
+  group_->addToPathTree(group_->PathTree_, kV4Prefix1, groupOwnerKey, 1);
+
+  auto& messages = subscribeToLogMessages("", folly::LogLevel::INFO);
+  messages.clear();
+
+  group_->promoteDetachedPeerPathEntries(adjRib);
+
+  EXPECT_EQ(
+      group_->getFromPathTree(group_->PathTree_, kV4Prefix1, groupOwnerKey, 1),
+      nullptr);
+  EXPECT_EQ(
+      group_->getFromPathTree(group_->PathTree_, kV4Prefix1, peerOwnerKey, 1),
+      nullptr);
+
+  // Nothing was promoted (only a group path deleted): count is zero.
+  EXPECT_TRUE(logMessagesContain(messages, "Promoted 0 PathTree entries"));
+}
+
+/*
+ * promoteDetachedPeerToSync() tests
+ */
+
+TEST_F(UpdateGroupDetachedPeerTest, PromoteDetachedPeerToSyncTransitionsPeer) {
+  auto adjRib = createAndRegisterPeer(0);
+
+  // Wire the group's tracker so registerGroupConsumer() can create its
+  // consumer.
+  auto changeTracker =
+      std::make_shared<ChangeTracker<ShadowRibEntry>>("test_tracker");
+  ConsumerBitmap addPathBitmap;
+  ConsumerBitmap nonAddPathBitmap;
+  group_->setChangeListTracker(changeTracker, addPathBitmap, nonAddPathBitmap);
+
+  // Give the detached peer its own CL consumer; the group joins at its
+  // position.
+  adjRib->registerDetachedConsumer(
+      changeTracker, addPathBitmap, nonAddPathBitmap);
+
+  // Detached peer ahead of the group (DEP-A: detachedRibVersion stays 0).
+  group_->markPeerDetached(adjRib);
+  adjRib->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+  adjRib->setLastSeenRibVersion(99);
+
+  group_->promoteDetachedPeerToSync(adjRib);
+
+  // Peer is in sync and out of the detached set.
+  EXPECT_EQ(adjRib->getPeerState(), PeerUpdateState::JOINED_RUNNING);
+  EXPECT_TRUE(group_->isPeerInSync(0));
+  EXPECT_FALSE(group_->getDetachedPeers().contains(adjRib));
+
+  // The promotion counts as a rejoin.
+  EXPECT_EQ(adjRib->getStats().getNumTimesRejoined(), 1);
+
+  // Group adopted the peer's RIB version; peer's detached version was reset.
+  EXPECT_EQ(group_->getLastSeenRibVersion(), 99);
+  EXPECT_EQ(adjRib->getDetachedRibVersion(), 0);
+
+  // Cleanup before the local tracker is destroyed.
+  group_->resetChangeListConsumer();
+}
+
+TEST_F(
+    UpdateGroupDetachedPeerTest,
+    PromoteDetachedPeerToSyncMovesEntriesAndRebuildsConsumer) {
+  auto adjRib = createAndRegisterPeer(0);
+
+  auto changeTracker =
+      std::make_shared<ChangeTracker<ShadowRibEntry>>("test_tracker");
+  ConsumerBitmap addPathBitmap;
+  ConsumerBitmap nonAddPathBitmap;
+  group_->setChangeListTracker(changeTracker, addPathBitmap, nonAddPathBitmap);
+  adjRib->registerDetachedConsumer(
+      changeTracker, addPathBitmap, nonAddPathBitmap);
+  group_->markPeerDetached(adjRib);
+
+  auto groupOwnerKey = group_->getGroupOwnerKey();
+  auto peerOwnerKey = adjRib->getPeerOwnerKey();
+  // kV4Prefix1: peer's diverged entry + a stale group entry.
+  // kV4Prefix2: group-only stale entry the peer never advertised.
+  auto peerEntry = group_->addToLiteTree(
+      group_->LiteTree_, kV4Prefix1, peerOwnerKey, kPlaceholderPathID);
+  group_->addToLiteTree(
+      group_->LiteTree_, kV4Prefix1, groupOwnerKey, kPlaceholderPathID);
+  group_->addToLiteTree(
+      group_->LiteTree_, kV4Prefix2, groupOwnerKey, kPlaceholderPathID);
+
+  group_->promoteDetachedPeerToSync(adjRib);
+
+  // Peer entry promoted to the group owner key; peer owner key gone.
+  EXPECT_EQ(
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix1, groupOwnerKey),
+      peerEntry);
+  EXPECT_EQ(
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix1, peerOwnerKey),
+      nullptr);
+  // Stale group-only entry deleted.
+  EXPECT_EQ(
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix2, groupOwnerKey),
+      nullptr);
+
+  // Group's change list consumer was (re)created.
+  EXPECT_NE(group_->getChangeListConsumer(), nullptr);
+
+  group_->resetChangeListConsumer();
+}
+
+TEST_F(
+    UpdateGroupDetachedPeerTest,
+    PromoteDetachedPeerToSyncAbortsWhenPeerHasNoConsumer) {
+  auto adjRib = createAndRegisterPeer(0);
+  // No detached CL consumer registered for the peer -> getChangeListConsumer()
+  // is null, so promotion must abort before mutating any state.
+  ASSERT_EQ(adjRib->getChangeListConsumer(), nullptr);
+
+  auto groupOwnerKey = group_->getGroupOwnerKey();
+  auto peerOwnerKey = adjRib->getPeerOwnerKey();
+  auto peerEntry = group_->addToLiteTree(
+      group_->LiteTree_, kV4Prefix1, peerOwnerKey, kPlaceholderPathID);
+  auto groupEntry = group_->addToLiteTree(
+      group_->LiteTree_, kV4Prefix2, groupOwnerKey, kPlaceholderPathID);
+  group_->markPeerDetached(adjRib);
+  adjRib->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+
+  group_->promoteDetachedPeerToSync(adjRib);
+
+  // Aborted before moving entries: the peer's entry is untouched (not re-keyed
+  // under the group owner key) and the group-only entry is intact.
+  EXPECT_EQ(
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix1, peerOwnerKey),
+      peerEntry);
+  EXPECT_EQ(
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix1, groupOwnerKey),
+      nullptr);
+  EXPECT_EQ(
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix2, groupOwnerKey),
+      groupEntry);
+  // Peer stays detached, not promoted.
+  EXPECT_EQ(adjRib->getPeerState(), PeerUpdateState::DETACHED_READY_TO_JOIN);
+  EXPECT_FALSE(group_->isPeerInSync(0));
+  EXPECT_TRUE(group_->getDetachedPeers().contains(adjRib));
+}
+
+TEST_F(
+    UpdateGroupDetachedPeerTest,
+    PromoteDetachedPeerToSyncAbortsWhenTrackerNotSet) {
+  auto adjRib = createAndRegisterPeer(0);
+
+  // Give the peer a CL consumer, but deliberately do NOT wire the group's
+  // tracker/bitmaps via setChangeListTracker(). Promotion must abort when it
+  // cannot build a new group consumer.
+  auto changeTracker =
+      std::make_shared<ChangeTracker<ShadowRibEntry>>("test_tracker");
+  ConsumerBitmap addPathBitmap;
+  ConsumerBitmap nonAddPathBitmap;
+  adjRib->registerDetachedConsumer(
+      changeTracker, addPathBitmap, nonAddPathBitmap);
+  ASSERT_NE(adjRib->getChangeListConsumer(), nullptr);
+
+  auto groupOwnerKey = group_->getGroupOwnerKey();
+  auto peerOwnerKey = adjRib->getPeerOwnerKey();
+  auto peerEntry = group_->addToLiteTree(
+      group_->LiteTree_, kV4Prefix1, peerOwnerKey, kPlaceholderPathID);
+  auto groupEntry = group_->addToLiteTree(
+      group_->LiteTree_, kV4Prefix2, groupOwnerKey, kPlaceholderPathID);
+  group_->markPeerDetached(adjRib);
+  adjRib->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+
+  group_->promoteDetachedPeerToSync(adjRib);
+
+  // Aborted before moving entries: entries untouched, no group consumer made.
+  EXPECT_EQ(
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix1, peerOwnerKey),
+      peerEntry);
+  EXPECT_EQ(
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix1, groupOwnerKey),
+      nullptr);
+  EXPECT_EQ(
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix2, groupOwnerKey),
+      groupEntry);
+  EXPECT_EQ(group_->getChangeListConsumer(), nullptr);
+  // Peer stays detached, not promoted.
+  EXPECT_EQ(adjRib->getPeerState(), PeerUpdateState::DETACHED_READY_TO_JOIN);
+  EXPECT_FALSE(group_->isPeerInSync(0));
+  EXPECT_TRUE(group_->getDetachedPeers().contains(adjRib));
+
+  // Cleanup the peer's consumer before the local tracker is destroyed.
+  adjRib->resetChangeListConsumer();
+}
+
+/*
+ * handleNoSyncPeers() tests
+ */
+
+TEST_F(
+    UpdateGroupDetachedPeerTest,
+    HandleNoSyncPeersPromotesDfpAndRestoresSync) {
+  auto adjRib = createAndRegisterPeer(0);
+  // A DFP: detached, drained its packing list, RIB-OUT identical to the group.
+  group_->markPeerDetached(adjRib);
+  adjRib->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+  adjRib->setAdjRibFlag(AdjRib::IS_DETACHED_FAST_PEER);
+  ASSERT_EQ(group_->getNumInSyncPeers(), 0);
+
+  group_->handleNoSyncPeers();
+
+  // checkAndAcceptReadyToJoinPeers promotes the DFP, restoring sync.
+  EXPECT_EQ(adjRib->getPeerState(), PeerUpdateState::JOINED_RUNNING);
+  EXPECT_TRUE(group_->isPeerInSync(0));
+  EXPECT_EQ(group_->getNumInSyncPeers(), 1);
+  EXPECT_FALSE(group_->getDetachedPeers().contains(adjRib));
+}
+
+TEST_F(
+    UpdateGroupDetachedPeerTest,
+    HandleNoSyncPeersWithSharingDspStaysFrozen) {
+  auto adjRib0 = createAndRegisterPeer(0);
+  auto adjRib1 = createAndRegisterPeer(1);
+  group_->markPeerInSync(adjRib0);
+  group_->markPeerInSync(adjRib1);
+  group_->setLastSeenRibVersion(42);
+
+  // adjRib0 detaches after join -> DSP that still shares the group's entries
+  // (detachedRibVersion > 0, counted in numPeersDetachedAfterJoin_).
+  group_->detachSlowPeer(adjRib0);
+  ASSERT_GT(adjRib0->getDetachedRibVersion(), 0);
+  ASSERT_EQ(group_->getNumPeersDetachedAfterJoin(), 1);
+  // Drop the last in-sync peer too, leaving the group with no SYNC peers.
+  group_->markPeerDetached(adjRib1);
+  ASSERT_EQ(group_->getNumInSyncPeers(), 0);
+
+  group_->handleNoSyncPeers();
+
+  // A sharing DSP exists, so the group stays frozen waiting for it to catch up:
+  // nothing is promoted.
+  EXPECT_EQ(group_->getNumInSyncPeers(), 0);
+  EXPECT_NE(adjRib0->getPeerState(), PeerUpdateState::JOINED_RUNNING);
+  EXPECT_TRUE(group_->getDetachedPeers().contains(adjRib0));
+}
+
+TEST_F(UpdateGroupDetachedPeerTest, HandleNoSyncPeersPromotesReadyDepA) {
+  auto adjRib = createAndRegisterPeer(0);
+
+  // Wire the group's tracker so promoteDetachedPeerToSync can rebuild the
+  // group consumer; give the peer its own CL consumer to join at.
+  auto changeTracker =
+      std::make_shared<ChangeTracker<ShadowRibEntry>>("test_tracker");
+  ConsumerBitmap addPathBitmap;
+  ConsumerBitmap nonAddPathBitmap;
+  group_->setChangeListTracker(changeTracker, addPathBitmap, nonAddPathBitmap);
+  adjRib->registerDetachedConsumer(
+      changeTracker, addPathBitmap, nonAddPathBitmap);
+
+  // DEP-A: detached ahead of the group on the CL (detachedRibVersion 0), with
+  // its packing list drained (DETACHED_READY_TO_JOIN).
+  group_->markPeerDetached(adjRib);
+  adjRib->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+  adjRib->setLastSeenRibVersion(99);
+  ASSERT_EQ(group_->getNumInSyncPeers(), 0);
+  ASSERT_EQ(group_->getNumPeersDetachedAfterJoin(), 0);
+
+  group_->handleNoSyncPeers();
+
+  // No SYNC peer and no sharing DSP -> the ready DEP-A is promoted to SYNC via
+  // promoteDetachedPeerToSync.
+  EXPECT_EQ(adjRib->getPeerState(), PeerUpdateState::JOINED_RUNNING);
+  EXPECT_TRUE(group_->isPeerInSync(0));
+  EXPECT_EQ(group_->getNumInSyncPeers(), 1);
+  EXPECT_FALSE(group_->getDetachedPeers().contains(adjRib));
+  EXPECT_EQ(adjRib->getStats().getNumTimesRejoined(), 1);
+
+  group_->resetChangeListConsumer();
+}
+
+TEST_F(UpdateGroupDetachedPeerTest, HandleNoSyncPeersNoReadyPeerStaysFrozen) {
+  auto adjRib = createAndRegisterPeer(0);
+  // DEP-A ahead of the group but still draining (not DETACHED_READY_TO_JOIN),
+  // detachedRibVersion 0 so there is no sharing DSP either.
+  group_->markPeerDetached(adjRib);
+  adjRib->setPeerState(PeerUpdateState::DETACHED_RUNNING);
+  ASSERT_EQ(group_->getNumInSyncPeers(), 0);
+  ASSERT_EQ(group_->getNumPeersDetachedAfterJoin(), 0);
+
+  group_->handleNoSyncPeers();
+
+  // Nothing is ready to promote -> the group stays frozen and the peer is
+  // untouched.
+  EXPECT_EQ(group_->getNumInSyncPeers(), 0);
+  EXPECT_EQ(adjRib->getPeerState(), PeerUpdateState::DETACHED_RUNNING);
+  EXPECT_TRUE(group_->getDetachedPeers().contains(adjRib));
 }
 
 /*
@@ -1723,13 +2314,13 @@ TEST_F(UpdateGroupDetachedPeerTest, WithdrawMultiplePeersMixedCloneBehavior) {
 
 /**
  * Group withdrawal with sendAddPath=true exercises the PathTree code path
- * in copyEntryForPeer and lazyClonePathForDetachedPeers.
+ * in copyEntryForOwner and lazyClonePathForDetachedPeers.
  */
 TEST_F(UpdateGroupDetachedPeerTest, WithdrawClonesEntryAddPathMode) {
   group_->groupKey_.afiIpv4Negotiated = true;
   group_->groupKey_.sendAddPath = true;
   auto adjRib0 = createAndRegisterPeer(0);
-  // Register a second peer so copyEntryForPeer uses peer owner key.
+  // Register a second peer so copyEntryForOwner uses peer owner key.
   auto adjRib1 = createAndRegisterPeer(1);
   auto groupOwnerKey = group_->getGroupOwnerKey();
   auto peerOwnerKey = adjRib0->getPeerOwnerKey();
@@ -2078,7 +2669,7 @@ TEST_F(UpdateGroupDetachedPeerTest, AnnouncementClonesEntryAddPathMode) {
   group_->groupKey_.afiIpv4Negotiated = true;
   group_->groupKey_.sendAddPath = true;
   auto adjRib0 = createAndRegisterPeer(0);
-  // Register a second peer so copyEntryForPeer uses peer owner key.
+  // Register a second peer so copyEntryForOwner uses peer owner key.
   auto adjRib1 = createAndRegisterPeer(1);
   auto groupOwnerKey = group_->getGroupOwnerKey();
   auto peerOwnerKey = adjRib0->getPeerOwnerKey();
@@ -2134,6 +2725,103 @@ TEST_F(UpdateGroupDetachedPeerTest, AnnouncementClonesEntryAddPathMode) {
   EXPECT_EQ(groupEntry->getRibVersion(), 60);
 }
 
+TEST_F(
+    UpdateGroupDetachedPeerTest,
+    UnregisterDetachedPeerCleansUpPerPeerLiteTreeEntries) {
+  auto adjRib = createAndRegisterPeer(0);
+  auto peerOwnerKey = adjRib->getPeerOwnerKey();
+  auto groupOwnerKey = group_->getGroupOwnerKey();
+
+  adjRib->setPeerState(PeerUpdateState::DETACHED_RUNNING);
+  adjRib->setDetachedRibVersion(50);
+  group_->markPeerDetached(adjRib);
+
+  // Add per-peer entry (diverged from group)
+  group_->addToLiteTree(
+      group_->LiteTree_, kV4Prefix1, peerOwnerKey, kPlaceholderPathID);
+
+  // Add group entry that the peer was sharing (ribVersion <=
+  // detachedRibVersion)
+  auto groupEntry = group_->addToLiteTree(
+      group_->LiteTree_, kV4Prefix2, groupOwnerKey, kPlaceholderPathID);
+  groupEntry->setRibVersion(10);
+
+  ASSERT_NE(
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix1, peerOwnerKey),
+      nullptr);
+  ASSERT_NE(
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix2, groupOwnerKey),
+      nullptr);
+
+  group_->unregisterPeer(adjRib);
+
+  // Per-peer entry should be deleted
+  EXPECT_EQ(
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix1, peerOwnerKey),
+      nullptr);
+
+  // Group entry should still exist (shared group-owned entry, not deleted)
+  EXPECT_NE(
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix2, groupOwnerKey),
+      nullptr);
+
+  // Peer removed from detached set
+  EXPECT_FALSE(group_->getDetachedPeers().contains(adjRib));
+
+  // Remove from peers_ so TearDown doesn't double-unregister
+  peers_.erase(std::remove(peers_.begin(), peers_.end(), adjRib), peers_.end());
+}
+
+TEST_F(
+    UpdateGroupDetachedPeerTest,
+    UnregisterDetachedPeerCleansUpPerPeerPathTreeEntries) {
+  auto adjRib = createAndRegisterPeer(0);
+  adjRib->sendAddPath_ = true;
+  auto peerOwnerKey = adjRib->getPeerOwnerKey();
+  auto groupOwnerKey = group_->getGroupOwnerKey();
+
+  adjRib->setPeerState(PeerUpdateState::DETACHED_RUNNING);
+  adjRib->setDetachedRibVersion(50);
+  group_->markPeerDetached(adjRib);
+
+  // Add per-peer path entries (diverged)
+  group_->addToPathTree(
+      group_->PathTree_, kV4Prefix1, peerOwnerKey, /*pathId=*/1);
+  group_->addToPathTree(
+      group_->PathTree_, kV4Prefix1, peerOwnerKey, /*pathId=*/2);
+
+  // Add group entry the peer was sharing
+  auto groupEntry = group_->addToPathTree(
+      group_->PathTree_, kV4Prefix2, groupOwnerKey, /*pathId=*/1);
+  groupEntry->setRibVersion(10);
+
+  ASSERT_NE(
+      group_->getFromPathTree(group_->PathTree_, kV4Prefix1, peerOwnerKey, 1),
+      nullptr);
+  ASSERT_NE(
+      group_->getFromPathTree(group_->PathTree_, kV4Prefix1, peerOwnerKey, 2),
+      nullptr);
+
+  group_->unregisterPeer(adjRib);
+
+  // Per-peer entries should be deleted
+  EXPECT_EQ(
+      group_->getFromPathTree(group_->PathTree_, kV4Prefix1, peerOwnerKey, 1),
+      nullptr);
+  EXPECT_EQ(
+      group_->getFromPathTree(group_->PathTree_, kV4Prefix1, peerOwnerKey, 2),
+      nullptr);
+
+  // Group entry should still exist
+  EXPECT_NE(
+      group_->getFromPathTree(group_->PathTree_, kV4Prefix2, groupOwnerKey, 1),
+      nullptr);
+
+  EXPECT_FALSE(group_->getDetachedPeers().contains(adjRib));
+
+  peers_.erase(std::remove(peers_.begin(), peers_.end(), adjRib), peers_.end());
+}
+
 /*
  * Lifecycle tests for slow peer detachment and rejoin flow.
  *
@@ -2167,19 +2855,10 @@ class UpdateGroupDetachLifecycleTest : public ::testing::Test {
     changeTracker_ =
         std::make_shared<ChangeTracker<ShadowRibEntry>>("test_tracker");
 
-    groupConsumer_ = std::make_shared<AdjRibOutGroupConsumer>(
-        changeTracker_,
-        group_,
-        "test_group_consumer",
-        *evb_,
-        addPathBitmap_,
-        nonAddPathBitmap_);
-    groupConsumer_->registerWithTracker();
-    groupConsumer_->setBitmap();
-
-    group_->setChangeListConsumer(groupConsumer_);
     group_->setChangeListTracker(
         changeTracker_, addPathBitmap_, nonAddPathBitmap_);
+    group_->registerGroupConsumer();
+    groupConsumer_ = group_->getChangeListConsumer();
   }
 
   void TearDown() override {
@@ -2602,6 +3281,52 @@ TEST_F(UpdateGroupDetachLifecycleTest, AcceptDFPWithSharedEntriesOnly) {
   }
 }
 
+/* A DFP rejoin (accepted directly, no collapse) bumps the peer's rejoin count.
+ */
+TEST_F(UpdateGroupDetachLifecycleTest, RejoinCountIncrementsForDFP) {
+  auto adjRib0 = createAndRegisterPeer(0);
+  auto adjRib1 = createAndRegisterPeer(1);
+  setUpJoinedRunningPeer(adjRib1, 1);
+
+  adjRib0->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+  adjRib0->setAdjRibFlag(AdjRib::IS_DETACHED_FAST_PEER);
+  group_->markPeerDetached(adjRib0);
+  adjRib0->setDetachedRibVersion(10);
+  ASSERT_EQ(adjRib0->getStats().getNumTimesRejoined(), 0);
+
+  group_->checkAndAcceptReadyToJoinPeers();
+
+  ASSERT_EQ(adjRib0->getPeerState(), PeerUpdateState::JOINED_RUNNING);
+  EXPECT_EQ(adjRib0->getStats().getNumTimesRejoined(), 1);
+}
+
+/* A DSP rejoin (accepted via collapse) bumps the peer's rejoin count. */
+TEST_F(UpdateGroupDetachLifecycleTest, RejoinCountIncrementsForDSP) {
+  auto adjRib0 = createAndRegisterPeer(0);
+  auto adjRib1 = createAndRegisterPeer(1);
+  setUpJoinedRunningPeer(adjRib1, 1);
+
+  adjRib0->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+  group_->markPeerDetached(adjRib0);
+  adjRib0->setDetachedRibVersion(10);
+  setUpReadyPeerConsumer(adjRib0);
+
+  // Shared, pre-detachment group entry so collapse finds no discrepancy.
+  auto groupOwnerKey = group_->getGroupOwnerKey();
+  auto attrs = std::make_shared<BgpPath>(*buildBgpPathFields(1, 1, 0, 0));
+  auto* entry = group_->addToLiteTree(
+      group_->LiteTree_, kV4Prefix1, groupOwnerKey, kPlaceholderPathID);
+  entry->setPostAttr(attrs);
+  entry->setRibVersion(5);
+  ASSERT_EQ(adjRib0->getStats().getNumTimesRejoined(), 0);
+
+  setGroupConsumerReady();
+  group_->checkAndAcceptReadyToJoinPeers();
+
+  ASSERT_EQ(adjRib0->getPeerState(), PeerUpdateState::JOINED_RUNNING);
+  EXPECT_EQ(adjRib0->getStats().getNumTimesRejoined(), 1);
+}
+
 /*
  * DSP with a mix of shared (pre-detachment) and lazily-cloned entries.
  * Shared entries: group-only, ribVersion <= detachedRibVersion.
@@ -2840,75 +3565,6 @@ TEST_F(UpdateGroupDetachLifecycleTest, DFPDetachAndReadyToJoin) {
 }
 
 /*
- * Two peers block. Both get detected as slow and detach.
- * Verify independent detachment and processing.
- */
-TEST_F(UpdateGroupDetachLifecycleTest, TwoPeersDetachIndependently) {
-  auto adjRib0 = createAndRegisterPeer(0);
-  auto adjRib1 = createAndRegisterPeer(1);
-  auto adjRib2 = createAndRegisterPeer(2);
-  setUpJoinedRunningPeer(adjRib0, 0);
-  setUpJoinedRunningPeer(adjRib1, 1);
-  setUpJoinedRunningPeer(adjRib2, 2);
-
-  // Publish a CL item and consume it so group consumer is ready
-  publishChangeItem(folly::CIDRNetwork{folly::IPAddress("10.0.0.0"), 24});
-  groupConsumer_->iterateChanges();
-
-  // Add prefix to group PL
-  addPrefixToGroupPL(folly::CIDRNetwork{folly::IPAddress("10.0.0.0"), 24});
-
-  // Both peer 0 and 1 block
-  group_->markPeerBlocked(adjRib0);
-  group_->markPeerBlocked(adjRib1);
-
-  // Both detach
-  group_->detachSlowPeer(adjRib0);
-  group_->detachSlowPeer(adjRib1);
-
-  EXPECT_EQ(adjRib0->getPeerState(), PeerUpdateState::DETACHED_BLOCKED);
-  EXPECT_EQ(adjRib1->getPeerState(), PeerUpdateState::DETACHED_BLOCKED);
-  EXPECT_TRUE(group_->getDetachedPeers().contains(adjRib0));
-  EXPECT_TRUE(group_->getDetachedPeers().contains(adjRib1));
-
-  // Peer 2 is unaffected
-  EXPECT_EQ(adjRib2->getPeerState(), PeerUpdateState::JOINED_RUNNING);
-  EXPECT_TRUE(group_->isPeerInSync(2));
-  EXPECT_FALSE(group_->getDetachedPeers().contains(adjRib2));
-
-  // Peer 0: DFP — consumer is ready (joined at group's ready position), PL
-  // empty
-  adjRib0->clearPackingList();
-
-  // Unblock peer 0 — DFP path
-  group_->markPeerUnblocked(adjRib0);
-  evb_->loopOnce();
-
-  EXPECT_EQ(adjRib0->getPeerState(), PeerUpdateState::DETACHED_READY_TO_JOIN);
-  EXPECT_TRUE(adjRib0->isAdjRibFlagSet(AdjRib::IS_DETACHED_FAST_PEER));
-
-  // Publish a new CL item — pends peer 1's consumer so it's no longer ready
-  publishChangeItem(folly::CIDRNetwork{folly::IPAddress("20.0.0.0"), 24});
-
-  // Advance group's version so peer 1 fails the DFP version check
-  group_->setLastSeenRibVersion(group_->getLastSeenRibVersion() + 1);
-
-  // Clear peer 1's PL — tests don't have boundedAdjRibOutQueue_ for sending
-  adjRib1->clearPackingList();
-
-  // Unblock peer 1 — DSP path (consumer not ready, has pending CL item)
-  group_->markPeerUnblocked(adjRib1);
-  evb_->loopOnce();
-
-  // Peer 1 should NOT transition to DETACHED_READY_TO_JOIN yet
-  EXPECT_NE(adjRib1->getPeerState(), PeerUpdateState::DETACHED_READY_TO_JOIN);
-
-  // Clean up
-  adjRib0->deactivateDetachedModeProcessing();
-  adjRib1->deactivateDetachedModeProcessing();
-}
-
-/*
  * Peer detaches, reaches DETACHED_READY_TO_JOIN, then rejoins via
  * checkAndAcceptReadyToJoinPeers. Block info should be reset on rejoin,
  * not on detach activation.
@@ -2966,7 +3622,7 @@ TEST_F(UpdateGroupDetachLifecycleTest, BlockCountResetOnRejoin) {
  * Peer cannot rejoin — should transition back to DETACHED_RUNNING and
  * reschedule packing timers.
  */
-TEST_F(UpdateGroupDetachLifecycleTest, CheckAndAcceptDSPPeerGroupNotReady) {
+TEST_F(UpdateGroupDetachLifecycleTest, DSPPeerRejoinsWhenGroupConsumerReady) {
   auto adjRib0 = createAndRegisterPeer(0);
   auto adjRib1 = createAndRegisterPeer(1);
   setUpJoinedRunningPeer(adjRib1, 1);
@@ -3006,7 +3662,7 @@ TEST_F(UpdateGroupDetachLifecycleTest, CheckAndAcceptDSPPeerGroupNotReady) {
  * and peer's consumer has a null marker (no changes published). Peer can
  * rejoin since both consumers are ready.
  */
-TEST_F(UpdateGroupDetachLifecycleTest, CheckAndAcceptDSPPeerConsumerNotReady) {
+TEST_F(UpdateGroupDetachLifecycleTest, DSPPeerRejoinsWhenPeerConsumerReady) {
   auto adjRib0 = createAndRegisterPeer(0);
   auto adjRib1 = createAndRegisterPeer(1);
   setUpJoinedRunningPeer(adjRib1, 1);
@@ -3069,7 +3725,7 @@ TEST_F(
     UpdateGroupDetachedPeerTest,
     GetRibEntryWithUpdateGroupCopiesSharedEntry) {
   auto adjRib = createAndRegisterPeer(0);
-  // Register a second peer so copyEntryForPeer uses peer owner key.
+  // Register a second peer so copyEntryForOwner uses peer owner key.
   auto adjRib1 = createAndRegisterPeer(1);
   adjRib->setDetachedRibVersion(10);
 
@@ -3146,17 +3802,9 @@ TEST_F(UpdateGroupDetachedPeerTest, DetachSlowPeerSetsEgressEoRWhenFlagIsTrue) {
       std::make_shared<ChangeTracker<ShadowRibEntry>>("test_tracker");
   ConsumerBitmap addPathBitmap;
   ConsumerBitmap nonAddPathBitmap;
-  auto groupConsumer = std::make_shared<AdjRibOutGroupConsumer>(
-      changeTracker,
-      group_,
-      "test_group_consumer",
-      *evb_,
-      addPathBitmap,
-      nonAddPathBitmap);
-  groupConsumer->registerWithTracker();
-  groupConsumer->setBitmap();
-  group_->setChangeListConsumer(groupConsumer);
   group_->setChangeListTracker(changeTracker, addPathBitmap, nonAddPathBitmap);
+  group_->registerGroupConsumer();
+  auto groupConsumer = group_->getChangeListConsumer();
 
   ShadowRibEntry entry;
   entry.prefix = folly::CIDRNetwork{folly::IPAddress("10.0.0.0"), 24};
@@ -3171,13 +3819,23 @@ TEST_F(UpdateGroupDetachedPeerTest, DetachSlowPeerSetsEgressEoRWhenFlagIsTrue) {
   group_->setSyncBitForTesting(1);
   group_->markPeerBlocked(adjRib0);
 
-  EXPECT_FALSE(adjRib0->egressEoRsPending_);
+  EXPECT_FALSE(adjRib0->egressEoRsPending());
 
-  group_->detachSlowPeer(adjRib0, true /* sendWithEoR */);
+  /*
+   * In-sync peers are marked as owing EoR when the EoR becomes owed
+   * (processRibOutAnnouncement); simulate that here. The peer has not committed
+   * its EoR (it is blocked), so it must RETAIN the pending EoR through
+   * slow-peer detach -- detach must neither clear nor re-arm it.
+   */
+  group_->groupKey_.afiIpv4Negotiated = true;
+  group_->egressEoRPendingV4_ = true;
+  adjRib0->setEgressEoRsPending(
+      group_->egressEoRPendingV4_, group_->egressEoRPendingV6_);
+  group_->detachSlowPeer(adjRib0);
 
-  /* Peer should have egressEoRsPending set via sendWithEoR */
+  /* Peer retains its (uncommitted) pending EoR across detach. */
   EXPECT_EQ(adjRib0->getPeerState(), PeerUpdateState::DETACHED_BLOCKED);
-  EXPECT_TRUE(adjRib0->egressEoRsPending_);
+  EXPECT_TRUE(adjRib0->egressEoRsPending());
 
   /* Clean up consumers before group destruction */
   adjRib0->deactivateDetachedModeProcessing();
@@ -3203,18 +3861,9 @@ TEST_F(
   ConsumerBitmap addPathBitmap;
   ConsumerBitmap nonAddPathBitmap;
 
-  auto groupConsumer = std::make_shared<AdjRibOutGroupConsumer>(
-      changeTracker,
-      group_,
-      "test_group_consumer",
-      *evb_,
-      addPathBitmap,
-      nonAddPathBitmap);
-  groupConsumer->registerWithTracker();
-  groupConsumer->setBitmap();
-
-  group_->setChangeListConsumer(groupConsumer);
   group_->setChangeListTracker(changeTracker, addPathBitmap, nonAddPathBitmap);
+  group_->registerGroupConsumer();
+  auto groupConsumer = group_->getChangeListConsumer();
 
   ShadowRibEntry entry;
   entry.prefix = folly::CIDRNetwork{folly::IPAddress("10.0.0.0"), 24};
@@ -3228,13 +3877,15 @@ TEST_F(
   group_->setSyncBitForTesting(1);
   group_->markPeerBlocked(adjRib0);
 
-  EXPECT_FALSE(adjRib0->egressEoRsPending_);
+  EXPECT_FALSE(adjRib0->egressEoRsPending());
 
   group_->detachSlowPeer(adjRib0);
 
-  /* Peer should still not have egressEoRsPending (sendWithEoR defaults false)
+  /*
+   * The group has no EoR pending and the peer was never marked as owing one, so
+   * it has nothing pending after detach.
    */
-  EXPECT_FALSE(adjRib0->egressEoRsPending_);
+  EXPECT_FALSE(adjRib0->egressEoRsPending());
 
   /* Clean up consumers before group destruction */
   adjRib0->deactivateDetachedModeProcessing();
@@ -3246,17 +3897,16 @@ TEST_F(
 }
 
 /**
- * Test: Initial RIB dump with sendWithEoR=true threads the flag through
- * the distribution path. When a slow peer gets detached during distribution,
- * sendWithEoR is used to set egressEoRsPending_ on the detached peer.
+ * Test: Initial RIB dump with sendWithEoR=true. When a slow peer gets detached
+ * during distribution, it inherits the group's pending egress EoR.
  *
  * Flow:
  *   1. walkAndProcessShadowRib(true) populates packing list
- *   2. processRibOutAnnouncement sets egressEoRsPending_ = true
+ *   2. processRibOutAnnouncement sets the group's per-AFI egress EoR pending
+ * and marks every in-sync peer's flags via setEgressEorsPendingSyncPeers
  *   3. buildAndSendGroupBgpMessages(sendWithEoR=true) distributes messages
  *   4. distributeMessageToInSyncPeers finds peer0's queue blocked
- *   5. markPeerBlocked triggers detachSlowPeer(adjRib, sendWithEoR=true)
- *   6. detachSlowPeer sets egressEoRsPending_ on peer via sendWithEoR
+ *   5. markPeerBlocked triggers detachSlowPeer(adjRib)
  */
 TEST_F(UpdateGroupDetachedPeerTest, RibWalkDetachCopiesEgressEoRsPending) {
   /* Build shadow RIB with one entry */
@@ -3324,18 +3974,9 @@ TEST_F(UpdateGroupDetachedPeerTest, RibWalkDetachCopiesEgressEoRsPending) {
   ConsumerBitmap addPathBitmap;
   ConsumerBitmap nonAddPathBitmap;
 
-  auto groupConsumer = std::make_shared<AdjRibOutGroupConsumer>(
-      changeTracker,
-      group_,
-      "test_group_consumer",
-      *evb_,
-      addPathBitmap,
-      nonAddPathBitmap);
-  groupConsumer->registerWithTracker();
-  groupConsumer->setBitmap();
-
-  group_->setChangeListConsumer(groupConsumer);
   group_->setChangeListTracker(changeTracker, addPathBitmap, nonAddPathBitmap);
+  group_->registerGroupConsumer();
+  auto groupConsumer = group_->getChangeListConsumer();
 
   /* Publish an item so the consumer has a non-null marker */
   ShadowRibEntry clEntry;
@@ -3351,30 +3992,30 @@ TEST_F(UpdateGroupDetachedPeerTest, RibWalkDetachCopiesEgressEoRsPending) {
   group_->setSyncBitForTesting(1);
 
   /* Peer should not have egressEoRsPending before rib walk */
-  EXPECT_FALSE(adjRib0->egressEoRsPending_);
+  EXPECT_FALSE(adjRib0->egressEoRsPending());
 
   /* Walk shadow RIB with sendWithEoR=true (initial dump) */
   group_->walkAndProcessShadowRib(true /* sendWithEoR */);
 
   /*
    * Pump the event loop to let buildAndSendGroupBgpMessages run.
-   * sendWithEoR=true is threaded through the distribution path.
    * This will:
    *   1. Try to distribute messages
    *   2. peer0's queue is blocked -> markPeerBlocked -> detachSlowPeer
-   *   3. detachSlowPeer sets egressEoRsPending_ on peer via sendWithEoR
+   *   3. peer0 was marked as owing EoR at intake (processRibOutAnnouncement)
+   * and never committed it (blocked), so it retains its pending EoR on detach
    */
   evb_->loopOnce();
 
-  /* Peer0 should have been detached and inherited egressEoRsPending_ */
+  /* Peer0 should have been detached and inherited egressEoRsPending */
   EXPECT_TRUE(group_->getDetachedPeers().contains(adjRib0));
-  EXPECT_TRUE(adjRib0->egressEoRsPending_);
+  EXPECT_TRUE(adjRib0->egressEoRsPending());
 
   /*
-   * Group's egressEoRsPending_ should be reset after
+   * Group's egressEoRsPending should be reset after
    * buildAndSendGroupBgpMessages
    */
-  EXPECT_FALSE(group_->egressEoRsPending_);
+  EXPECT_FALSE(group_->egressEoRsPending());
 
   /* Close blocked queue and pump evb so deferredPushToPeer can exit */
   blockedQueue->close();
@@ -3387,6 +4028,56 @@ TEST_F(UpdateGroupDetachedPeerTest, RibWalkDetachCopiesEgressEoRsPending) {
   groupConsumer->deregisterFromTracker();
   group_->resetChangeListConsumer();
   groupConsumer.reset();
+}
+
+/*
+ * Regression test for a duplicate-EoR race on detach.
+ *
+ * The group's per-AFI flag (egressEoRPendingV4_) means "owed to the in-sync set
+ * as a whole" and is cleared only after waitForAllPendingPushes() drains every
+ * peer. A peer's own EGRESS_EOR_PENDING_<afi> flag is cleared the instant THAT
+ * peer's EoR push resolves (markEgressEoRSent). These are not atomic: a peer
+ * can have its v4 EoR already committed (per-peer flag cleared) while the group
+ * flag is still set because another peer's push is still pending.
+ *
+ * If such a peer detaches in that window, detachPeer must NOT set the v4 flag
+ * pending again from the still-true group flag -- doing so makes the detached
+ * peer's sendPendingEoRs emit a SECOND v4 EoR. It must still keep the v6 flag,
+ * which was never committed (so there is no missed EoR either).
+ */
+TEST_F(UpdateGroupDetachedPeerTest, DetachDoesNotResendCommittedEgressEoR) {
+  auto adjRib0 = createAndRegisterPeer(0);
+  adjRib0->setPeerState(PeerUpdateState::JOINED_RUNNING);
+  group_->setSyncBitForTesting(0);
+
+  /*
+   * Group still owes both AFIs to the in-sync set as a whole (another peer's
+   * push has not landed, so distributePendingEoRs has not cleared these yet).
+   */
+  group_->groupKey_.afiIpv4Negotiated = true;
+  group_->groupKey_.afiIpv6Negotiated = true;
+  group_->egressEoRPendingV4_ = true;
+  group_->egressEoRPendingV6_ = true;
+
+  /*
+   * Peer0 was marked to send both AFIs (distributePendingEoRs step A), then its
+   * v4 EoR push resolved inline -> markEgressEoRSent cleared peer0's v4 flag.
+   * v6 is still pending for peer0 (its v6 push has not resolved).
+   */
+  adjRib0->setEgressEoRsPending(true /* v4 */, true /* v6 */);
+  adjRib0->markEgressEoRSent(nettools::bgplib::BgpUpdateAfi::AFI_IPv4);
+  ASSERT_FALSE(adjRib0->isAdjRibFlagSet(AdjRib::EGRESS_EOR_PENDING_V4));
+  ASSERT_TRUE(adjRib0->isAdjRibFlagSet(AdjRib::EGRESS_EOR_PENDING_V6));
+
+  /* Peer0 detaches before the group clears its v4 flag. */
+  group_->detachPeer(adjRib0, AdjRibOutGroup::DetachReason::Blocking);
+
+  /*
+   * v4 was already handed off to peer0 -> must NOT be re-armed (no duplicate
+   * EoR). v6 was never committed -> must remain owed (no missed EoR).
+   */
+  EXPECT_FALSE(adjRib0->isAdjRibFlagSet(AdjRib::EGRESS_EOR_PENDING_V4));
+  EXPECT_TRUE(adjRib0->isAdjRibFlagSet(AdjRib::EGRESS_EOR_PENDING_V6));
 }
 
 /*
@@ -3914,7 +4605,7 @@ TEST_F(
  * 5. Blocked bitmap cleared
  * 6. Slow peer duration timer cancelled
  * 7. Detached consumer registered
- * 8. EoR state propagated if group has pending EoR
+ * 8. EoR state retained if peer still owes EoR (not yet committed)
  */
 TEST_F(UpdateGroupDetachLifecycleTest, DetachPeerSetsAllExpectedState) {
   auto adjRib0 = createAndRegisterPeer(0);
@@ -3933,8 +4624,13 @@ TEST_F(UpdateGroupDetachLifecycleTest, DetachPeerSetsAllExpectedState) {
   // Mark peer as blocked in the group bitmap
   BitmapUtils::setBit(group_->adjRibBlockedBitmap_, 0);
 
-  // Set group EoR pending
-  group_->egressEoRsPending_ = true;
+  // Set group EoR pending and mark the in-sync peer as owing it, mirroring the
+  // intake marking in processRibOutAnnouncement. adjRib0 has not committed its
+  // EoR, so it must retain it across detach (detachPeer must not clear it).
+  group_->egressEoRPendingV4_ = true;
+  group_->egressEoRPendingV6_ = true;
+  adjRib0->setEgressEoRsPending(
+      group_->egressEoRPendingV4_, group_->egressEoRPendingV6_);
 
   // Add prefix to group PL so clonePackingList has something to clone
   auto attrs = std::make_shared<BgpPath>(*buildBgpPathFields(1, 1, 0, 0));
@@ -3946,7 +4642,7 @@ TEST_F(UpdateGroupDetachLifecycleTest, DetachPeerSetsAllExpectedState) {
   ASSERT_TRUE(BitmapUtils::isBitSet(group_->adjRibBlockedBitmap_, 0));
   ASSERT_EQ(adjRib0->getStats().getPostOutPrefixCount(), 0);
 
-  group_->detachPeer(adjRib0);
+  group_->detachPeer(adjRib0, AdjRibOutGroup::DetachReason::Blocking);
 
   // 1. Egress prefix counts copied from group
   EXPECT_EQ(
@@ -3978,12 +4674,115 @@ TEST_F(UpdateGroupDetachLifecycleTest, DetachPeerSetsAllExpectedState) {
   // 7. Detached consumer registered
   EXPECT_NE(adjRib0->getDetachedConsumer(), nullptr);
 
-  // 8. EoR state propagated (group had egressEoRsPending_ = true)
-  EXPECT_TRUE(adjRib0->egressEoRsPending_);
+  // 8. EoR state retained (peer owed EoR and had not committed it)
+  EXPECT_TRUE(adjRib0->egressEoRsPending());
 
   // Peer 1 unaffected
   EXPECT_TRUE(group_->isPeerInSync(1));
   EXPECT_FALSE(group_->getDetachedPeers().contains(adjRib1));
+}
+
+/*
+ * A detached peer with lastSeenRibVersion > group's transitions to
+ * DETACHED_READY_TO_JOIN after PL drain via maybeTransitionDetachedReadyToJoin.
+ */
+TEST_F(
+    UpdateGroupDetachLifecycleTest,
+    PeerAheadOfGroupTransitionsToReadyToJoin) {
+  auto adjRib0 = createAndRegisterPeer(0);
+  auto adjRib1 = createAndRegisterPeer(1);
+  setUpJoinedRunningPeer(adjRib0, 0);
+  setUpJoinedRunningPeer(adjRib1, 1);
+
+  adjRib0->setPeerState(PeerUpdateState::DETACHED_INIT_DUMP);
+  adjRib0->setLastSeenRibVersion(100);
+  group_->setLastSeenRibVersion(50);
+  group_->markPeerDetached(adjRib0);
+
+  EXPECT_TRUE(adjRib0->attrToPrefixMap_.empty());
+
+  adjRib0->maybeTransitionDetachedReadyToJoin();
+
+  EXPECT_EQ(adjRib0->getPeerState(), PeerUpdateState::DETACHED_READY_TO_JOIN);
+  EXPECT_FALSE(adjRib0->isAdjRibFlagSet(AdjRib::IS_DETACHED_FAST_PEER));
+  EXPECT_EQ(adjRib1->getPeerState(), PeerUpdateState::JOINED_RUNNING);
+}
+
+/*
+ * checkAndAcceptReadyToJoinPeers does not reschedule packing timers for a
+ * DETACHED_READY_TO_JOIN peer whose lastSeenRibVersion > group's. The peer
+ * stays in DETACHED_READY_TO_JOIN.
+ */
+TEST_F(
+    UpdateGroupDetachLifecycleTest,
+    PeerAheadOfGroupDoesNotProceedOnChangelist) {
+  auto adjRib0 = createAndRegisterPeer(0);
+  auto adjRib1 = createAndRegisterPeer(1);
+  setUpJoinedRunningPeer(adjRib1, 1);
+
+  adjRib0->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+  adjRib0->setLastSeenRibVersion(100);
+  group_->setLastSeenRibVersion(50);
+  group_->markPeerDetached(adjRib0);
+  setUpReadyPeerConsumer(adjRib0);
+
+  // Group consumer is NOT at end of CL
+  publishChangeItem(folly::CIDRNetwork{folly::IPAddress("10.0.0.0"), 24});
+
+  group_->checkAndAcceptReadyToJoinPeers();
+
+  // Peer should stay in DETACHED_READY_TO_JOIN, not set to DETACHED_RUNNING
+  EXPECT_EQ(adjRib0->getPeerState(), PeerUpdateState::DETACHED_READY_TO_JOIN);
+}
+
+/*
+ * DSP defer path: when a peer reaches the DSP rejoin point via
+ * maybeTransitionDetachedReadyToJoin while the group's packing list still has
+ * undistributed entries, maybeAcceptDSPPeer defers acceptance. The peer
+ * stays DETACHED_READY_TO_JOIN (not in sync) until the group drains its packing
+ * list, at which point checkAndAcceptReadyToJoinPeers accepts it.
+ */
+TEST_F(
+    UpdateGroupDetachLifecycleTest,
+    DSPRejoinDeferredUntilGroupPackingListDrains) {
+  auto adjRib0 = createAndRegisterPeer(0);
+  auto adjRib1 = createAndRegisterPeer(1);
+  setUpJoinedRunningPeer(adjRib1, 1);
+
+  /*
+   * Peer 0 has caught up to the group's CL marker (ready to rejoin). Use
+   * DETACHED_INIT_DUMP so maybeTransitionDetachedReadyToJoin deterministically
+   * takes the DSP rejoin path (the DFP fast-path is skipped for init-dump
+   * peers) and calls maybeAcceptDSPPeer.
+   */
+  adjRib0->setPeerState(PeerUpdateState::DETACHED_INIT_DUMP);
+  group_->markPeerDetached(adjRib0);
+  setUpReadyPeerConsumer(adjRib0); // peer CL marker == group marker (nullptr)
+  setGroupConsumerReady();
+  ASSERT_TRUE(adjRib0->attrToPrefixMap_.empty());
+  ASSERT_TRUE(adjRib0->isReadyToRejoinGroup());
+
+  // The group still owes an undistributed entry in its packing list.
+  addPrefixToGroupPL(kV4Prefix1);
+  ASSERT_FALSE(group_->getAttrToPrefixMap().empty());
+
+  // DSP rejoin attempt: acceptance is deferred because the group PL is dirty.
+  adjRib0->maybeTransitionDetachedReadyToJoin();
+
+  EXPECT_EQ(adjRib0->getPeerState(), PeerUpdateState::DETACHED_READY_TO_JOIN);
+  EXPECT_FALSE(group_->isPeerInSync(0));
+  EXPECT_TRUE(group_->getDetachedPeers().contains(adjRib0));
+
+  // Once the group's packing list drains, checkAndAcceptReadyToJoinPeers picks
+  // up the deferred peer and accepts it.
+  group_->attrToPrefixMap_.clear();
+  ASSERT_TRUE(group_->getAttrToPrefixMap().empty());
+
+  group_->checkAndAcceptReadyToJoinPeers();
+
+  EXPECT_EQ(adjRib0->getPeerState(), PeerUpdateState::JOINED_RUNNING);
+  EXPECT_TRUE(group_->isPeerInSync(0));
+  EXPECT_FALSE(group_->getDetachedPeers().contains(adjRib0));
 }
 
 } // namespace facebook::bgp

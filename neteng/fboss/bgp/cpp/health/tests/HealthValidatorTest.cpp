@@ -1277,3 +1277,51 @@ CO_TEST_F(HealthValidatorBBTest, PlannedExit_Skipped_OnBBPlatform) {
   }
   EXPECT_EQ(*check->status(), HealthCheckStatus::SKIPPED);
 }
+
+TEST(HealthValidatorPrefixLimitDropsTest, PassWhenNoDrops) {
+  TBgpSession s1;
+  s1.peer_addr() = "1.2.3.4";
+  TBgpSession s2;
+  s2.peer_addr() = "5.6.7.8";
+  s2.prepolicy_rcvd_dropped_prefix_count() = 0;
+
+  auto result = HealthValidator::evaluatePrefixLimitDrops({s1, s2});
+  EXPECT_EQ(*result.status(), HealthCheckStatus::PASS);
+  EXPECT_EQ(*result.observedValue(), 0.0);
+}
+
+TEST(HealthValidatorPrefixLimitDropsTest, WarnListsExactPerPeerCounts) {
+  TBgpSession dropper1;
+  dropper1.peer_addr() = "1.2.3.4";
+  dropper1.prepolicy_rcvd_dropped_prefix_count() = 50;
+
+  TBgpSession dropper2;
+  dropper2.peer_addr() = "5.6.7.8";
+  dropper2.prepolicy_rcvd_dropped_prefix_count() = 30;
+
+  TBgpSession clean;
+  clean.peer_addr() = "9.9.9.9";
+
+  auto result =
+      HealthValidator::evaluatePrefixLimitDrops({dropper1, dropper2, clean});
+
+  EXPECT_EQ(*result.status(), HealthCheckStatus::WARN);
+  EXPECT_EQ(*result.observedValue(), 2.0);
+  const auto& msg = *result.message();
+  EXPECT_NE(msg.find("1.2.3.4 (PR dropped 50)"), std::string::npos);
+  EXPECT_NE(msg.find("5.6.7.8 (PR dropped 30)"), std::string::npos);
+  // The clean peer must not be listed.
+  EXPECT_EQ(msg.find("9.9.9.9"), std::string::npos);
+}
+
+CO_TEST_F(HealthValidatorTest, Peer_PrefixLimitDrops_SkippedWhenNoPeerMgr) {
+  // The fixture validator has a null PeerManager, so per-peer enumeration is
+  // skipped rather than failed.
+  auto report = co_await validator_->generateReport();
+  auto* check = findCheck(report, HealthCheckId::PEER_PREFIX_LIMIT_DROPS);
+  EXPECT_NE(check, nullptr);
+  if (!check) {
+    co_return;
+  }
+  EXPECT_EQ(*check->status(), HealthCheckStatus::SKIPPED);
+}

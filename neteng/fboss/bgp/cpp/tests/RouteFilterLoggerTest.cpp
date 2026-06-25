@@ -14,13 +14,16 @@
  * limitations under the License.
  */
 
+#include <gflags/gflags.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include <folly/Random.h>
 
-#include "neteng/fboss/bgp/cpp/adjrib/RouteFilterLogger.h"
+#include "neteng/fboss/bgp/cpp/adjrib/facebook/RouteFilterLogger.h"
 #include "neteng/fboss/bgp/cpp/tests/MockScubaData.h"
+
+DECLARE_bool(disable_route_filter_scuba_logging);
 
 namespace facebook::bgp {
 using namespace ::testing;
@@ -28,7 +31,7 @@ using namespace ::testing;
 TEST(RouteFilterLoggerTest, BasicTest) {
   // test with nullptr scuba logger to verfiy no crash
   {
-    auto logger = std::make_unique<RouteFilterLogger>(
+    auto logger = std::make_unique<ScubaRouteFilterLogger>(
         "rsw001", "rsw.*", "fsw001", nullptr);
     EXPECT_EQ(
         0,
@@ -57,7 +60,7 @@ TEST(RouteFilterLoggerTest, BasicTest) {
               return 1;
             }));
 
-    auto logger = std::make_unique<RouteFilterLogger>(
+    auto logger = std::make_unique<ScubaRouteFilterLogger>(
         "rsw001", "rsw.*", "fsw001", mockScuba);
     EXPECT_LT(
         0,
@@ -75,13 +78,30 @@ TEST(RouteFilterLoggerTest, BasicTest) {
     auto scuba = std::make_shared<rfe::ScubaData>(
         fmt::format("there_is_no_way_this_table_exists_{}", rand32));
 
-    auto logger =
-        std::make_unique<RouteFilterLogger>("rsw001", "rsw.*", "fsw001", scuba);
+    auto logger = std::make_unique<ScubaRouteFilterLogger>(
+        "rsw001", "rsw.*", "fsw001", scuba);
     EXPECT_LT(
         0,
         logger->log(
             true, folly::CIDRNetwork("192.0.2.1", 32), true, false, {}));
   }
+}
+
+// When disable_route_filter_scuba_logging is set,
+// createRouteFilterLoggerFactory still returns a usable factory, but the
+// loggers it creates have no Scuba backend, so log() is inert and returns 0.
+TEST(RouteFilterLoggerTest, DisabledFactoryProducesInertLogger) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_disable_route_filter_scuba_logging = true;
+
+  auto factory = createRouteFilterLoggerFactory();
+  ASSERT_NE(nullptr, factory);
+
+  auto logger = factory->create("rsw001", "rsw.*", "fsw001");
+  ASSERT_NE(nullptr, logger);
+  EXPECT_EQ(
+      0,
+      logger->log(true, folly::CIDRNetwork("192.0.2.1", 32), true, false, {}));
 }
 
 } // namespace facebook::bgp

@@ -69,6 +69,17 @@ class HealthValidator {
    */
   folly::coro::Task<neteng::fboss::bgp::thrift::THealthReport> generateReport();
 
+  /*
+   * Build the per-peer prefix-limit drop health result from a set of sessions.
+   * WARN (listing each affected peer with its exact PR dropped count) when any
+   * peer has dropped received routes due to its configured per-peer prefix
+   * limit, else PASS. Pure and static so it can be unit tested without a live
+   * PeerManager.
+   */
+  static neteng::fboss::bgp::thrift::THealthCheckResult
+  evaluatePrefixLimitDrops(
+      const std::vector<neteng::fboss::bgp::thrift::TBgpSession>& sessions);
+
  protected:
   using THealthCheckResult = neteng::fboss::bgp::thrift::THealthCheckResult;
   using TModuleHealthReport = neteng::fboss::bgp::thrift::TModuleHealthReport;
@@ -82,7 +93,7 @@ class HealthValidator {
   TModuleHealthReport checkGlobalTaskThread();
   TModuleHealthReport checkGlobalConvergence();
   TModuleHealthReport checkSessionManager();
-  TModuleHealthReport checkPeerManager();
+  folly::coro::Task<TModuleHealthReport> checkPeerManager();
   folly::coro::Task<TModuleHealthReport> checkRib();
   /* Virtual: BB override consults its NetlinkWrapper. Base returns
    * SKIPPED when NHT is disabled in config, FAIL when NHT is enabled

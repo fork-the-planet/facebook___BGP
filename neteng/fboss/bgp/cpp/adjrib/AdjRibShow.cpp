@@ -71,17 +71,22 @@ void AdjRib::getNetworks(
       }
       break;
     case RouteFilterType::PRE_FILTER_ADVERTISED:
-    case RouteFilterType::POST_FILTER_ADVERTISED:
+    case RouteFilterType::POST_FILTER_ADVERTISED: {
+      // With update groups, an in-sync peer's RIB-OUT entries live under the
+      // group owner key; resolve the entry visible to this peer (peer-owned,
+      // shared group, or omitted) via the version-gated resolver.
+      const auto sharingVersion = getRibOutSharingVersion();
       if (!sendAddPath_) {
         for (auto itr = adjRibOutGroup_->LiteTree_.begin();
              itr != adjRibOutGroup_->LiteTree_.end();
              itr++) {
-          auto ownerItr = itr->value().find(getPeerOwnerKey());
-          if (ownerItr == itr->value().end()) {
+          const auto* adjRibEntry = adjRibOutGroup_->resolveLiteEntryForPeer(
+              itr->value(), getPeerOwnerKey(), sharingVersion);
+          if (!adjRibEntry) {
             continue;
           }
           const folly::CIDRNetwork prefix = {itr.ipAddress(), itr.masklen()};
-          auto pfxAndPath = convertEntryToPath(prefix, *ownerItr->second, type);
+          auto pfxAndPath = convertEntryToPath(prefix, *adjRibEntry, type);
           if (pfxAndPath.has_value()) {
             prefixToPath[pfxAndPath.value().first] = pfxAndPath.value().second;
           }
@@ -90,21 +95,22 @@ void AdjRib::getNetworks(
         for (auto itr = adjRibOutGroup_->PathTree_.begin();
              itr != adjRibOutGroup_->PathTree_.end();
              itr++) {
-          auto ownerItr = itr->value().find(getPeerOwnerKey());
-          if (ownerItr == itr->value().end()) {
-            continue;
-          }
           const folly::CIDRNetwork prefix = {itr.ipAddress(), itr.masklen()};
-          for (const auto& [_, adjRibEntry] : ownerItr->second) {
-            auto pfxAndPath = convertEntryToPath(prefix, *adjRibEntry, type);
-            if (pfxAndPath.has_value()) {
-              prefixToPath[pfxAndPath.value().first] =
-                  pfxAndPath.value().second;
-            }
-          }
+          adjRibOutGroup_->resolvePathEntriesForPeer(
+              itr->value(),
+              getPeerOwnerKey(),
+              sharingVersion,
+              [&](uint32_t /*pathId*/, const AdjRibEntry& adjRibEntry) {
+                auto pfxAndPath = convertEntryToPath(prefix, adjRibEntry, type);
+                if (pfxAndPath.has_value()) {
+                  prefixToPath[pfxAndPath.value().first] =
+                      pfxAndPath.value().second;
+                }
+              });
         }
       }
       break;
+    }
     default:
       return;
   }
@@ -148,18 +154,23 @@ void AdjRib::getNetworks2(
       }
       break;
     case RouteFilterType::PRE_FILTER_ADVERTISED:
-    case RouteFilterType::POST_FILTER_ADVERTISED:
+    case RouteFilterType::POST_FILTER_ADVERTISED: {
+      // With update groups, an in-sync peer's RIB-OUT entries live under the
+      // group owner key; resolve the entry visible to this peer (peer-owned,
+      // shared group, or omitted) via the version-gated resolver.
+      const auto sharingVersion = getRibOutSharingVersion();
       if (!sendAddPath_) {
         for (auto itr = adjRibOutGroup_->LiteTree_.begin();
              itr != adjRibOutGroup_->LiteTree_.end();
              itr++) {
-          auto ownerItr = itr->value().find(getPeerOwnerKey());
-          if (ownerItr == itr->value().end()) {
+          const auto* adjRibEntry = adjRibOutGroup_->resolveLiteEntryForPeer(
+              itr->value(), getPeerOwnerKey(), sharingVersion);
+          if (!adjRibEntry) {
             continue;
           }
           const folly::CIDRNetwork prefix = {itr.ipAddress(), itr.masklen()};
-          auto pfxAndPath = convertEntryToPath(
-              prefix, *ownerItr->second, type, kDefaultPathID);
+          auto pfxAndPath =
+              convertEntryToPath(prefix, *adjRibEntry, type, kDefaultPathID);
           if (pfxAndPath.has_value()) {
             prefixToPath[pfxAndPath.value().first].push_back(
                 pfxAndPath.value().second);
@@ -169,22 +180,23 @@ void AdjRib::getNetworks2(
         for (auto itr = adjRibOutGroup_->PathTree_.begin();
              itr != adjRibOutGroup_->PathTree_.end();
              itr++) {
-          auto ownerItr = itr->value().find(getPeerOwnerKey());
-          if (ownerItr == itr->value().end()) {
-            continue;
-          }
           const folly::CIDRNetwork prefix = {itr.ipAddress(), itr.masklen()};
-          for (const auto& [network, adjRibEntry] : ownerItr->second) {
-            auto pfxAndPath =
-                convertEntryToPath(prefix, *adjRibEntry, type, network);
-            if (pfxAndPath.has_value()) {
-              prefixToPath[pfxAndPath.value().first].emplace_back(
-                  pfxAndPath.value().second);
-            }
-          }
+          adjRibOutGroup_->resolvePathEntriesForPeer(
+              itr->value(),
+              getPeerOwnerKey(),
+              sharingVersion,
+              [&](uint32_t pathId, const AdjRibEntry& adjRibEntry) {
+                auto pfxAndPath =
+                    convertEntryToPath(prefix, adjRibEntry, type, pathId);
+                if (pfxAndPath.has_value()) {
+                  prefixToPath[pfxAndPath.value().first].emplace_back(
+                      pfxAndPath.value().second);
+                }
+              });
         }
       }
       break;
+    }
     default:
       return;
   }
@@ -338,17 +350,22 @@ void AdjRib::getDryRunNetworks(
         }
       }
       break;
-    case RouteFilterType::POST_FILTER_ADVERTISED:
+    case RouteFilterType::POST_FILTER_ADVERTISED: {
+      // With update groups, an in-sync peer's RIB-OUT entries live under the
+      // group owner key; resolve the entry visible to this peer (peer-owned,
+      // shared group, or omitted) via the version-gated resolver.
+      const auto sharingVersion = getRibOutSharingVersion();
       for (auto itr = adjRibOutGroup_->LiteTree_.begin();
            itr != adjRibOutGroup_->LiteTree_.end();
            itr++) {
-        auto ownerItr = itr->value().find(getPeerOwnerKey());
-        if (ownerItr == itr->value().end()) {
+        const auto* adjRibEntry = adjRibOutGroup_->resolveLiteEntryForPeer(
+            itr->value(), getPeerOwnerKey(), sharingVersion);
+        if (!adjRibEntry) {
           continue;
         }
         const folly::CIDRNetwork prefix = {itr.ipAddress(), itr.masklen()};
         auto pfxAndPath = getDryRunPaths(
-            policyManager, peerConfig, prefix, *ownerItr->second, type);
+            policyManager, peerConfig, prefix, *adjRibEntry, type);
         if (pfxAndPath.has_value()) {
           prefixToPath[pfxAndPath.value().first] = pfxAndPath.value().second;
         }
@@ -356,23 +373,22 @@ void AdjRib::getDryRunNetworks(
       for (auto itr = adjRibOutGroup_->PathTree_.begin();
            itr != adjRibOutGroup_->PathTree_.end();
            itr++) {
-        auto ownerItr = itr->value().find(getPeerOwnerKey());
-        if (ownerItr == itr->value().end()) {
-          continue;
-        }
         const folly::CIDRNetwork prefix = {itr.ipAddress(), itr.masklen()};
-        for (const auto& [_, adjRibEntry] : ownerItr->second) {
-          TBgpPath tPath;
-          TIpPrefix tPrefix;
-
-          auto pfxAndPath = getDryRunPaths(
-              policyManager, peerConfig, prefix, *adjRibEntry, type);
-          if (pfxAndPath.has_value()) {
-            prefixToPath[pfxAndPath.value().first] = pfxAndPath.value().second;
-          }
-        }
+        adjRibOutGroup_->resolvePathEntriesForPeer(
+            itr->value(),
+            getPeerOwnerKey(),
+            sharingVersion,
+            [&](uint32_t /*pathId*/, const AdjRibEntry& adjRibEntry) {
+              auto pfxAndPath = getDryRunPaths(
+                  policyManager, peerConfig, prefix, adjRibEntry, type);
+              if (pfxAndPath.has_value()) {
+                prefixToPath[pfxAndPath.value().first] =
+                    pfxAndPath.value().second;
+              }
+            });
       }
       break;
+    }
     default:
       return;
   }

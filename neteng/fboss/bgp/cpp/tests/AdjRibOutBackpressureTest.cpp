@@ -138,11 +138,14 @@ class SendBgpMessagesFixture : public AdjRibOutboundFixture {
     adjRib_->enableEgressQueueBackpressure_ = true;
 
     // Set up EoR sent adjRib state.
-    adjRib_->egressEoRsPending_ = eorPending;
     adjRib_->egressEoRsSent_ = eorSent;
 
     adjRib_->isAfiIpv4Negotiated_ = enableIPv4;
     adjRib_->isAfiIpv6Negotiated_ = enableIPv6;
+
+    adjRib_->setEgressEoRsPending(
+        adjRib_->isAfiIpv4Negotiated_ && eorPending,
+        adjRib_->isAfiIpv6Negotiated_ && eorPending);
 
     // Attach out adjRibOutQueue_.
     adjRib_->adjRibOutQueue_ = adjRibOutQ_;
@@ -249,7 +252,7 @@ class SendBgpMessagesFixtureWithBackpressure : public SendBgpMessagesFixture {
 
 TEST_F(SendBgpMessagesFixture, SessionEstablishedCleanUp) {
   setupAdjRibForOutUnitTest();
-  adjRib_->egressEoRsPending_ = true;
+  adjRib_->setEgressEoRsPending(true, true);
   adjRib_->egressEoRsSent_ = true;
   adjRib_->sendCoroScheduled_ = true;
   adjRib_->setAdjRibFlag(AdjRib::SCHEDULED_PUSH_TO_PEER);
@@ -261,7 +264,7 @@ TEST_F(SendBgpMessagesFixture, SessionEstablishedCleanUp) {
       std::make_shared<AdjRib::BoundedAdjRibOutQueueT>(
           capacity_, highWm_, lowWm_));
 
-  EXPECT_FALSE(adjRib_->egressEoRsPending_);
+  EXPECT_FALSE(adjRib_->egressEoRsPending());
   EXPECT_FALSE(adjRib_->egressEoRsSent_);
   EXPECT_FALSE(adjRib_->sendCoroScheduled_);
   EXPECT_FALSE(adjRib_->isAdjRibFlagSet(AdjRib::SCHEDULED_PUSH_TO_PEER));
@@ -429,7 +432,7 @@ CO_TEST_F(SendBgpMessagesFixtureWithBackpressure, SendPendingEoRsTest) {
       true /* v4Afi */,
       true /* v6Afi */);
   FillQueueToSize(highWm_);
-  EXPECT_TRUE(adjRib_->egressEoRsPending_);
+  EXPECT_TRUE(adjRib_->egressEoRsPending());
 
   // Start event base loop
   std::thread evbThread([this]() { evb_.loopForever(); });
@@ -463,7 +466,7 @@ CO_TEST_F(SendBgpMessagesFixtureWithBackpressure, SendPendingEoRsTest) {
       }
     }
   }
-  EXPECT_FALSE(adjRib_->egressEoRsPending_);
+  EXPECT_FALSE(adjRib_->egressEoRsPending());
 }
 
 CO_TEST_F(SendBgpMessagesFixture, SimpleSendBgpUpdateMessagesTest) {
@@ -507,7 +510,7 @@ CO_TEST_F(SendBgpMessagesFixture, SimpleSendBgpUpdateMessagesTest) {
   EXPECT_TRUE(seenPrefixes.contains(network::toIPPrefix(kV4Prefix3)));
   EXPECT_TRUE(seenPrefixes.contains(network::toIPPrefix(kV4Prefix4)));
 
-  EXPECT_FALSE(adjRib_->egressEoRsPending_);
+  EXPECT_FALSE(adjRib_->egressEoRsPending());
   EXPECT_TRUE(adjRib_->egressEoRsSent_);
   EXPECT_TRUE(adjRib_->attrToPrefixMap_.empty());
 }
@@ -566,7 +569,7 @@ CO_TEST_F(SendBgpMessagesFixture, BulkSendBgpUpdateMessagesTest) {
   /* Local bgp id due to ebgp session. */
   EXPECT_TRUE(seenNexthops.contains(network::toBinaryAddress(kV4Nexthop1)));
 
-  EXPECT_FALSE(adjRib_->egressEoRsPending_);
+  EXPECT_FALSE(adjRib_->egressEoRsPending());
   EXPECT_TRUE(adjRib_->egressEoRsSent_);
   EXPECT_TRUE(adjRib_->attrToPrefixMap_.empty());
 }
@@ -580,7 +583,7 @@ CO_TEST_F(SendBgpMessagesFixture, SendBgpUpdateMessagesTest_AfterEoR) {
 
     EXPECT_TRUE(adjRib_->boundedAdjRibOutQueue_->empty());
 
-    EXPECT_FALSE(adjRib_->egressEoRsPending_);
+    EXPECT_FALSE(adjRib_->egressEoRsPending());
     EXPECT_TRUE(adjRib_->egressEoRsSent_);
   }
 
@@ -595,7 +598,7 @@ CO_TEST_F(SendBgpMessagesFixture, SendBgpUpdateMessagesTest_AfterEoR) {
 
     EXPECT_EQ(2, adjRib_->boundedAdjRibOutQueue_->size());
 
-    EXPECT_FALSE(adjRib_->egressEoRsPending_);
+    EXPECT_FALSE(adjRib_->egressEoRsPending());
     EXPECT_TRUE(adjRib_->egressEoRsSent_);
   }
 }
@@ -667,7 +670,7 @@ CO_TEST_F(SendBgpMessagesFixture, SendBgpUpdateMessagesTest_BeforeEoR) {
 
     EXPECT_EQ(2, adjRib_->boundedAdjRibOutQueue_->size());
 
-    EXPECT_FALSE(adjRib_->egressEoRsPending_);
+    EXPECT_FALSE(adjRib_->egressEoRsPending());
     EXPECT_FALSE(adjRib_->egressEoRsSent_);
   }
 }
@@ -1382,7 +1385,7 @@ CO_TEST_F(SendBgpMessagesFixtureWithBackpressure, QueueCloseTest) {
   adjRib_->enableEgressQueueBackpressure_ = true;
 
   // Set up EoR sent adjRib state
-  adjRib_->egressEoRsPending_ = false;
+  adjRib_->setEgressEoRsPending(false, false);
   adjRib_->egressEoRsSent_ = true;
 
   // Save a copy of the queue pointer
@@ -1458,7 +1461,7 @@ CO_TEST_F(
   adjRib_->enableEgressQueueBackpressure_ = true;
 
   // Set up EoR sent state (normal operating state)
-  adjRib_->egressEoRsPending_ = false;
+  adjRib_->setEgressEoRsPending(false, false);
   adjRib_->egressEoRsSent_ = true;
 
   LOG(INFO) << "Initial queue ref count: "

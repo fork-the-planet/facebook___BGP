@@ -344,6 +344,7 @@ bool AdjRib::canAddRibInEntry(
      * an update of existing path, not a new one.
      */
     incrementPrefixesDroppedByLimit();
+    stats_.incrementPreFilterDroppedRouteCount();
     return false;
   }
   return true;

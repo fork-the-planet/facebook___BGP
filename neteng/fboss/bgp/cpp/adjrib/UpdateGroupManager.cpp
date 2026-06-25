@@ -17,6 +17,7 @@
 #include <fmt/format.h>
 #include <folly/logging/xlog.h>
 
+#include "neteng/fboss/bgp/cpp/adjrib/AdjRib.h"
 #include "neteng/fboss/bgp/cpp/adjrib/AdjRibGroup.h"
 #include "neteng/fboss/bgp/cpp/adjrib/UpdateGroupManager.h"
 #include "neteng/fboss/bgp/cpp/stats/Stats.h"
@@ -86,7 +87,7 @@ folly::coro::Task<void> UpdateGroupManager::maybeDestroyUpdateGroup(
     co_return;
   }
 
-  group->cancelChangeListConsumeTimer();
+  group->resetChangeListConsumeTimer();
   group->deactivateChangeListConsumer();
   group->resetChangeListConsumer();
   group->clearPackingList();
@@ -101,6 +102,58 @@ folly::coro::Task<void> UpdateGroupManager::maybeDestroyUpdateGroup(
    * destroyed to avoid blocking the EventBase thread in the destructor.
    */
   co_await g->drainAsyncScope();
+}
+
+void UpdateGroupManager::rekeyGroup(
+    const std::shared_ptr<AdjRibOutGroup>& group) {
+  auto oldKey = group->getGroupKey();
+
+  // Rebuild UpdateGroupKey on all peers in the group
+  auto& bitToAdjRibs = group->getBitToAdjRibs();
+  if (bitToAdjRibs.empty()) {
+    XLOGF(
+        ERR,
+        "Group {}: unexpected empty group while updating group key",
+        group->getGroupDescriptor());
+    return;
+  }
+
+  for (const auto& [_, adjRib] : bitToAdjRibs) {
+    adjRib->buildAndSetUpdateGroupKey();
+  }
+
+  auto& newKey = bitToAdjRibs.begin()->second->getUpdateGroupKey();
+
+  if (oldKey == newKey) {
+    XLOGF(
+        DBG1,
+        "Group {}: rekeyGroup no-op, key unchanged ({})",
+        group->getGroupDescriptor(),
+        UpdateGroupKey::toString(oldKey));
+    return;
+  }
+
+  group->setGroupKey(newKey);
+
+  auto [it, inserted] = updateGroups_.try_emplace(newKey, group);
+  if (!inserted) {
+    XLOGF(
+        ERR,
+        "Group {}: rekeyGroup found existing group {} at new key {}, overwriting",
+        group->getGroupDescriptor(),
+        it->second->getGroupDescriptor(),
+        UpdateGroupKey::toString(newKey));
+    it->second = group;
+  }
+
+  updateGroups_.erase(oldKey);
+
+  XLOGF(
+      INFO,
+      "Group {}: Group key changed from {} to {}",
+      group->getGroupDescriptor(),
+      UpdateGroupKey::toString(oldKey),
+      UpdateGroupKey::toString(newKey));
 }
 
 void UpdateGroupManager::setUpdateGroupState(

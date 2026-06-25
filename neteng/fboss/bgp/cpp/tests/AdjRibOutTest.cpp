@@ -81,6 +81,7 @@
 #include <folly/logging/xlog.h>
 
 #include "neteng/fboss/bgp/cpp/adjrib/AdjRibCommon.h"
+#include "neteng/fboss/bgp/cpp/adjrib/facebook/RouteFilterLogger.h"
 #include "neteng/fboss/bgp/cpp/tests/AdjRibOutUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/BoundedWaitUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/RibPolicyUtils.h"
@@ -2851,7 +2852,7 @@ TEST_F(AdjRibOutboundFixture, getDryRunNetworks) {
   evb_.loop();
 }
 
-/* Verify we set and clear egressEoRsPending_ on the adjRib. */
+/* Verify we set and clear the egress EoR pending flags on the adjRib. */
 TEST_F(AdjRibOutboundFixture, VerifyEgressEoRFlagsResetSessionEstablished) {
   setupAdjRib(
       kLocalAs1,
@@ -2869,11 +2870,11 @@ TEST_F(AdjRibOutboundFixture, VerifyEgressEoRFlagsResetSessionEstablished) {
       EnhancedRouteRefreshNegotiated(false),
       RouteRefreshNegotiated(false));
 
-  adjRib_->egressEoRsPending_ = true;
+  adjRib_->setEgressEoRsPending(true, true);
   adjRib_->egressEoRsSent_ = true;
 
   fm_->addTask([&] {
-    EXPECT_TRUE(adjRib_->egressEoRsPending_);
+    EXPECT_TRUE(adjRib_->egressEoRsPending());
     EXPECT_TRUE(adjRib_->egressEoRsSent_);
 
     /* sessionEstablished should reset all previous eor state. */
@@ -2889,7 +2890,7 @@ TEST_F(AdjRibOutboundFixture, VerifyEgressEoRFlagsResetSessionEstablished) {
         false /* isRouteRefreshNegotiated */,
         std::nullopt /* addPathCapa */);
 
-    EXPECT_FALSE(adjRib_->egressEoRsPending_);
+    EXPECT_FALSE(adjRib_->egressEoRsPending());
     EXPECT_FALSE(adjRib_->egressEoRsSent_);
     terminateAdjRib();
   });
@@ -2929,7 +2930,7 @@ TEST_F(AdjRibOutboundFixture, VerifyEgressEoRsPendingSetDuringRibInitialDump) {
        * is enabled , so we will see egressEoRsPending = true
        * because EoR is not immediately sent.
        */
-      EXPECT_TRUE(adjRib_->egressEoRsPending_);
+      EXPECT_TRUE(adjRib_->egressEoRsPending());
     } else {
       /* Let processRibOutMsgLoop run. */
       fiberSleepFor(10ms);
@@ -2938,7 +2939,7 @@ TEST_F(AdjRibOutboundFixture, VerifyEgressEoRsPendingSetDuringRibInitialDump) {
        * is disabled, so we will not see egressEoRsPending = true
        * because EoR is immediately sent.
        */
-      EXPECT_FALSE(adjRib_->egressEoRsPending_);
+      EXPECT_FALSE(adjRib_->egressEoRsPending());
     }
   });
 
@@ -2976,7 +2977,7 @@ TEST_F(AdjRibOutboundFixture, VerifyEgressEoRsPendingSetDuringRibInitialDump) {
 
     // no more msg in the queue
     EXPECT_EQ(0, adjRibOutQ_->size());
-    EXPECT_FALSE(adjRib_->egressEoRsPending_);
+    EXPECT_FALSE(adjRib_->egressEoRsPending());
     EXPECT_TRUE(adjRib_->egressEoRsSent_);
 
     terminateAdjRib();
@@ -3462,7 +3463,7 @@ TEST_F(AdjRibOutboundFixture, VerifyRouteFilterPolicyDeny) {
                 "65530:15800", sample.getNormVectorValue("communities")[0]);
             return 1;
           }));
-  auto logger = std::make_unique<RouteFilterLogger>(
+  auto logger = std::make_unique<ScubaRouteFilterLogger>(
       "rsw001", "rsw.*", "fsw001", mockScuba);
 
   // create a policy that permits all
@@ -3535,7 +3536,7 @@ TEST_F(AdjRibOutboundFixture, VerifyRouteFilterPolicyPermissiveAllow) {
                 "65530:15800", sample.getNormVectorValue("communities")[0]);
             return 1;
           }));
-  auto logger = std::make_unique<RouteFilterLogger>(
+  auto logger = std::make_unique<ScubaRouteFilterLogger>(
       "rsw001", "rsw.*", "fsw001", mockScuba);
 
   // create a policy that permits all

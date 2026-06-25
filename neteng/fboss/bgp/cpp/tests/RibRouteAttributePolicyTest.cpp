@@ -14,7 +14,11 @@
  * limitations under the License.
  */
 
+#include <folly/coro/AsyncScope.h>
 #include <folly/coro/BlockingWait.h>
+#include <folly/coro/Sleep.h>
+#include <folly/coro/Task.h>
+#include <folly/synchronization/Baton.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
@@ -70,6 +74,10 @@
 
 #define RouteAttributePolicy_TEST_FRIENDS \
   FRIEND_TEST(RibFixtureAddPathTestSuite, LbwProgramFibTest);
+
+#define RibDC_TEST_FRIENDS \
+  FRIEND_TEST(             \
+      RibFixtureAddPathTestSuite, StopJoinsCoroutinesBeforeResettingTimer);
 
 #include "configerator/structs/neteng/bgp_policy/thrift/gen-cpp2/rib_policy_types.h"
 #include "fboss/lib/CommonUtils.h"
@@ -2141,6 +2149,45 @@ TEST_P(RibFixtureAddPathTestSuite, SelectiveReEvaluationOnStatementRemoved) {
     EXPECT_TRUE(cache.contains(prefix1));
     EXPECT_FALSE(cache.at(prefix1).has_value());
   }
+}
+
+/*
+ * Regression test for D105639072.
+ *
+ * RibBase::stop() MUST cancel and join all coroutines (cancelAndJoinTasks)
+ * BEFORE RibDC::cleanupPlatform() destroys the DC-specific
+ * routeAttributePolicyTimer_. Otherwise a still-running coroutine (e.g.
+ * processRibPolicyMsgLoop -> scheduleRouteAttributePolicyTimer) could
+ * dereference the timer after it was reset.
+ *
+ * We register a probe coroutine on the Rib's async scope. It suspends until
+ * cancelAndJoinTasks() cancels it; on resume it asserts the DC timer is still
+ * alive (cleanupPlatform() has not run yet). Under the buggy ordering the timer
+ * would already be null here. The single rib_->stop() is driven by TearDown().
+ */
+TEST_P(RibFixtureAddPathTestSuite, StopJoinsCoroutinesBeforeResettingTimer) {
+  folly::Baton<> probeRunning;
+
+  auto probe = [](MockRib* rib,
+                  folly::Baton<>* running) -> folly::coro::Task<void> {
+    running->post();
+    co_await folly::coro::sleepReturnEarlyOnCancel(std::chrono::hours(1));
+
+    EXPECT_NE(rib->routeAttributePolicyTimer_, nullptr)
+        << "cleanupPlatform() reset routeAttributePolicyTimer_ before "
+           "cancelAndJoinTasks() joined coroutines - use-after-free risk.";
+    co_return;
+  };
+
+  rib_->getEventBase().runInEventBaseThreadAndWait([&]() {
+    rib_->getRibAsyncScope().add(
+        folly::coro::co_withExecutor(
+            &rib_->getEventBase(), probe(rib_.get(), &probeRunning)));
+  });
+
+  // Ensure the probe is registered and suspended before TearDown drives the
+  // single rib_->stop(), which cancels + joins it and runs the assertion.
+  probeRunning.wait();
 }
 
 } // namespace bgp

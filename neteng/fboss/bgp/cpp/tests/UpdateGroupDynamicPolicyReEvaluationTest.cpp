@@ -33,14 +33,17 @@
       ProcessGroupEgressPolicyReEvaluation_HandlesAllPeerStates);  \
   FRIEND_TEST(                                                     \
       UpdateGroupDynamicPolicyReEvaluationTest,                    \
-      ProcessRibDumpReq_ReschedulesTimerForDetachedPeer);
+      ProcessGroupEgressPolicyReEvaluation_UpdatesGroupKey);       \
+  FRIEND_TEST(                                                     \
+      UpdateGroupDynamicPolicyReEvaluationTest,                    \
+      ProcessRibDumpReq_DetachedPeerAheadOfGroupAfterRibWalk);
 
 #define AdjRib_TEST_FRIENDS                              \
   friend class UpdateGroupDynamicPolicyReEvaluationTest; \
   friend class SinglePeerPolicyReEvaluation;             \
   FRIEND_TEST(                                           \
       UpdateGroupDynamicPolicyReEvaluationTest,          \
-      ProcessRibDumpReq_ReschedulesTimerForDetachedPeer);
+      ProcessRibDumpReq_DetachedPeerAheadOfGroupAfterRibWalk);
 
 #include <gtest/gtest.h>
 
@@ -308,14 +311,31 @@ TEST_F(
   auto ctx = setUp(true /* enableUpdateGroup */);
   auto& evb = ctx.peerMgr->getEventBase();
 
-  // Put all three adjRibs into the same group
-  auto group = ctx.adjRib1->getUpdateGroup();
-  ctx.adjRib2->getUpdateGroup()->unregisterPeer(ctx.adjRib2);
-  group->registerPeer(ctx.adjRib2);
-  ctx.adjRib2->setUpdateGroup(group);
-  ctx.adjRib3->getUpdateGroup()->unregisterPeer(ctx.adjRib3);
-  group->registerPeer(ctx.adjRib3);
-  ctx.adjRib3->setUpdateGroup(group);
+  // Register all three adjRibs in a single manager-tracked group
+  std::shared_ptr<AdjRibOutGroup> group;
+  UpdateGroupKey originalKey;
+  evb.runInEventBaseThreadAndWait([&]() {
+    originalKey = ctx.adjRib1->buildAndSetUpdateGroupKey();
+    group = ctx.peerMgr->updateGroupManager_->findOrCreateGroup(originalKey);
+
+    auto oldGroup1 = ctx.adjRib1->getUpdateGroup();
+    oldGroup1->unregisterPeer(ctx.adjRib1);
+    group->registerPeer(ctx.adjRib1);
+    ctx.adjRib1->setUpdateGroup(group);
+    ctx.adjRib1->resetInInitialAnnouncement();
+
+    auto oldGroup2 = ctx.adjRib2->getUpdateGroup();
+    oldGroup2->unregisterPeer(ctx.adjRib2);
+    group->registerPeer(ctx.adjRib2);
+    ctx.adjRib2->setUpdateGroup(group);
+    ctx.adjRib2->resetInInitialAnnouncement();
+
+    auto oldGroup3 = ctx.adjRib3->getUpdateGroup();
+    oldGroup3->unregisterPeer(ctx.adjRib3);
+    group->registerPeer(ctx.adjRib3);
+    ctx.adjRib3->setUpdateGroup(group);
+    ctx.adjRib3->resetInInitialAnnouncement();
+  });
 
   // adjRib1: IN_SYNC (default)
   // adjRib2: DETACHED_RUNNING without a rib dump scheduled
@@ -332,7 +352,15 @@ TEST_F(
   evb.runInEventBaseThreadAndWait(
       [&]() { ctx.peerMgr->scheduleRibDumpForAdjRib(ctx.adjRib3); });
 
+  // Change egress policy on all peers so rekeyGroup updates the map
   evb.runInEventBaseThreadAndWait([&]() {
+    folly::F14FastMap<bgp_policy::DIRECTION, std::optional<std::string>>
+        newPolicy;
+    newPolicy[bgp_policy::DIRECTION::OUT] = "new_group_policy";
+    ctx.adjRib1->updateIngressEgressPolicyNames(newPolicy);
+    ctx.adjRib2->updateIngressEgressPolicyNames(newPolicy);
+    ctx.adjRib3->updateIngressEgressPolicyNames(newPolicy);
+
     ctx.adjRib1->setPendingEgressPolicyUpdate(true);
     ctx.adjRib2->setPendingEgressPolicyUpdate(true);
     ctx.adjRib3->setPendingEgressPolicyUpdate(true);
@@ -342,8 +370,6 @@ TEST_F(
       folly::coro::co_withExecutor(
           &evb, ctx.peerMgr->processGroupEgressPolicyReEvaluation(group)));
 
-  // All assertions run on the evb thread to avoid racing with the async
-  // processRibDumpReq scheduled by processGroupEgressPolicyReEvaluation.
   WITH_RETRIES({
     evb.runInEventBaseThreadAndWait([&]() {
       // adjRib1 (IN_SYNC): flag cleared immediately
@@ -357,6 +383,63 @@ TEST_F(
     });
   });
 
+  // Verify the group was re-keyed in the UpdateGroupManager
+  evb.runInEventBaseThreadAndWait([&]() {
+    auto newKey = group->getGroupKey();
+    EXPECT_EQ(newKey.egressPolicyName, "new_group_policy");
+    EXPECT_FALSE(ctx.peerMgr->updateGroupManager_->hasGroup(originalKey));
+    EXPECT_TRUE(ctx.peerMgr->updateGroupManager_->hasGroup(newKey));
+  });
+
+  tearDown(ctx);
+}
+
+TEST_F(
+    UpdateGroupDynamicPolicyReEvaluationTest,
+    ProcessGroupEgressPolicyReEvaluation_UpdatesGroupKey) {
+  auto ctx = setUp(true /* enableUpdateGroup */);
+  auto& evb = ctx.peerMgr->getEventBase();
+
+  auto group = ctx.adjRib1->getUpdateGroup();
+  auto oldKey = group->getGroupKey();
+
+  // Move adjRib2 into adjRib1's group so they share a group
+  ctx.adjRib2->getUpdateGroup()->unregisterPeer(ctx.adjRib2);
+  group->registerPeer(ctx.adjRib2);
+  ctx.adjRib2->setUpdateGroup(group);
+
+  // Change the egress policy name on both peers
+  folly::F14FastMap<bgp_policy::DIRECTION, std::optional<std::string>>
+      newPolicy;
+  newPolicy[bgp_policy::DIRECTION::OUT] = "NEW_EGRESS_POLICY";
+  ctx.adjRib1->updateIngressEgressPolicyNames(newPolicy);
+  ctx.adjRib2->updateIngressEgressPolicyNames(newPolicy);
+
+  evb.runInEventBaseThreadAndWait([&]() {
+    ctx.adjRib1->setPendingEgressPolicyUpdate(true);
+    ctx.adjRib2->setPendingEgressPolicyUpdate(true);
+  });
+
+  folly::coro::blockingWait(
+      folly::coro::co_withExecutor(
+          &evb, ctx.peerMgr->processGroupEgressPolicyReEvaluation(group)));
+
+  evb.runInEventBaseThreadAndWait([&]() {
+    // Each peer's UpdateGroupKey should reflect the new policy
+    EXPECT_EQ(
+        ctx.adjRib1->getUpdateGroupKey().egressPolicyName, "NEW_EGRESS_POLICY");
+    EXPECT_EQ(
+        ctx.adjRib2->getUpdateGroupKey().egressPolicyName, "NEW_EGRESS_POLICY");
+
+    // The group's key should also be updated
+    EXPECT_EQ(group->getGroupKey().egressPolicyName, "NEW_EGRESS_POLICY");
+    EXPECT_NE(group->getGroupKey(), oldKey);
+
+    // Pending flags should be cleared
+    EXPECT_FALSE(ctx.adjRib1->isEgressPolicyUpdateRequired());
+    EXPECT_FALSE(ctx.adjRib2->isEgressPolicyUpdateRequired());
+  });
+
   tearDown(ctx);
 }
 
@@ -368,7 +451,7 @@ TEST_F(
  */
 TEST_F(
     UpdateGroupDynamicPolicyReEvaluationTest,
-    ProcessRibDumpReq_ReschedulesTimerForDetachedPeer) {
+    ProcessRibDumpReq_DetachedPeerAheadOfGroupAfterRibWalk) {
   auto ctx = setUp(true /* enableUpdateGroup */);
   auto& evb = ctx.peerMgr->getEventBase();
 
@@ -414,18 +497,10 @@ TEST_F(
   std::shared_ptr<AdjRibOutGroupConsumer> groupConsumer;
   evb.runInEventBaseThreadAndWait([&]() {
     auto group = ctx.adjRib1->getUpdateGroup();
-    groupConsumer = std::make_shared<AdjRibOutGroupConsumer>(
-        ctx.peerMgr->changeListTracker_,
-        group,
-        "test_group_consumer",
-        evb,
-        addPathBitmap,
-        nonAddPathBitmap);
-    groupConsumer->registerWithTracker();
-    groupConsumer->setBitmap();
-    group->setChangeListConsumer(groupConsumer);
     group->setChangeListTracker(
         ctx.peerMgr->changeListTracker_, addPathBitmap, nonAddPathBitmap);
+    group->registerGroupConsumer();
+    groupConsumer = group->getChangeListConsumer();
   });
 
   // Phase 3: Publish one more prefix to ShadowRib. This item lands on
@@ -462,7 +537,7 @@ TEST_F(
     // joinConsumer ensures the per-peer consumer inherits the group's
     // position, so entries published before the group consumer (Phase 1)
     // will NOT have the per-peer bit set.
-    adjRib->registerDetachedConsumer(
+    adjRib->registerDetachedConsumerAtGroupPosition(
         ctx.peerMgr->changeListTracker_,
         groupConsumer,
         addPathBitmap,
@@ -518,10 +593,11 @@ TEST_F(
     EXPECT_EQ(totalPrefixes, 5);
   });
 
-  // Phase 7: EventBase processes sendBgpUpdates which drains the PL
-  // and reschedules packing timers.
+  // Phase 7: EventBase processes sendBgpUpdates which drains the PL.
+  // Peer's lastSeenRibVersion (from RIB dump) > group's (0), so the
+  // ahead-of-group branch fires and cancels packing timers.
   evb.runInEventBaseThreadAndWait([&]() {
-    EXPECT_TRUE(ctx.adjRib1->changeListConsumeTimer_->isScheduled());
+    EXPECT_FALSE(ctx.adjRib1->changeListConsumeTimer_->isScheduled());
   });
 
   // Clean up before teardown
@@ -581,4 +657,5 @@ class SinglePeerPolicyReEvaluation : public ::testing::Test {
       nettools::bgplib::kMaxIngressQueueSize};
   MonitoredMPMCQueue<AdjRib::ObservableMessageT> observerQ_;
 };
+
 } // namespace facebook::bgp

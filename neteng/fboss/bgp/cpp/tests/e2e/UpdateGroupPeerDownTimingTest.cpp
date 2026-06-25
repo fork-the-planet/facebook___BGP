@@ -19,7 +19,7 @@
  *
  * Per-peer policy change for DETACHED peer (simulated via route ops)
  * Peer DOWN from P-JR — unregister, adjust bitmaps
- * Peer DOWN from P-DB — handleDetachedPeerDown cleanup
+ * Peer DOWN from P-DB — unregisterPeer cleanup
  * Peer DOWN from P-DRJ during acceptance — acceptance takes JOINED path
  * Peer DOWN mid-PL drain — per-peer entries cleaned, PL freed
  */
@@ -219,7 +219,7 @@ TEST_P(UpdateGroupMultiPeerTest, PeerDownFromJoinedRunning) {
 }
 
 /*
- * Peer DOWN from P-DB — handleDetachedPeerDown cleanup.
+ * Peer DOWN from P-DB — unregisterPeer cleanup.
  * Freq-detach peer3 to DETACHED_BLOCKED, then bringDownPeer.
  * Verify consumer unregistered, detached count decremented, peer4 continues.
  */

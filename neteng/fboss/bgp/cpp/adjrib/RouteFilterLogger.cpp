@@ -18,13 +18,8 @@
 
 namespace facebook::bgp {
 
-size_t RouteFilterLogger::log(
-    bool /*egress*/,
-    const folly::CIDRNetwork& /*prefix*/,
-    bool /*allow*/,
-    bool /*permissive*/,
-    const std::vector<std::string>& /*communities*/) {
-  return 0;
+std::unique_ptr<RouteFilterLoggerFactory> createRouteFilterLoggerFactory() {
+  return nullptr;
 }
 
 } // namespace facebook::bgp

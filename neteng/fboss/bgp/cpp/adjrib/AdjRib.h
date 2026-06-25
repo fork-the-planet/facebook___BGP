@@ -23,6 +23,7 @@
 #include <fboss/lib/RadixTree.h>
 #include <fmt/core.h>
 #include <folly/CancellationToken.h>
+#include <folly/Function.h>
 #include <folly/IPAddress.h>
 #include <folly/Singleton.h>
 #include <folly/container/F14Map.h>
@@ -418,6 +419,29 @@ class AdjRib : boost::noncopyable,
   }
 
   /*
+   * @brief: the RIB version up to which this peer shares the group's RIB-OUT
+   * entries, used to version-gate per-peer show/count lookups via
+   * AdjRibOutGroup::resolve{Lite,Path}EntriesForPeer.
+   * - Detached peer: its frozen detach version (getDetachedRibVersion()) — it
+   *   shares only group entries created at/before detachment; entries with a
+   *   greater ribVersion were never seen by this peer.
+   * - In-sync peer (has a group): the group's current version, so every
+   *   current group entry is shared.
+   * - Standalone peer / update-group disabled (no group): its own
+   *   lastSeenRibVersion_ — there are no group entries to gate, entries live
+   *   under the peer key, so the gate never trips on this value.
+   */
+  inline uint64_t getRibOutSharingVersion() const noexcept {
+    if (isDetachedPeer()) {
+      return getDetachedRibVersion();
+    }
+    if (adjRibOutGroup_) {
+      return adjRibOutGroup_->getLastSeenRibVersion();
+    }
+    return lastSeenRibVersion_;
+  }
+
+  /*
    * @brief  get size of the in/out tree. The tree instance
    *         is determined based on the parameters passed in.
    *         If isAddPathEnabled then look at adjRibInPathTree_
@@ -629,8 +653,20 @@ class AdjRib : boost::noncopyable,
       const nettools::bgplib::BgpRouteRefreshMessageSubtype& subtype) noexcept;
 
   // Get AdjRibStats for this peer
-  const AdjRibStats& getStats() {
+  const AdjRibStats& getStats() const {
     return stats_;
+  }
+
+  // Cumulative detach/rejoin bookkeeping recorded against this peer by the
+  // group (see AdjRibOutGroup::detachPeer / tryAcceptPeersToGroup).
+  void incrementTimesDetachedByBlocking() noexcept {
+    stats_.incrementTimesDetachedByBlocking();
+  }
+  void incrementTimesDetachedByPolicy() noexcept {
+    stats_.incrementTimesDetachedByPolicy();
+  }
+  void incrementTimesRejoined() noexcept {
+    stats_.incrementTimesRejoined();
   }
 
   void copyEgressPrefixCountsFrom(const AdjRibStats& other) {
@@ -666,12 +702,43 @@ class AdjRib : boost::noncopyable,
   }
 
   /**
-   * @brief Set the egressEoRsPending flag
-   * Used by AdjRibOutGroup to notify peers to send EoR markers
-   * Peer will send EoRs via existing sendPendingEoRs() logic
+   * @brief Set the per-AFI egress EoR pending flags.
+   * Used by AdjRibOutGroup to mark which EoR markers a peer still owes. The
+   * group passes its own per-AFI flags so a peer detached mid-EoR inherits
+   * exactly the AFIs the group has NOT yet committed (e.g. v4 already sent ->
+   * v4Pending=false, so the detached peer only sends the remaining v6).
    */
-  void setEgressEoRsPending() {
-    egressEoRsPending_ = true;
+  void setEgressEoRsPending(bool v4Pending, bool v6Pending) {
+    if (v4Pending) {
+      setAdjRibFlag(EGRESS_EOR_PENDING_V4);
+    } else {
+      clearAdjRibFlag(EGRESS_EOR_PENDING_V4);
+    }
+
+    if (v6Pending) {
+      setAdjRibFlag(EGRESS_EOR_PENDING_V6);
+    } else {
+      clearAdjRibFlag(EGRESS_EOR_PENDING_V6);
+    }
+  }
+
+  /* Clear the per-AFI egress EoR pending flag once that AFI's EoR is queued. */
+  void clearEgressEoRPendingV4() {
+    clearAdjRibFlag(EGRESS_EOR_PENDING_V4);
+  }
+  void clearEgressEoRPendingV6() {
+    clearAdjRibFlag(EGRESS_EOR_PENDING_V6);
+  }
+
+  bool egressEoRPendingV4() const {
+    return isAdjRibFlagSet(EGRESS_EOR_PENDING_V4);
+  }
+  bool egressEoRPendingV6() const {
+    return isAdjRibFlagSet(EGRESS_EOR_PENDING_V6);
+  }
+
+  bool egressEoRsPending() const {
+    return egressEoRPendingV4() || egressEoRPendingV6();
   }
 
   bool sendAddPath() {
@@ -696,6 +763,26 @@ class AdjRib : boost::noncopyable,
    * EoRs sent) Called by AdjRibOutGroup after group packing list is drained
    */
   folly::coro::Task<std::pair<bool, uint16_t>> sendPendingEoRs() noexcept;
+
+  /**
+   * @brief Per-peer bookkeeping after all of the peer's egress EoR PDUs are
+   * pushed to queue.
+   *
+   * Sets egressEoRsSent_ to true, records the time, logs the
+   * event, and notifies the peer manager. Does not touch the egress queue.
+   * One-time per session (guarded by egressEoRsSent_).
+   */
+  void onEgressEoRSent() noexcept;
+
+  /**
+   * @brief Finalize a single AFI's egress EoR once its PDU has landed in the
+   * peer's egress queue. The group's EoR push supplies this as the onResolved
+   * continuation to tryPushToPeer, so it runs on immediate push or from
+   * deferredPushToPeer for a backpressured peer. The continuation carries the
+   * AFI, so this clears exactly this AFI's EGRESS_EOR_PENDING flag, then calls
+   * onEgressSent() to fire the one-time bookkeeping if it was the last.
+   */
+  void markEgressEoRSent(nettools::bgplib::BgpUpdateAfi afi) noexcept;
 
   int64_t flapCounter() {
     return flapCounter_;
@@ -902,9 +989,11 @@ class AdjRib : boost::noncopyable,
    * Called by AdjRibOutGroup::tryPushToPeer when the peer's queue is blocked.
    * Returns false if scheduling failed (asyncScope null or cancelled),
    * so the caller can avoid leaving the blocked bitmap bit set.
+   * onResolved (optional) is forwarded to deferredPushToPeer.
    */
   bool scheduleDeferredPushToPeer(
-      nettools::bgplib::FiberBgpPeer::InputMessageT message) noexcept;
+      nettools::bgplib::FiberBgpPeer::InputMessageT message,
+      folly::Function<void() noexcept> onResolved = {}) noexcept;
 
   /*
    * Get the peer's bit position within the update group
@@ -1030,15 +1119,20 @@ class AdjRib : boost::noncopyable,
    *        A peer cannot be both detached and in-sync simultaneously,
    *        so only one coroutine can be pending at a time — no counter
    *        is needed.
-   * Bits 5-31: Reserved for future use.
+   * EGRESS_EOR_PENDING_V4 — the peer still owes an IPv4 egress EoR
+   *        marker. Set at RIB-dump intake (or copied from the group on detach);
+   *        cleared by clearEgressEoRPendingV4() in sendPendingEoRs once the
+   * EoRs have been pushed to the peer's egress queue (sendPendingEoRs also sets
+   * the one-time egressEoRsSent_ flag). EGRESS_EOR_PENDING_V6 — same as
+   * EGRESS_EOR_PENDING_V4 for IPv6, cleared by clearEgressEoRPendingV6().
    */
   enum AdjRibFlag : uint32_t {
     RIB_OUT_DISCREPANCY = 0,
     IS_DETACHED_FAST_PEER,
     DETACHED_INIT_DUMP_PEER,
-    /* A sendBgpUpdates (detached) or deferredPushToPeer (in-sync) coroutine
-     * is pending. Mutually exclusive by peer state — see comment above. */
     SCHEDULED_PUSH_TO_PEER,
+    EGRESS_EOR_PENDING_V4,
+    EGRESS_EOR_PENDING_V6,
   };
 
   bool isAdjRibFlagSet(AdjRibFlag flag) const {
@@ -1119,15 +1213,30 @@ class AdjRib : boost::noncopyable,
   }
 
   /*
-   * Register a detached consumer at the group's current CL position.
-   * Called during slow peer detachment so the peer can consume CL
-   * independently.
+   * Register a detached consumer to tracker with null marker (implicitly
+   * means it is at the end of the CL).
+   * Called for new peers entering a running group (DETACHED_INIT_DUMP).
+   * @param changeListTracker - The global change list tracker
+   * @param addPathBitmap - The add-path consumer bitmap
+   * @param nonAddPathBitmap - The non-add-path consumer bitmap
+   * @return true if a new consumer was registered; false if registration was
+   *         skipped (a consumer already exists or changeListTracker is null).
+   */
+  bool registerDetachedConsumer(
+      std::shared_ptr<ChangeTracker<ShadowRibEntry>>& changeListTracker,
+      ConsumerBitmap& addPathBitmap,
+      ConsumerBitmap& nonAddPathBitmap);
+
+  /*
+   * Register a detached consumer and join it at the group consumer's position.
+   * Called during slow peer detachment so the peer starts consuming CL
+   * from where the group left off.
    * @param changeListTracker - The global change list tracker
    * @param groupConsumer - The group's consumer to join at its position
    * @param addPathBitmap - The add-path consumer bitmap
    * @param nonAddPathBitmap - The non-add-path consumer bitmap
    */
-  void registerDetachedConsumer(
+  void registerDetachedConsumerAtGroupPosition(
       std::shared_ptr<ChangeTracker<ShadowRibEntry>>& changeListTracker,
       const std::shared_ptr<AdjRibOutGroupConsumer>& groupConsumer,
       ConsumerBitmap& addPathBitmap,
@@ -1150,11 +1259,15 @@ class AdjRib : boost::noncopyable,
 
   /*
    * DSP (Detached Slow Peer) readiness check.
-   * Returns true if peer has consumed all CL items and reached the end.
+   * Returns true if the peer has drained its packing list and its change list
+   * marker has caught up to the group consumer's marker (same position on the
+   * CL). We compare markers rather than requiring the end of the CL: when the
+   * group is frozen mid-list, a DSP that reaches that frozen marker can rejoin
+   * without waiting for the group to reach the end.
    *
    * Conditions:
    *   1. attrToPrefixMap_ is empty (PL fully drained)
-   *   2. changeListConsumer_->isReady() (consumer at end of CL)
+   *   2. changeListConsumer_->getMarker() == the group consumer's marker
    */
   bool isReadyToRejoinGroup() const;
 
@@ -1228,7 +1341,7 @@ class AdjRib : boost::noncopyable,
 
   /*
    * Test-only: when true, AdjRibOutGroup skips this peer in
-   * checkAndAcceptReadyToJoinPeers / checkAndAcceptDSPPeer, keeping
+   * checkAndAcceptReadyToJoinPeers / maybeAcceptDSPPeer, keeping
    * it in DETACHED_READY_TO_JOIN. Read/written on the EventBase thread.
    */
   bool testOnlyDeferDrjAcceptance{false};
@@ -1854,10 +1967,12 @@ class AdjRib : boost::noncopyable,
    * Deferred push coroutine — waits for queue space then pushes.
    * Runs on the peer's asyncScope_ (not the group's).
    * RAII guard calls markPeerUnblocked on completion.
+   * onResolved (optional) runs once, only on a successful push.
    */
   folly::coro::Task<void> deferredPushToPeer(
       nettools::bgplib::FiberBgpPeer::InputMessageT message,
-      std::shared_ptr<AdjRib> self) noexcept;
+      std::shared_ptr<AdjRib> self,
+      folly::Function<void() noexcept> onResolved = {}) noexcept;
 
   /*
    * Returns true if we should break out of sendBgpUpdates early due to
@@ -1869,7 +1984,7 @@ class AdjRib : boost::noncopyable,
     // full RIB walk and we must send it all with EoR. Otherwise,
     // sendBgpUpdates may choose to defer sending the packing list in favor
     // of processing newer items from the changelist.
-    return tryPullNewChangeItems && !egressEoRsPending_;
+    return tryPullNewChangeItems && !egressEoRsPending();
   }
 
   /* Used to pause any updates to attrToPrefixMap_. */
@@ -2198,8 +2313,6 @@ class AdjRib : boost::noncopyable,
   // Flag to indicate whether we have sent eor to peer or not
   // TODO: This should be two flags if we decide to split v4 and v6 logic
   bool egressEoRsSent_{false};
-  /* Flag to indicate if sending EoR is pending. */
-  bool egressEoRsPending_{false};
 
   int64_t eorSentTime_{0};
   int64_t eorReceivedTime_{0};

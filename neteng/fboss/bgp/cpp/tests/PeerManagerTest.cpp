@@ -5236,8 +5236,6 @@ TEST_F(PeerManagerTestFixture, DisableScubaLoggingTest) {
   auto sessionMgr = std::make_shared<SessionManager>(*globalConfig, false);
   peerMgr->setSessionManager(sessionMgr);
 
-  EXPECT_EQ(nullptr, peerMgr->scubaLogger_);
-
   auto& evb = peerMgr->getEventBase();
   auto adjRib1 = setupAdjRib(
       evb,

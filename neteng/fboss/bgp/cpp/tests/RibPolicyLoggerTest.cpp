@@ -19,7 +19,7 @@
 
 #include <folly/Random.h>
 
-#include "neteng/fboss/bgp/cpp/rib/RibPolicyLogger.h"
+#include "neteng/fboss/bgp/cpp/rib/facebook/RibPolicyLogger.h"
 #include "neteng/fboss/bgp/cpp/tests/MockScubaData.h"
 
 namespace facebook::bgp {
@@ -28,7 +28,7 @@ using namespace ::testing;
 TEST(RibPolicyLoggerTest, BasicTest) {
   // test with nullptr scuba logger to verfiy no crash
   {
-    auto logger = std::make_unique<RibPolicyLogger>("rsw001", nullptr);
+    auto logger = std::make_unique<ScubaRibPolicyLogger>("rsw001", nullptr);
     EXPECT_EQ(0, logger->log(1, 2));
   }
   // test with mocked scuba logger to verify data is populated correctly
@@ -46,7 +46,7 @@ TEST(RibPolicyLoggerTest, BasicTest) {
               EXPECT_EQ("2", sample.getNormalValue("rf_policy_version"));
               return 1;
             }));
-    auto logger = std::make_unique<RibPolicyLogger>("rsw001", mockScuba);
+    auto logger = std::make_unique<ScubaRibPolicyLogger>("rsw001", mockScuba);
     EXPECT_LT(0, logger->log(1, 2));
   }
   // test with prod scuba to verify that creating a logger for
@@ -55,7 +55,7 @@ TEST(RibPolicyLoggerTest, BasicTest) {
     auto rand32 = folly::Random::rand32();
     auto scuba = std::make_shared<rfe::ScubaData>(
         fmt::format("non_existent_table_{}", rand32));
-    auto logger = std::make_unique<RibPolicyLogger>("rsw001", scuba);
+    auto logger = std::make_unique<ScubaRibPolicyLogger>("rsw001", scuba);
     EXPECT_LT(0, logger->log(1, 2));
   }
 }

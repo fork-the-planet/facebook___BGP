@@ -483,7 +483,6 @@ add_library(bgp_common
   neteng/fboss/bgp/cpp/common/FeatureFlags.cpp
   neteng/fboss/bgp/cpp/common/RouteInfo.cpp
   neteng/fboss/bgp/cpp/common/Utils.cpp
-  neteng/fboss/bgp/cpp/ScubaLoggerFactory.cpp
   neteng/fboss/bgp/cpp/stats/Stats.cpp
   neteng/fboss/bgp/cpp/lib/BgpMessageParser.cpp
   neteng/fboss/bgp/cpp/lib/detail/BgpMessageParserUtils.cpp

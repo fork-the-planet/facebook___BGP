@@ -92,18 +92,11 @@ class AdjRibGroupTest : public ::testing::Test {
 
   void MockChangeListConsumer() {
     /*
-     * Create a mock change list consumer for the group
-     * Uses AdjRibOutGroupConsumer (not AdjRibOutConsumer) for group-level
-     * processing
+     * Wire the tracker and bitmaps so the group can create and register its own
+     * change list consumer via registerGroupConsumer() (the production path).
      */
-    auto changeListConsumer = std::make_shared<AdjRibOutGroupConsumer>(
-        changeListTracker_,
-        adjRibOutGroup_,
-        adjRibOutGroup_->getAdjRibGroupName(),
-        *evb_,
-        addPathConsumerBitmap_,
-        nonAddPathConsumerBitmap_);
-    adjRibOutGroup_->setChangeListConsumer(changeListConsumer);
+    adjRibOutGroup_->setChangeListTracker(
+        changeListTracker_, addPathConsumerBitmap_, nonAddPathConsumerBitmap_);
   }
 
   std::shared_ptr<AdjRib> createMinimalAdjRib(uint8_t id = 1) {
@@ -155,8 +148,9 @@ TEST_F(AdjRibGroupTest, SetGetChangeListConsumer) {
   // Initially, changeListConsumer should be null
   EXPECT_EQ(adjRibOutGroup_->getChangeListConsumer(), nullptr);
 
-  // Set the consumer
+  // Wire the tracker and register: the group creates its own consumer
   MockChangeListConsumer();
+  adjRibOutGroup_->registerGroupConsumer();
 
   // Verify consumer is set
   EXPECT_NE(adjRibOutGroup_->getChangeListConsumer(), nullptr);
@@ -168,8 +162,9 @@ TEST_F(AdjRibGroupTest, SetGetChangeListConsumer) {
 TEST_F(AdjRibGroupTest, ResetChangeListConsumer) {
   createAdjRibOutGroup("test_group");
 
-  // Set the consumer
+  // Wire the tracker and register: the group creates its own consumer
   MockChangeListConsumer();
+  adjRibOutGroup_->registerGroupConsumer();
   EXPECT_NE(adjRibOutGroup_->getChangeListConsumer(), nullptr);
 
   // Reset the consumer
@@ -180,26 +175,26 @@ TEST_F(AdjRibGroupTest, ResetChangeListConsumer) {
 }
 
 /**
- * Test: activateChangeListConsumer with no consumer set (error case)
+ * Test: registerGroupConsumer with no tracker set (cannot create consumer)
  */
-TEST_F(AdjRibGroupTest, ActivateChangeListConsumerNoConsumer) {
+TEST_F(AdjRibGroupTest, RegisterGroupConsumerNoTracker) {
   createAdjRibOutGroup("test_group");
 
   // Should log error but not crash
-  EXPECT_NO_THROW(adjRibOutGroup_->activateChangeListConsumer());
+  EXPECT_NO_THROW(adjRibOutGroup_->registerGroupConsumer());
 }
 
 /**
- * Test: activateChangeListConsumer with valid consumer
+ * Test: registerGroupConsumer with valid consumer
  */
-TEST_F(AdjRibGroupTest, ActivateChangeListConsumer) {
+TEST_F(AdjRibGroupTest, RegisterGroupConsumer) {
   createAdjRibOutGroup("test_group");
   MockChangeListConsumer();
   auto& messages = subscribeToLogMessages("", folly::LogLevel::DBG2);
 
   // Activate the consumer and schedule the timer
-  adjRibOutGroup_->activateChangeListConsumer();
-  adjRibOutGroup_->scheduleConsumeTimer();
+  adjRibOutGroup_->registerGroupConsumer();
+  adjRibOutGroup_->scheduleChangeListConsumeTimer();
   // First loopOnce fires the timer, second runs the coro body
   evb_->loopOnce();
   evb_->loopOnce();
@@ -221,15 +216,15 @@ TEST_F(AdjRibGroupTest, ActivateChangeListConsumer) {
 }
 
 /**
- * Test: activateChangeListConsumer called twice (idempotent)
+ * Test: registerGroupConsumer called twice (idempotent)
  */
-TEST_F(AdjRibGroupTest, ActivateChangeListConsumerTwice) {
+TEST_F(AdjRibGroupTest, RegisterGroupConsumerTwice) {
   createAdjRibOutGroup("test_group");
   MockChangeListConsumer();
 
   // Activate the consumer twice
-  adjRibOutGroup_->activateChangeListConsumer();
-  adjRibOutGroup_->activateChangeListConsumer();
+  adjRibOutGroup_->registerGroupConsumer();
+  adjRibOutGroup_->registerGroupConsumer();
 
   // Should not crash, second call should be no-op
   EXPECT_NO_THROW(evb_->loopOnce());
@@ -241,7 +236,7 @@ TEST_F(AdjRibGroupTest, ActivateChangeListConsumerTwice) {
 /**
  * Test: deactivateChangeListConsumer with no activation
  */
-TEST_F(AdjRibGroupTest, DeactivateChangeListConsumerNotActivated) {
+TEST_F(AdjRibGroupTest, DeregisterGroupConsumerNotActivated) {
   createAdjRibOutGroup("test_group");
   MockChangeListConsumer();
 
@@ -252,12 +247,12 @@ TEST_F(AdjRibGroupTest, DeactivateChangeListConsumerNotActivated) {
 /**
  * Test: deactivateChangeListConsumer after activation
  */
-TEST_F(AdjRibGroupTest, DeactivateChangeListConsumerAfterActivation) {
+TEST_F(AdjRibGroupTest, DeregisterGroupConsumerAfterActivation) {
   createAdjRibOutGroup("test_group");
   MockChangeListConsumer();
 
   // Activate then deactivate
-  adjRibOutGroup_->activateChangeListConsumer();
+  adjRibOutGroup_->registerGroupConsumer();
   adjRibOutGroup_->deactivateChangeListConsumer();
 
   // Should cleanly deactivate
@@ -272,7 +267,7 @@ TEST_F(AdjRibGroupTest, ActivateDeactivateReactivate) {
   MockChangeListConsumer();
 
   // First activation
-  adjRibOutGroup_->activateChangeListConsumer();
+  adjRibOutGroup_->registerGroupConsumer();
   EXPECT_NO_THROW(evb_->loopOnce());
 
   // Deactivation
@@ -280,7 +275,7 @@ TEST_F(AdjRibGroupTest, ActivateDeactivateReactivate) {
   EXPECT_NO_THROW(evb_->loopOnce());
 
   // Second activation
-  adjRibOutGroup_->activateChangeListConsumer();
+  adjRibOutGroup_->registerGroupConsumer();
   EXPECT_NO_THROW(evb_->loopOnce());
 
   // Final cleanup
@@ -294,19 +289,13 @@ TEST_F(AdjRibGroupTest, MultipleGroupsSameTracker) {
   // Create first group
   createAdjRibOutGroup("group1", 1);
   MockChangeListConsumer();
-  adjRibOutGroup_->activateChangeListConsumer();
+  adjRibOutGroup_->registerGroupConsumer();
 
   /* Create second group with same tracker */
   auto group2 = std::make_shared<AdjRibOutGroup>(*evb_, "group2", 2);
-  auto consumer2 = std::make_shared<AdjRibOutGroupConsumer>(
-      changeListTracker_,
-      group2,
-      "group2",
-      *evb_,
-      addPathConsumerBitmap_,
-      nonAddPathConsumerBitmap_);
-  group2->setChangeListConsumer(consumer2);
-  group2->activateChangeListConsumer();
+  group2->setChangeListTracker(
+      changeListTracker_, addPathConsumerBitmap_, nonAddPathConsumerBitmap_);
+  group2->registerGroupConsumer();
 
   // Both should work without interference
   EXPECT_NO_THROW(evb_->loopOnce());
@@ -402,6 +391,204 @@ TEST_F(AdjRibGroupTest, LiteTreeOperationsWithGroupKey) {
   auto* afterDelete = adjRibOutGroup_->getFromLiteTree(
       adjRibOutGroup_->LiteTree_, prefix, ownerKey);
   EXPECT_EQ(afterDelete, nullptr);
+}
+
+/**
+ * Test: resolveLiteEntryForPeer applies the ribVersion sharing gate.
+ *   - peer still shares the group entry when sharingVersion >= entry version
+ *     (in-sync, or detached with the entry at/below the detach version),
+ *   - omits a post-detach group entry (sharingVersion < entry version),
+ *   - returns the per-peer (lazy-cloned) entry when present, regardless of
+ *     the version gate.
+ */
+TEST_F(AdjRibGroupTest, ResolveLiteEntryForPeer_VersionGatedSharing) {
+  createAdjRibOutGroup("test_group", 42, createDefaultGroupKey());
+
+  const folly::CIDRNetwork prefix{folly::IPAddress("10.0.0.0"), 24};
+  const auto groupKey = adjRibOutGroup_->getGroupOwnerKey();
+  auto peerId = std::make_shared<nettools::bgplib::BgpPeerId>(
+      folly::IPAddress("10.0.0.1"),
+      folly::IPAddressV4("255.0.0.1").toLongHBO());
+  const auto peerKey = AdjRibOutOwnerKey::forPeer(peerId);
+
+  // Group entry created at rib version 100; no per-peer entry yet.
+  constexpr uint64_t kGroupEntryVersion = 100;
+  auto* groupEntry = adjRibOutGroup_->addToLiteTree(
+      adjRibOutGroup_->LiteTree_, prefix, groupKey, kDefaultPathID);
+  groupEntry->setRibVersion(kGroupEntryVersion);
+
+  const auto& ownerMap =
+      adjRibOutGroup_
+          ->getRadixNodeItrFromLiteTree(adjRibOutGroup_->LiteTree_, prefix)
+          ->value();
+
+  // In-sync / detached-unchanged: sharingVersion >= entry version -> shared.
+  EXPECT_EQ(
+      groupEntry,
+      adjRibOutGroup_->resolveLiteEntryForPeer(
+          ownerMap, peerKey, kGroupEntryVersion));
+  EXPECT_EQ(
+      groupEntry,
+      adjRibOutGroup_->resolveLiteEntryForPeer(
+          ownerMap, peerKey, kGroupEntryVersion + 50));
+
+  // Post-detach: sharingVersion < entry version -> peer never saw it -> omit.
+  EXPECT_EQ(
+      nullptr,
+      adjRibOutGroup_->resolveLiteEntryForPeer(
+          ownerMap, peerKey, kGroupEntryVersion - 1));
+
+  // Diverged: a per-peer (lazy-cloned) entry wins regardless of the version
+  // gate.
+  auto* peerEntry = adjRibOutGroup_->addToLiteTree(
+      adjRibOutGroup_->LiteTree_, prefix, peerKey, kDefaultPathID);
+  peerEntry->setRibVersion(kGroupEntryVersion + 20);
+  EXPECT_EQ(
+      peerEntry,
+      adjRibOutGroup_->resolveLiteEntryForPeer(
+          ownerMap, peerKey, kGroupEntryVersion - 1));
+  EXPECT_EQ(
+      peerEntry,
+      adjRibOutGroup_->resolveLiteEntryForPeer(
+          ownerMap, peerKey, kGroupEntryVersion + 1000));
+}
+
+/**
+ * Test: resolvePathEntriesForPeer resolves divergence per (prefix, pathId).
+ * A peer-owned path wins; a group-only path is emitted only when not owned by
+ * the peer AND still shared per the ribVersion gate.
+ */
+TEST_F(AdjRibGroupTest, ResolvePathEntriesForPeer_PerPathDivergence) {
+  UpdateGroupKey key = createDefaultGroupKey();
+  key.sendAddPath = true;
+  createAdjRibOutGroup("test_group", 42, key);
+
+  const folly::CIDRNetwork prefix{folly::IPAddress("10.0.0.0"), 24};
+  const auto groupKey = adjRibOutGroup_->getGroupOwnerKey();
+  auto peerId = std::make_shared<nettools::bgplib::BgpPeerId>(
+      folly::IPAddress("10.0.0.1"),
+      folly::IPAddressV4("255.0.0.1").toLongHBO());
+  const auto peerKey = AdjRibOutOwnerKey::forPeer(peerId);
+
+  // Group paths: pathId 1 @ v100, pathId 2 @ v200. Peer diverged on pathId 1.
+  auto* g1 = adjRibOutGroup_->addToPathTree(
+      adjRibOutGroup_->PathTree_, prefix, groupKey, /*pathId=*/1);
+  g1->setRibVersion(100);
+  auto* g2 = adjRibOutGroup_->addToPathTree(
+      adjRibOutGroup_->PathTree_, prefix, groupKey, /*pathId=*/2);
+  g2->setRibVersion(200);
+  auto* p1 = adjRibOutGroup_->addToPathTree(
+      adjRibOutGroup_->PathTree_, prefix, peerKey, /*pathId=*/1);
+  p1->setRibVersion(150);
+
+  const auto& ownerMap =
+      adjRibOutGroup_
+          ->getRadixNodeItrFromPathTree(adjRibOutGroup_->PathTree_, prefix)
+          ->value();
+
+  // Detached at version 120: pathId 1 -> peer-owned p1; pathId 2 group entry
+  // (v200 > 120) was never seen -> omitted.
+  std::map<uint32_t, const AdjRibEntry*> detachedView;
+  adjRibOutGroup_->resolvePathEntriesForPeer(
+      ownerMap,
+      peerKey,
+      /*sharingVersion=*/120,
+      [&](uint32_t pathId, const AdjRibEntry& entry) {
+        detachedView[pathId] = &entry;
+      });
+  EXPECT_EQ(1u, detachedView.size());
+  EXPECT_EQ(p1, detachedView[1]);
+
+  // In-sync (sharingVersion 200): pathId 1 -> p1; pathId 2 group entry shared.
+  std::map<uint32_t, const AdjRibEntry*> inSyncView;
+  adjRibOutGroup_->resolvePathEntriesForPeer(
+      ownerMap,
+      peerKey,
+      /*sharingVersion=*/200,
+      [&](uint32_t pathId, const AdjRibEntry& entry) {
+        inSyncView[pathId] = &entry;
+      });
+  EXPECT_EQ(2u, inSyncView.size());
+  EXPECT_EQ(p1, inSyncView[1]);
+  EXPECT_EQ(g2, inSyncView[2]);
+}
+
+/**
+ * Test: with update group DISABLED, neither resolver consults the group owner
+ * key — only the peer's own entries are surfaced. (createAdjRibOutGroup always
+ * enables update-group, so the group is constructed directly here.)
+ */
+TEST_F(AdjRibGroupTest, ResolveEntriesForPeer_UpdateGroupDisabled) {
+  const folly::CIDRNetwork prefix{folly::IPAddress("10.0.0.0"), 24};
+  auto peerId = std::make_shared<nettools::bgplib::BgpPeerId>(
+      folly::IPAddress("10.0.0.1"),
+      folly::IPAddressV4("255.0.0.1").toLongHBO());
+  const auto peerKey = AdjRibOutOwnerKey::forPeer(peerId);
+
+  // --- Lite (non-add-path) ---
+  adjRibOutGroup_ = std::make_shared<AdjRibOutGroup>(
+      *evb_,
+      "test_group_disabled_lite",
+      42,
+      false /* enableUpdateGroup */,
+      createDefaultGroupKey());
+  const auto groupKey = adjRibOutGroup_->getGroupOwnerKey();
+
+  auto* liteGroupEntry = adjRibOutGroup_->addToLiteTree(
+      adjRibOutGroup_->LiteTree_, prefix, groupKey, kDefaultPathID);
+  liteGroupEntry->setRibVersion(100);
+  const auto& liteOwnerMap =
+      adjRibOutGroup_
+          ->getRadixNodeItrFromLiteTree(adjRibOutGroup_->LiteTree_, prefix)
+          ->value();
+  // Group-only entry is never consulted, regardless of version.
+  EXPECT_EQ(
+      nullptr,
+      adjRibOutGroup_->resolveLiteEntryForPeer(liteOwnerMap, peerKey, 100));
+  EXPECT_EQ(
+      nullptr,
+      adjRibOutGroup_->resolveLiteEntryForPeer(liteOwnerMap, peerKey, 1000));
+  // A per-peer entry is still returned (peer key is always consulted).
+  auto* litePeerEntry = adjRibOutGroup_->addToLiteTree(
+      adjRibOutGroup_->LiteTree_, prefix, peerKey, kDefaultPathID);
+  litePeerEntry->setRibVersion(50);
+  EXPECT_EQ(
+      litePeerEntry,
+      adjRibOutGroup_->resolveLiteEntryForPeer(liteOwnerMap, peerKey, 100));
+
+  // --- Path (add-path) ---
+  UpdateGroupKey pathKey = createDefaultGroupKey();
+  pathKey.sendAddPath = true;
+  adjRibOutGroup_ = std::make_shared<AdjRibOutGroup>(
+      *evb_,
+      "test_group_disabled_path",
+      43,
+      false /* enableUpdateGroup */,
+      pathKey);
+  const auto pathGroupKey = adjRibOutGroup_->getGroupOwnerKey();
+
+  auto* pathGroupEntry = adjRibOutGroup_->addToPathTree(
+      adjRibOutGroup_->PathTree_, prefix, pathGroupKey, /*pathId=*/1);
+  pathGroupEntry->setRibVersion(100);
+  auto* pathPeerEntry = adjRibOutGroup_->addToPathTree(
+      adjRibOutGroup_->PathTree_, prefix, peerKey, /*pathId=*/2);
+  pathPeerEntry->setRibVersion(50);
+  const auto& pathOwnerMap =
+      adjRibOutGroup_
+          ->getRadixNodeItrFromPathTree(adjRibOutGroup_->PathTree_, prefix)
+          ->value();
+  // Only the peer-owned pathId 2 is emitted; the group-only pathId 1 is never
+  // consulted.
+  std::map<uint32_t, const AdjRibEntry*> view;
+  adjRibOutGroup_->resolvePathEntriesForPeer(
+      pathOwnerMap,
+      peerKey,
+      /*sharingVersion=*/1000,
+      [&](uint32_t pathId, const AdjRibEntry& entry) {
+        view[pathId] = &entry;
+      });
+  EXPECT_EQ(1u, view.size());
+  EXPECT_EQ(pathPeerEntry, view[2]);
 }
 
 /**
@@ -1791,7 +1978,7 @@ TEST_F(AdjRibGroupPackingFixture, DistributeMessageToInSyncPeers_NoPeers) {
   // No peers registered, should not crash
   EXPECT_NO_THROW(
       folly::coro::blockingWait(adjRibOutGroup_->distributeMessageToInSyncPeers(
-          update, nullptr, nettools::bgplib::BgpUpdateAfi::AFI_IPv4, false)));
+          update, nullptr, nettools::bgplib::BgpUpdateAfi::AFI_IPv4)));
 }
 
 /**
@@ -1803,7 +1990,7 @@ TEST_F(AdjRibGroupPackingFixture, DistributeMessageToInSyncPeers_NullMessage) {
   // Null message - should handle gracefully
   EXPECT_NO_THROW(
       folly::coro::blockingWait(adjRibOutGroup_->distributeMessageToInSyncPeers(
-          nullptr, nullptr, nettools::bgplib::BgpUpdateAfi::AFI_IPv4, false)));
+          nullptr, nullptr, nettools::bgplib::BgpUpdateAfi::AFI_IPv4)));
 }
 
 /**
@@ -1897,7 +2084,7 @@ TEST_F(AdjRibGroupDistributionFixture, BitmapIterationEmptyMap) {
    */
   EXPECT_NO_THROW(
       folly::coro::blockingWait(adjRibOutGroup_->distributeMessageToInSyncPeers(
-          message, nullptr, nettools::bgplib::BgpUpdateAfi::AFI_IPv4, false)));
+          message, nullptr, nettools::bgplib::BgpUpdateAfi::AFI_IPv4)));
 }
 
 /**
@@ -1907,7 +2094,7 @@ TEST_F(AdjRibGroupDistributionFixture, DistributeNullMessage) {
   // Null message should be handled gracefully with warning log
   EXPECT_NO_THROW(
       folly::coro::blockingWait(adjRibOutGroup_->distributeMessageToInSyncPeers(
-          nullptr, nullptr, nettools::bgplib::BgpUpdateAfi::AFI_IPv4, false)));
+          nullptr, nullptr, nettools::bgplib::BgpUpdateAfi::AFI_IPv4)));
 }
 
 /**
@@ -2295,18 +2482,19 @@ TEST_F(AdjRibGroupAddPathFixture, MessageCloning_Nocrash) {
   // Without peers, this is a smoke test that it doesn't crash
   EXPECT_NO_THROW(
       folly::coro::blockingWait(adjRibOutGroup_->distributeMessageToInSyncPeers(
-          message, nullptr, nettools::bgplib::BgpUpdateAfi::AFI_IPv4, false)));
+          message, nullptr, nettools::bgplib::BgpUpdateAfi::AFI_IPv4)));
 }
 
 /**
- * Test: EoR handoff - notifyPeersToSendEoR with no peers
+ * Test: EoR handoff - distributePendingEoRs with no peers
  * Verifies the function handles empty peer maps gracefully
  */
 TEST_F(AdjRibGroupAddPathFixture, NotifyEoR_NoPeersGraceful) {
   createGroupWithAddPath(false);
 
   // With no peers registered, should not crash
-  EXPECT_NO_THROW(adjRibOutGroup_->notifyPeersToSendEoR());
+  EXPECT_NO_THROW(
+      folly::coro::blockingWait(adjRibOutGroup_->distributePendingEoRs()));
 }
 
 /**
@@ -2318,7 +2506,8 @@ TEST_F(AdjRibGroupAddPathFixture, NotifyEoR_BitmapIterationFixed) {
 
   // Even with sparse bitmap, iteration should work
   // This tests the fix: for (const auto& [bitPos, adjRib] : bitToAdjRibs_)
-  EXPECT_NO_THROW(adjRibOutGroup_->notifyPeersToSendEoR());
+  EXPECT_NO_THROW(
+      folly::coro::blockingWait(adjRibOutGroup_->distributePendingEoRs()));
 }
 
 /**
@@ -2532,7 +2721,7 @@ TEST_F(AdjRibGroupPackingFixture, GroupStateTransitions) {
 /*
  * ============================================================================
  * Detached Peer Termination Tests
- * Tests for handleDetachedPeerDown() cleanup logic
+ * Tests for cleanUpDetachedRibEntries() cleanup logic
  * ============================================================================
  */
 

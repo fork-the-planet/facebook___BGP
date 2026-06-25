@@ -196,7 +196,6 @@ class MockRib : public RibDC {
   using RibDC::recordPartialDrainTransition;
   using RibDC::RibDC;
   using RibDC::ribPolicyLogger_;
-  using RibDC::scubaLogger_;
 
   MOCK_METHOD(void, prepareFibProgramming_, ());
 

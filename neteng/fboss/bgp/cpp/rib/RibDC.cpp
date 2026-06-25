@@ -20,7 +20,6 @@
 #include "neteng/fboss/bgp/cpp/BgpServiceUtil.h"
 #include "neteng/fboss/bgp/cpp/common/BgpError.h"
 #include "neteng/fboss/bgp/cpp/common/Consts.h"
-#include "neteng/fboss/bgp/cpp/facebook/ScubaLoggerFactory.h"
 #include "neteng/fboss/bgp/cpp/fsdb/FsdbSyncer.h"
 #include "neteng/fboss/bgp/cpp/peer/NeighborWatcher.h"
 #include "neteng/fboss/bgp/cpp/rib/FibDev.h"
@@ -28,6 +27,7 @@
 #include "neteng/fboss/bgp/cpp/rib/RibDC.h"
 #include "neteng/fboss/bgp/cpp/rib/RibFileUtils.h"
 #include "neteng/fboss/bgp/cpp/rib/RibPolicy.h"
+#include "neteng/fboss/bgp/cpp/rib/RibPolicyLogger.h"
 #include "neteng/fboss/bgp/cpp/rib/Utils.h"
 #include "neteng/fboss/bgp/cpp/stats/Stats.h"
 #include "neteng/fboss/bgp/if/gen-cpp2/bgp_thrift_types.h"
@@ -124,10 +124,8 @@ RibDC::RibDC(
         scheduleRouteAttributePolicyTimer();
       });
 
-  scubaLogger_ = createRibPolicyScubaLogger();
-  if (scubaLogger_ && globalConfig_.deviceName) {
-    ribPolicyLogger_ = std::make_unique<RibPolicyLogger>(
-        *globalConfig_.deviceName, scubaLogger_);
+  if (globalConfig_.deviceName) {
+    ribPolicyLogger_ = createRibPolicyLogger(*globalConfig_.deviceName);
   }
 
   /*
@@ -278,22 +276,22 @@ void RibDC::processNexthopResolutionUpdate(
   }
 }
 
-void RibDC::publishPartialDrainState() {
+bool RibDC::publishPartialDrainState() {
   if (!fsdbSyncer_) {
-    return;
+    return false;
   }
-  if (!isDevicePartiallyDrained()) {
-    fsdbSyncer_->setPartialDrainState(std::nullopt);
-    return;
+  if (!FLAGS_publish_partial_drain_state_to_fsdb) {
+    return false;
   }
   /*
    * Build the snapshot here (device summary + per-prefix drained set) rather
    * than in RibBase::prepareFibProgramming, keeping all drain-domain logic on
    * the DC side. getPartialDrainState() scans ribEntries_ for drained prefixes
-   * — O(n_ribEntries) — but this path is gated on an actual transition, so the
+   * — O(n_ribEntries) — but this path is gated on a pending publish, so the
    * scan runs only on drain-change passes, not every FIB programming pass.
    */
   fsdbSyncer_->setPartialDrainState(std::make_optional(getPartialDrainState()));
+  return true;
 }
 
 /*
@@ -343,6 +341,17 @@ void RibDC::replaceRibPolicy(
         hasUpdatePS,
         hasUpdateRF);
   }
+}
+
+void RibDC::cleanupPlatform() noexcept {
+  /*
+   * Destroy the DC-specific timer on the evb thread. RibBase::stop() has
+   * already joined all coroutines (so none can call
+   * scheduleRouteAttributePolicyTimer() and dereference the timer) and has not
+   * yet terminated the evb loop (so this dispatch can still run).
+   */
+  evb_.runImmediatelyOrRunInEventBaseThreadAndWait(
+      [&]() { routeAttributePolicyTimer_.reset(); });
 }
 
 void RibDC::postRouteFilterPolicyReplaced() {
@@ -854,11 +863,11 @@ std::pair<bool, bool> RibDC::runBestPathSelection(RibEntry& entry) noexcept {
       pathSelectionPolicy_,
       enableRibAllocatedPathId_);
 
-  // Accumulate across the pass; onPrepareFibProgrammingComplete() consumes the
-  // flag to drive a single end-of-pass state publish.
+  // Mark a publish pending across the pass; onPrepareFibProgrammingComplete()
+  // consumes it to drive a single end-of-pass state publish.
   if (recordPartialDrainTransition(
           oldIsPartialDrain, entry.getIsPartialDrain())) {
-    partialDrainStateChanged_ = true;
+    partialDrainPublishPending_ = true;
   }
 
   return result;
@@ -866,15 +875,19 @@ std::pair<bool, bool> RibDC::runBestPathSelection(RibEntry& entry) noexcept {
 
 void RibDC::onPrepareFibProgrammingComplete() noexcept {
   /*
-   * Partial-drain publish is independent of FIB programming — a drain
-   * transition that doesn't change FIB state still needs to be published so
-   * downstream subscribers can react. Runs once per pass, gated on an actual
-   * transition so the snapshot scan in publishPartialDrainState() runs only on
-   * drain-change passes.
+   * Publish the device partial-drain state whenever it is pending: once at
+   * startup (partialDrainPublishPending_ is constructed true, so the baseline
+   * is published on the first completed pass — a never-drained device reports a
+   * positive is_partially_drained=false instead of leaving the subtree absent)
+   * and thereafter on each drain transition. The first pass runs before the
+   * syncer starts, but the write is buffered in the syncer's state tree and
+   * flushed by its initial sync on connect, so no separate post-start seed is
+   * needed. Clear the pending bit only once a publish actually lands —
+   * publishPartialDrainState() no-ops when the feature gflag is off or no
+   * syncer is wired, so a disabled feature never consumes the pending publish.
    */
-  if (partialDrainStateChanged_) {
-    publishPartialDrainState();
-    partialDrainStateChanged_ = false;
+  if (partialDrainPublishPending_ && publishPartialDrainState()) {
+    partialDrainPublishPending_ = false;
   }
 }
 

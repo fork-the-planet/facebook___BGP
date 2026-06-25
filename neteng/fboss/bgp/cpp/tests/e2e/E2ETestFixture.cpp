@@ -1135,22 +1135,20 @@ BgpPeerDisplayInfo createDisplayInfo(
   displayInfo.peeringParams.holdTime =
       cfg.holdTime.value_or(std::chrono::seconds(90));
   displayInfo.peeringParams.description = cfg.description.value_or("");
-  /*
-   * Honor per-peer AFI disable flags so a peer can negotiate a single AFI
-   * (and therefore send a single EoR). Default (flag unset) keeps both AFIs.
-   */
-  const bool v4Enabled = !cfg.disableIpv4Afi.value_or(false);
-  const bool v6Enabled = !cfg.disableIpv6Afi.value_or(false);
-  displayInfo.peeringParams.isAfiIpv4Configured = v4Enabled;
-  displayInfo.peeringParams.isAfiIpv6Configured = v6Enabled;
+  displayInfo.peeringParams.isAfiIpv4Configured =
+      !cfg.disableIpv4Afi.value_or(false);
+  displayInfo.peeringParams.isAfiIpv6Configured =
+      !cfg.disableIpv6Afi.value_or(false);
   displayInfo.peeringParams.nexthopV4 = cfg.nexthopV4;
   displayInfo.peeringParams.nexthopV6 = cfg.nexthopV6;
   displayInfo.peeringParams.advertiseLinkBandwidth = cfg.advertiseLinkBandwidth;
   displayInfo.peeringParams.receiveLinkBandwidth = cfg.receiveLinkBandwidth;
   displayInfo.peeringParams.linkBandwidthBps = cfg.linkBandwidthBps;
   displayInfo.remoteBgpId = peerId.remoteBgpId;
-  displayInfo.negotiatedCapabilities.mpExtV4Unicast() = v4Enabled;
-  displayInfo.negotiatedCapabilities.mpExtV6Unicast() = v6Enabled;
+  displayInfo.negotiatedCapabilities.mpExtV4Unicast() =
+      !cfg.disableIpv4Afi.value_or(false);
+  displayInfo.negotiatedCapabilities.mpExtV6Unicast() =
+      !cfg.disableIpv6Afi.value_or(false);
   /* Enable 4-byte ASN capability (most common at Meta, required for ASNs >
    * 65535) */
   displayInfo.negotiatedCapabilities.as4byte() = true;
@@ -1244,19 +1242,20 @@ void E2ETestFixture::establishSession(
   XLOGF(
       INFO, "=== Establishing session for peer: {} ===", peerId.peerAddr.str());
 
+  auto qs = getQueueSizesForPeer(peerId.peerAddr);
   auto adjRibInQ = std::make_shared<AdjRib::AdjRibInQueueT>();
   auto adjRibOutQ = std::make_shared<AdjRib::AdjRibOutQueueT>();
   auto boundedAdjRibOutQ = std::make_shared<AdjRib::BoundedAdjRibOutQueueT>(
-      defaultQueueCapacity_, defaultQueueHighWm_, defaultQueueLowWm_);
+      qs.capacity, qs.highWm, qs.lowWm);
 
   XLOGF(
       INFO,
       "Test created bounded queue {} for peer {} (capacity={}, highWm={}, lowWm={})",
       (void*)boundedAdjRibOutQ.get(),
       peerId.peerAddr.str(),
-      defaultQueueCapacity_,
-      defaultQueueHighWm_,
-      defaultQueueLowWm_);
+      qs.capacity,
+      qs.highWm,
+      qs.lowWm);
 
   peerQueues_[peerId] = {adjRibInQ, adjRibOutQ, boundedAdjRibOutQ};
   auto currentVersion = std::make_shared<VersionNumber>(versionNumber);
@@ -1309,10 +1308,11 @@ void E2ETestFixture::dispatchStaleSessionEstablished(
       "=== Dispatching stale sessionEstablished for peer: {} ===",
       peerAddr.str());
 
+  auto staleQs = getQueueSizesForPeer(peerAddr);
   auto adjRibInQ = std::make_shared<AdjRib::AdjRibInQueueT>();
   auto adjRibOutQ = std::make_shared<AdjRib::AdjRibOutQueueT>();
   auto boundedAdjRibOutQ = std::make_shared<AdjRib::BoundedAdjRibOutQueueT>(
-      defaultQueueCapacity_, defaultQueueHighWm_, defaultQueueLowWm_);
+      staleQs.capacity, staleQs.highWm, staleQs.lowWm);
 
   // Create VersionNumber with an initial value
   uint64_t staleVersionNumber = 42;
@@ -2057,6 +2057,40 @@ size_t E2ETestFixture::drainPeerQueueCompletely(
   return drainAllOutboundMessagesToOrderedVec(
              peerId, maxRetries, maxMessages, /*sleepMsBetweenRetries=*/0)
       .size();
+}
+
+void E2ETestFixture::drainAndClassifyMessages(
+    const BgpPeerId& peerId,
+    size_t& updateCount,
+    size_t& eorCount,
+    int maxRetries,
+    int maxMessages) {
+  updateCount = 0;
+  eorCount = 0;
+
+  /*
+   * Drain in order via drainAllOutboundMessagesToOrderedVec (the single source
+   * of truth for the empty/retry/pump drain loop), then tally updates vs EoRs.
+   * Pump-only (no sleep between retries) to match the original behavior;
+   * maxRetries maps to the idle-retry budget and maxMessages caps draining.
+   */
+  const auto messages = drainAllOutboundMessagesToOrderedVec(
+      peerId, maxRetries, maxMessages, /*sleepMsBetweenRetries=*/0);
+  for (const auto& msg : messages) {
+    if (msg.isEoR) {
+      eorCount++;
+    } else if (msg.update) {
+      updateCount++;
+    }
+  }
+
+  XLOGF(
+      INFO,
+      "drainAndClassifyMessages: peer {} — {} updates, {} EoRs, {} total",
+      peerId.peerAddr.str(),
+      updateCount,
+      eorCount,
+      updateCount + eorCount);
 }
 
 /*

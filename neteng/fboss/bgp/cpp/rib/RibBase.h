@@ -176,12 +176,22 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
   virtual ~RibBase();
 
   void run() noexcept override;
-  void stop() noexcept override;
 
   /**
-   * @brief Clean up the RIB module resources.
+   * @brief Core shutdown sequence for the Rib module.
+   *
+   * Template method shared by all platforms. The fixed order guarantees that
+   * no coroutine can touch a resource after it is destroyed, and that the evb
+   * loop stays alive until every evb-bound resource has been torn down:
+   *   1. cancelAndJoinTasks() — join all coroutines (asyncScope_) FIRST, so
+   *      none can touch resources destroyed afterwards.
+   *   2. cleanupCommon() — reset core timers, stop/destroy FIB, and clear heavy
+   *      data structures (ribEntries_, nexthopInfoMap_).
+   *   3. cleanupPlatform() — destroy platform-specific resources (e.g. RibDC's
+   *      routeAttributePolicyTimer_) on the evb thread; no-op on BB.
+   *   4. terminate the evb loop, only after all evb-bound cleanup is done.
    */
-  void stopRoutine() noexcept;
+  void stop() noexcept override;
 
   void setFibBatchTime(std::chrono::milliseconds d);
   std::chrono::milliseconds getFibBatchTime() const {
@@ -425,6 +435,31 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
   virtual void saveRibPolicyState() noexcept;
 
  protected:
+  /*
+   * [Exit] Step 1: request cancellation of and join all tasks in asyncScope_.
+   * After this returns no Rib coroutine is running, so timers and data
+   * structures they may access can be destroyed safely in the steps that
+   * follow.
+   */
+  void cancelAndJoinTasks() noexcept;
+
+  /*
+   * [Exit] Step 2: common (platform-agnostic) teardown — reset core timers,
+   * stop and destroy the FIB, and clear heavy data structures. Runs after
+   * cancelAndJoinTasks() and while the evb loop is still alive (stop()
+   * terminates the loop only after cleanupPlatform()).
+   */
+  void cleanupCommon() noexcept;
+
+  /*
+   * [Exit] Step 3: destroy platform-specific stop resources on the evb thread.
+   * Called by stop() after cancelAndJoinTasks() (so no coroutine can race the
+   * teardown) and before the evb loop is terminated (so evb-bound resources
+   * such as RibDC's routeAttributePolicyTimer_ can still be reset). BB has no
+   * such resources and implements this as a no-op.
+   */
+  virtual void cleanupPlatform() noexcept = 0;
+
   virtual void createFib();
   virtual void prepareFibProgramming(bool fullSync = false) noexcept;
   void handleFullAddPathWithdrawal(
@@ -940,9 +975,6 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
   // fib update with batch processing
   std::chrono::milliseconds fibBatchTime_{kFibBatchTimeDefault};
   std::unique_ptr<folly::AsyncTimeout> fibBatchTimer_;
-
-  /* TODO: Move out of RibBase once timer init moves to a subclass */
-  std::unique_ptr<folly::AsyncTimeout> routeAttributePolicyTimer_;
 
   /*
    * [Initialization]

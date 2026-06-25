@@ -59,9 +59,17 @@ void AdjRibStats::clear() {
   egressQueueTotalBlockDurationMs = 0;
   lastEgressQueueBlockTimeMs = 0;
   transientRouteUpdatesSuppressed = 0;
+  numTimesDetachedByBlocking = 0;
+  numTimesDetachedByPolicy = 0;
+  numTimesRejoined = 0;
   totalIngressRouteFilterDenied = 0;
+  preFilterDroppedRouteCount = 0;
   BgpStats::initEgressBackpressureStats();
   BgpStats::initWellKnownCommunityStats();
+}
+
+void AdjRibStats::incrementPreFilterDroppedRouteCount() {
+  preFilterDroppedRouteCount++;
 }
 
 /*******************************************************************************
@@ -219,6 +227,18 @@ void AdjRibStats::addEgressQueueBlockDuration(uint64_t duration) {
 
 void AdjRibStats::incrementTransientRouteUpdatesSuppressed() {
   ++transientRouteUpdatesSuppressed;
+}
+
+void AdjRibStats::incrementTimesDetachedByBlocking() {
+  ++numTimesDetachedByBlocking;
+}
+
+void AdjRibStats::incrementTimesDetachedByPolicy() {
+  ++numTimesDetachedByPolicy;
+}
+
+void AdjRibStats::incrementTimesRejoined() {
+  ++numTimesRejoined;
 }
 
 void AdjRibStats::setLastEgressQueueBlockTime(uint64_t lastBlockTimeMs) {

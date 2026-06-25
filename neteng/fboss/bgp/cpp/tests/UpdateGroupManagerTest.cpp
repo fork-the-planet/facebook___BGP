@@ -385,4 +385,143 @@ TEST_F(UpdateGroupManagerTest, InitialDumpTimestampAndDiscrepancies) {
   EXPECT_EQ(2, group->getTotalDiscrepancies());
 }
 
+TEST_F(UpdateGroupManagerTest, RekeyGroupUpdatesMapKey) {
+  folly::EventBase evb;
+  UpdateGroupConfig config;
+  UpdateGroupManager manager(evb, config);
+
+  auto oldKey = createTestKey("OLD_POLICY");
+  auto group = manager.findOrCreateGroup(oldKey);
+  ASSERT_NE(group, nullptr);
+  EXPECT_TRUE(manager.hasGroup(oldKey));
+
+  // Register a peer and change its egress policy name
+  nettools::bgplib::MonitoredBackPressuredQueue<RibInMessage> ribInQ{
+      nettools::bgplib::kMaxIngressQueueSize};
+  MonitoredMPMCQueue<AdjRib::ObservableMessageT> observerQ;
+  auto peerId = nettools::bgplib::BgpPeerId(
+      folly::IPAddress("10.0.0.1"),
+      folly::IPAddressV4("255.0.0.1").toLongHBO());
+  auto adjRib = std::make_shared<AdjRib>(
+      peerId,
+      PeeringParams(),
+      evb,
+      ribInQ,
+      observerQ,
+      std::make_shared<folly::coro::Baton>(),
+      nullptr,
+      std::make_shared<std::atomic<bool>>(false));
+  group->registerPeer(adjRib);
+
+  // Change egress policy on the peer
+  folly::F14FastMap<bgp_policy::DIRECTION, std::optional<std::string>>
+      newPolicy;
+  newPolicy[bgp_policy::DIRECTION::OUT] = "NEW_POLICY";
+  adjRib->updateIngressEgressPolicyNames(newPolicy);
+
+  // Rekey — should rebuild key on all peers internally
+  manager.rekeyGroup(group);
+
+  // Old key should be gone, new key should exist
+  EXPECT_FALSE(manager.hasGroup(oldKey));
+  auto newKey = group->getGroupKey();
+  EXPECT_EQ(newKey.egressPolicyName, "NEW_POLICY");
+  EXPECT_TRUE(manager.hasGroup(newKey));
+  EXPECT_EQ(manager.getGroup(newKey), group);
+  EXPECT_EQ(manager.getGroupCount(), 1);
+
+  // Verify adjRib's key was updated by rekeyGroup
+  EXPECT_EQ(adjRib->getUpdateGroupKey().egressPolicyName, "NEW_POLICY");
+}
+
+TEST_F(UpdateGroupManagerTest, RekeyGroupNoOpWhenKeyUnchanged) {
+  folly::EventBase evb;
+  UpdateGroupConfig config;
+  UpdateGroupManager manager(evb, config);
+
+  nettools::bgplib::MonitoredBackPressuredQueue<RibInMessage> ribInQ{
+      nettools::bgplib::kMaxIngressQueueSize};
+  MonitoredMPMCQueue<AdjRib::ObservableMessageT> observerQ;
+  auto peerId = nettools::bgplib::BgpPeerId(
+      folly::IPAddress("10.0.0.1"),
+      folly::IPAddressV4("255.0.0.1").toLongHBO());
+  auto adjRib = std::make_shared<AdjRib>(
+      peerId,
+      PeeringParams(),
+      evb,
+      ribInQ,
+      observerQ,
+      std::make_shared<folly::coro::Baton>(),
+      nullptr,
+      std::make_shared<std::atomic<bool>>(false));
+
+  // Build the key from the peer first, then create the group with that key
+  adjRib->buildAndSetUpdateGroupKey();
+  auto key = adjRib->getUpdateGroupKey();
+  auto group = manager.findOrCreateGroup(key);
+  group->registerPeer(adjRib);
+
+  // Rekey without changing the policy — should be a no-op
+  manager.rekeyGroup(group);
+
+  EXPECT_TRUE(manager.hasGroup(key));
+  EXPECT_EQ(manager.getGroupCount(), 1);
+}
+
+TEST_F(UpdateGroupManagerTest, RekeyGroupUpdatesAllPeerKeys) {
+  folly::EventBase evb;
+  UpdateGroupConfig config;
+  UpdateGroupManager manager(evb, config);
+
+  nettools::bgplib::MonitoredBackPressuredQueue<RibInMessage> ribInQ{
+      nettools::bgplib::kMaxIngressQueueSize};
+  MonitoredMPMCQueue<AdjRib::ObservableMessageT> observerQ;
+
+  auto peerId1 = nettools::bgplib::BgpPeerId(
+      folly::IPAddress("10.0.0.1"),
+      folly::IPAddressV4("255.0.0.1").toLongHBO());
+  auto adjRib1 = std::make_shared<AdjRib>(
+      peerId1,
+      PeeringParams(),
+      evb,
+      ribInQ,
+      observerQ,
+      std::make_shared<folly::coro::Baton>(),
+      nullptr,
+      std::make_shared<std::atomic<bool>>(false));
+
+  auto peerId2 = nettools::bgplib::BgpPeerId(
+      folly::IPAddress("10.0.0.2"),
+      folly::IPAddressV4("255.0.0.2").toLongHBO());
+  auto adjRib2 = std::make_shared<AdjRib>(
+      peerId2,
+      PeeringParams(),
+      evb,
+      ribInQ,
+      observerQ,
+      std::make_shared<folly::coro::Baton>(),
+      nullptr,
+      std::make_shared<std::atomic<bool>>(false));
+
+  auto group = manager.findOrCreateGroup(UpdateGroupKey{});
+  group->registerPeer(adjRib1);
+  group->registerPeer(adjRib2);
+
+  // Change egress policy on both peers
+  folly::F14FastMap<bgp_policy::DIRECTION, std::optional<std::string>>
+      newPolicy;
+  newPolicy[bgp_policy::DIRECTION::OUT] = "MULTI_PEER_POLICY";
+  adjRib1->updateIngressEgressPolicyNames(newPolicy);
+  adjRib2->updateIngressEgressPolicyNames(newPolicy);
+
+  manager.rekeyGroup(group);
+
+  // Both peers should have their keys rebuilt
+  EXPECT_EQ(adjRib1->getUpdateGroupKey().egressPolicyName, "MULTI_PEER_POLICY");
+  EXPECT_EQ(adjRib2->getUpdateGroupKey().egressPolicyName, "MULTI_PEER_POLICY");
+
+  // Group key should match
+  EXPECT_EQ(group->getGroupKey().egressPolicyName, "MULTI_PEER_POLICY");
+}
+
 } // namespace facebook::bgp

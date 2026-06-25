@@ -98,6 +98,19 @@ class AdjRibStats {
   uint64_t getTotalIngressRouteFilterDenied() const {
     return totalIngressRouteFilterDenied;
   }
+
+  /*
+   * Per-peer count of received routes dropped because the peer reached its
+   * configured pre-filter max prefix limit (RouteLimit.max_routes). This is
+   * reset on session down via clear(). A non-zero value means the peer is
+   * actively shedding received (PR) routes, which is a more reliable signal
+   * than comparing the live prefix count against the limit (the count can churn
+   * back below the limit while drops continue).
+   */
+  void incrementPreFilterDroppedRouteCount();
+  uint32_t getPreFilterDroppedRouteCount() const {
+    return preFilterDroppedRouteCount;
+  }
   /*******************************************************************************
    *             End   -    AdjRibIn stats functionality
    *******************************************************************************/
@@ -178,6 +191,25 @@ class AdjRibStats {
     return transientRouteUpdatesSuppressed;
   }
 
+  /*
+   * Cumulative count of how many times this peer was detached from its group
+   * (broken down by reason) and how many times it rejoined. Unlike the group's
+   * numPeersDetachedAfterJoin_ gauge (which rises on detach and falls on
+   * rejoin/down), these monotonically increase over the session.
+   */
+  void incrementTimesDetachedByBlocking();
+  void incrementTimesDetachedByPolicy();
+  void incrementTimesRejoined();
+  uint64_t getNumTimesDetachedByBlocking() const {
+    return numTimesDetachedByBlocking;
+  }
+  uint64_t getNumTimesDetachedByPolicy() const {
+    return numTimesDetachedByPolicy;
+  }
+  uint64_t getNumTimesRejoined() const {
+    return numTimesRejoined;
+  }
+
   void setLastEgressQueueBlockTime(uint64_t lastBlockTimeMs);
 
   uint64_t getLastEgressQueueBlockTime() const {
@@ -223,11 +255,16 @@ class AdjRibStats {
   uint64_t totalEnforceFirstAsRejects{0}; // Number of time the validation fails
   uint64_t totalIngressRouteFilterDenied{
       0}; // Number of ingress routes denied by CRF
+  uint32_t preFilterDroppedRouteCount{
+      0}; // Routes dropped by pre_filter max_routes cap
 
   uint32_t egressQueueBlocks{0};
   uint64_t egressQueueTotalBlockDurationMs{0};
   uint64_t lastEgressQueueBlockTimeMs{0};
   uint64_t transientRouteUpdatesSuppressed{0};
+  uint64_t numTimesDetachedByBlocking{0}; // Cumulative blocking detachments
+  uint64_t numTimesDetachedByPolicy{0}; // Cumulative policy detachments
+  uint64_t numTimesRejoined{0}; // Cumulative rejoins into the group
 
   const std::string peerIdOdsStr;
 

@@ -18,10 +18,9 @@
 
 namespace facebook::bgp {
 
-size_t RibPolicyLogger::log(
-    int64_t /*psPolicyVersion*/,
-    int64_t /*rfPolicyVersion*/) {
-  return 0;
+std::unique_ptr<RibPolicyLogger> createRibPolicyLogger(
+    const std::string& /*deviceName*/) {
+  return nullptr;
 }
 
 } // namespace facebook::bgp

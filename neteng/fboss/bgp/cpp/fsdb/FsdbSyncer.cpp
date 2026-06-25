@@ -24,6 +24,11 @@ DEFINE_bool(
     false,
     "Enable publishing RIB entries to FSDB");
 
+DEFINE_bool(
+    publish_partial_drain_state_to_fsdb,
+    false,
+    "Enable RibDC publishing device partial-drain state to FSDB");
+
 namespace {
 const thriftpath::RootThriftPath<facebook::fboss::fsdb::FsdbOperStateRoot>
     fsdbStateRootPath;

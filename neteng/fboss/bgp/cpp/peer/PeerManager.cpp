@@ -41,7 +41,6 @@
 #include "neteng/fboss/bgp/cpp/common/RibMessage.h"
 #include "neteng/fboss/bgp/cpp/config/ConfigManager.h"
 #include "neteng/fboss/bgp/cpp/config/ConfigStructs.h"
-#include "neteng/fboss/bgp/cpp/facebook/ScubaLoggerFactory.h"
 #include "neteng/fboss/bgp/cpp/peer/PeerManager.h"
 #include "neteng/fboss/bgp/cpp/policy/PolicyManager.h"
 #include "neteng/fboss/bgp/cpp/rib/Utils.h"
@@ -273,7 +272,7 @@ PeerManager::PeerManager(
     XLOG(ERR, "Did not get stream peering params");
   }
 
-  scubaLogger_ = createRouteFilterScubaLogger();
+  routeFilterLoggerFactory_ = createRouteFilterLoggerFactory();
   // if safemode file exists, then we are in safemode
   if (boost::filesystem::exists(FLAGS_safemode_file)) {
     XLOGF(
@@ -1115,16 +1114,29 @@ void PeerManager::processRibDumpReq(
    * library only after initial dump with EoR flag is sent to
    * adjRibOut.
    *
-   * consumers must be registered right away as soon EoR flag
+   * Consumers must be registered right away as soon EoR flag
    * is sent so as to not miss any further incremental changes
-   * to routes
+   * to routes. When update group is enabled, only detached
+   * peers would execute this method.
    *
-   * NOTE: With update groups enabled, only detached peers need their
-   * consumer activated here. IN_SYNC peers rely on the group's
-   * change list consumer.
+   * With update group enabled, we activate the changelist
+   * consumer using registerDetachedConsumer; disabled uses
+   * activateChangeListConsumer. The difference is due to two
+   * types of logic:
+   *
+   *  - activateChangeListConsumer has logic for out-delay which
+   *    is not applicable in update group
+   *
+   *  - registerDetachedConsumer uses bounded consumption up until
+   *    the group's position; activateChangeListConsumer will
+   *    consume all the way to the end of changelist every time.
    */
-  if (!enableUpdateGroup_ || adjRib->isDetachedPeer()) {
+  if (!enableUpdateGroup_) {
     adjRib->activateChangeListConsumer();
+  } else if (adjRib->isDetachedPeer()) {
+    adjRib->registerDetachedConsumer(
+        changeListTracker_, addPathConsumerBitmap_, nonAddPathConsumerBitmap_);
+    adjRib->activateDetachedModeProcessing();
   }
 }
 
@@ -2094,23 +2106,15 @@ folly::coro::Task<void> PeerManager::sessionEstablished(
       auto updateGroup = updateGroupManager_->findOrCreateGroup(updateGroupKey);
 
       /*
-       * Set change list consumer on the update group if not already set.
-       * The group needs its own consumer to receive incremental changes
-       * from the change tracker after initial dump completes.
+       * Wire the group's change list tracker and bitmaps once. The group's
+       * change list consumer is created lazily after the initial RIB dump
+       * (AdjRibOutGroup::registerGroupConsumer), not here.
        */
-      if (!updateGroup->getChangeListConsumer()) {
+      if (!updateGroup->getChangeListTracker()) {
         XLOGF(
             INFO,
-            "Setting change list consumer on update group [{}]",
+            "Setting change list tracker on update group [{}]",
             updateGroup->getGroupDescriptor());
-        auto groupConsumer = std::make_shared<AdjRibOutGroupConsumer>(
-            changeListTracker_,
-            updateGroup,
-            fmt::format("UpdateGroup-{}", updateGroup->getAdjRibGroupName()),
-            evb_,
-            addPathConsumerBitmap_,
-            nonAddPathConsumerBitmap_);
-        updateGroup->setChangeListConsumer(groupConsumer);
         updateGroup->setChangeListTracker(
             changeListTracker_,
             addPathConsumerBitmap_,
@@ -2118,7 +2122,7 @@ folly::coro::Task<void> PeerManager::sessionEstablished(
       } else {
         XLOGF(
             DBG1,
-            "Update group [{}] already has change list consumer",
+            "Update group [{}] already has change list tracker",
             updateGroup->getGroupDescriptor());
       }
 
@@ -2259,33 +2263,16 @@ folly::coro::Task<void> PeerManager::sessionTerminated(
   if (enableUpdateGroup_) {
     auto updateGroup = adjRib->getUpdateGroup();
     if (updateGroup) {
-      /* Check if peer is in detached state when going down (Scenario E) */
-      if (adjRib->isDetachedPeer()) {
-        XLOGF(
-            INFO,
-            "Session terminated for detached peer {}, triggering handleDetachedPeerDown",
-            peerId.str());
+      XLOGF(
+          INFO,
+          "Session terminated for peer {}, unregistering from update group",
+          peerId.str());
 
-        updateGroup->handleDetachedPeerDown(adjRib);
+      updateGroup->unregisterPeer(adjRib);
 
-        /* Maybe destroy group if no members remain */
-        const auto& updateGroupKey = adjRib->getUpdateGroupKey();
-        co_await updateGroupManager_->maybeDestroyUpdateGroup(updateGroupKey);
-      } else {
-        // Non-detached peer termination
-        // Unregister from update group and maybe destroy group if no
-        // members
-        XLOGF(
-            INFO,
-            "Session terminated for peer {}, unregistering from update group",
-            peerId.str());
-
-        updateGroup->unregisterPeer(adjRib);
-
-        // Maybe destroy group if no members remain
-        const auto& updateGroupKey = adjRib->getUpdateGroupKey();
-        co_await updateGroupManager_->maybeDestroyUpdateGroup(updateGroupKey);
-      }
+      // Maybe destroy group if no members remain
+      const auto& updateGroupKey = adjRib->getUpdateGroupKey();
+      co_await updateGroupManager_->maybeDestroyUpdateGroup(updateGroupKey);
     }
   }
 
@@ -3664,12 +3651,11 @@ std::tuple<bool, bool> PeerManager::setRouteFilterStatement(
 
     if (isMatch) {
       auto globalConfig = configManager_->getConfig()->getBgpGlobalConfig();
-      if (globalConfig->deviceName) {
-        auto logger = std::make_unique<RouteFilterLogger>(
+      if (routeFilterLoggerFactory_ && globalConfig->deviceName) {
+        auto logger = routeFilterLoggerFactory_->create(
             *(globalConfig->deviceName),
             stmtName,
-            adjRib->getPeeringParams().description,
-            scubaLogger_);
+            adjRib->getPeeringParams().description);
         return adjRib->setRouteFilterStatement(stmt, std::move(logger));
       }
       return adjRib->setRouteFilterStatement(stmt);
@@ -4045,18 +4031,15 @@ folly::coro::Task<void> PeerManager::processGroupEgressPolicyReEvaluation(
       "Group {}: Starting group egress policy re-evaluation",
       group->getAdjRibGroupName());
 
-  // Step 1: Group-level re-evaluation (serves all IN_SYNC members)
+  // Step 1: Rekey the group — rebuilds UpdateGroupKey on all peers
+  // and updates UpdateGroupManager before re-evaluation.
+  updateGroupManager_->rekeyGroup(group);
+
+  // Step 2: Group-level re-evaluation (serves all IN_SYNC members)
   group->reEvaluateSyncPeersEgressPolicy();
 
-  // Step 2: Individual re-evaluation for each detached peer
-  // Step 3: Clear pendingEgressPolicyUpdate for all peers in the group
-  // We iterate all AdjRibs (not just detachedPeers) because IN_SYNC peers
-  // also need their pendingEgressPolicyUpdate flag cleared after step 1.
+  // Step 3: Re-evaluate detached peers and clear pendingEgressPolicyUpdate.
   for (const auto& [_, adjRib] : group->getBitToAdjRibs()) {
-    if (!adjRib->isEgressPolicyUpdateRequired()) {
-      continue;
-    }
-
     if (isRibDumpScheduledForAdjRib(adjRib)) {
       /*
        * Peer already has a rib walk scheduled or in progress (buffered or in
@@ -4083,7 +4066,6 @@ folly::coro::Task<void> PeerManager::processGroupEgressPolicyReEvaluation(
       processRibDumpReq(adjRib, adjRib->sendAddPath());
     }
 
-    // Clear for all peers JOINED and DETACHED after RIB dump has been served.
     adjRib->clearPendingEgressPolicyUpdate();
   }
 

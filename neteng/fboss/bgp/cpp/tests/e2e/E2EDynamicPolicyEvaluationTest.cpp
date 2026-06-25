@@ -355,5 +355,179 @@ TEST_F(E2EDynamicPolicyEvaluationTest, MultiplePeersDrainIndependently) {
   EXPECT_TRUE(
       verifyRouteAdd("v4", "20.0.0.0", 8, kPeerAddr4, kNextHopV4_4.str()));
 }
+/**
+ * E2EUpdateGroupEoRIterationTest
+ *
+ * Tests that EoR is sent exactly once per peer, even when one peer is blocked
+ * during EoR distribution and another peer flaps (goes down and comes back up).
+ *
+ * Uses update groups with egress backpressure and the ACCEPT egress policy.
+ */
+class E2EUpdateGroupEoRIterationTest : public E2ETestFixture {
+ protected:
+  void SetUp() override {
+    setupPolicies();
+
+    /* v4-only peers so EoR is a single message per peer */
+    auto spec3 = kDefaultPeerSpec3;
+    spec3.egressPolicyName = kUndrainPolicyName;
+    spec3.disableIpv6Afi = true;
+    auto spec4 = kDefaultPeerSpec4;
+    spec4.egressPolicyName = kUndrainPolicyName;
+    spec4.disableIpv6Afi = true;
+    auto spec5 = kDefaultPeerSpec5;
+    spec5.egressPolicyName = kUndrainPolicyName;
+    spec5.disableIpv6Afi = true;
+
+    addPeer(spec3);
+    addPeer(spec4);
+    addPeer(spec5);
+
+    /* Add local routes before createRib so they're part of the initial RIB
+     * computation and present in shadow RIB for group initial dumps. */
+    addLocalRoute("10.0.0.0/8", {"100:1"}, 100);
+    addLocalRoute("20.0.0.0/8", {"200:1"}, 150);
+
+    createRib();
+    /* Peer4 gets a small queue (highWm=2) so both routes fit but EoR
+     * blocks on backpressure. Other peers use default queue sizes. */
+    setQueueSizeForPeer(kPeerAddr4, /*capacity=*/3, /*highWm=*/2, /*lowWm=*/0);
+    createPeerManager(
+        /*enableUpdateGroup=*/true, /*enableEgressBackpressure=*/true);
+  }
+
+  void setupPolicies() {
+    auto undrainStatement = createBgpPolicyStatement(
+        kUndrainPolicyName,
+        {createBgpPolicyTerm(
+            "accept-all",
+            "Accept all routes",
+            {},
+            {createBgpPolicyAction(bgp_policy::BgpPolicyActionType::PERMIT)},
+            bgp_policy::FlowControlAction::NEXT_TERM)});
+
+    bgp_policy::BgpPolicies policies;
+    policies.bgp_policy_statements()->emplace_back(undrainStatement);
+    setPolicyConfig(policies);
+  }
+};
+
+/**
+ * Test: BlockedPeerReceivesEoROnceAfterPeerFlap
+ *
+ * Verifies that when peer4 is blocked during EoR distribution and peer5
+ * flaps (down + up), EoR is sent exactly once to each peer.
+ *
+ * Sequence:
+ * T0: Bring up peer3 (source), peer4, peer5. Inject pfx1.
+ * T1: peer4 receives pfx1, then blocks (queue full at highWm=1).
+ *     EoR cannot be pushed to peer4 yet.
+ * T2: Bring down peer5, then bring it back up.
+ * T3: peer5 receives pfx1 + EoR from its rib walk.
+ * T4: Unblock peer4. Inject pfx2.
+ * T5: Verify peer4 messages in order: [UPDATE(pfx1), EoR, UPDATE(pfx2)].
+ *     Verify peer5 messages: [UPDATE(pfx2)] only — no second EoR.
+ */
+TEST_F(
+    E2EUpdateGroupEoRIterationTest,
+    BlockedPeerReceivesEoROnceAfterPeerFlap) {
+  bringUpPeer(kPeerAddr3);
+  bringUpPeer(kPeerAddr4);
+  bringUpPeer(kPeerAddr5);
+
+  BgpPeerId peerId3{kPeerAddr3, kPeerAddr3.asV4().toLongHBO()};
+  BgpPeerId peerId4{kPeerAddr4, kPeerAddr4.asV4().toLongHBO()};
+  BgpPeerId peerId5{kPeerAddr5, kPeerAddr5.asV4().toLongHBO()};
+
+  /* Send EoR after all peers are up so they all join the group before
+   * the initial dump runs. The local route (added in SetUp before
+   * createRib) is already in RIB when the initial path computation
+   * executes. */
+  sendEoRToPeer(peerId3);
+  sendEoRToPeer(peerId4);
+  sendEoRToPeer(peerId5);
+
+  /* Drain peer3 and peer5 to see which ones have received EoR.
+   * Peer4's queue is full (highWm=2) so the group's EoR distribution
+   * coroutine is suspended on peer4. Depending on iteration order,
+   * peer3 and/or peer5 may or may not have received EoR yet. */
+  size_t p3Updates = 0, p3EoRs = 0;
+  drainAndClassifyMessages(peerId3, p3Updates, p3EoRs);
+  XLOGF(
+      INFO,
+      "After initial dump: peer3 got {} updates, {} EoRs",
+      p3Updates,
+      p3EoRs);
+
+  // Don't drain peer4 — its small queue (highWm=2) should block on EoR
+
+  size_t p5Updates = 0, p5EoRs = 0;
+  drainAndClassifyMessages(peerId5, p5Updates, p5EoRs);
+  XLOGF(
+      INFO,
+      "After initial dump: peer5 got {} updates, {} EoRs",
+      p5Updates,
+      p5EoRs);
+
+  /* Flap peers that haven't received EoR yet, then verify they
+   * received both routes + EoR from their rib walk after reconnect. */
+  if (p3EoRs == 0) {
+    bringDownPeer(kPeerAddr3);
+    bringUpPeer(kPeerAddr3, /*versionNumber=*/2);
+    sendEoRToPeer(peerId3);
+
+    size_t p3ReconnUpdates = 0, p3ReconnEoRs = 0;
+    drainAndClassifyMessages(peerId3, p3ReconnUpdates, p3ReconnEoRs);
+    EXPECT_EQ(p3ReconnUpdates, 2)
+        << "Peer3 should have received 2 routes after reconnect";
+    EXPECT_EQ(p3ReconnEoRs, 1)
+        << "Peer3 should have received 1 EoR after reconnect";
+  }
+  if (p5EoRs == 0) {
+    bringDownPeer(kPeerAddr5);
+    bringUpPeer(kPeerAddr5, /*versionNumber=*/2);
+    sendEoRToPeer(peerId5);
+
+    size_t p5ReconnUpdates = 0, p5ReconnEoRs = 0;
+    drainAndClassifyMessages(peerId5, p5ReconnUpdates, p5ReconnEoRs);
+    EXPECT_EQ(p5ReconnUpdates, 2)
+        << "Peer5 should have received 2 routes after reconnect";
+    EXPECT_EQ(p5ReconnEoRs, 1)
+        << "Peer5 should have received 1 EoR after reconnect";
+  }
+
+  /* Unblock peer4 — drain its queue and verify 2 routes + 1 EoR */
+  size_t p4Updates = 0, p4EoRs = 0;
+  drainAndClassifyMessages(peerId4, p4Updates, p4EoRs);
+  EXPECT_EQ(p4Updates, 2) << "Peer4 should have received 2 routes";
+  EXPECT_EQ(p4EoRs, 1) << "Peer4 should have received exactly 1 EoR";
+
+  /* Inject a third route at runtime */
+  injectLocalRoutesAtRuntime({"30.0.0.0/8"}, {"300:1"}, 200);
+  auto prefix3 = folly::IPAddress::createNetwork("30.0.0.0/8");
+  ASSERT_TRUE(waitForRouteInShadowRib(prefix3));
+
+  /* Verify flapped peers receive the third route but NO extra EoR */
+  if (p3EoRs == 0) {
+    size_t p3FinalUpdates = 0, p3FinalEoRs = 0;
+    drainAndClassifyMessages(peerId3, p3FinalUpdates, p3FinalEoRs);
+    EXPECT_EQ(p3FinalUpdates, 1)
+        << "Peer3 should have received the third route";
+    EXPECT_EQ(p3FinalEoRs, 0) << "Peer3 should NOT have received extra EoR";
+  }
+  if (p5EoRs == 0) {
+    size_t p5FinalUpdates = 0, p5FinalEoRs = 0;
+    drainAndClassifyMessages(peerId5, p5FinalUpdates, p5FinalEoRs);
+    EXPECT_EQ(p5FinalUpdates, 1)
+        << "Peer5 should have received the third route";
+    EXPECT_EQ(p5FinalEoRs, 0) << "Peer5 should NOT have received extra EoR";
+  }
+
+  /* Peer4 should also receive the third route with no extra EoR */
+  size_t p4FinalUpdates = 0, p4FinalEoRs = 0;
+  drainAndClassifyMessages(peerId4, p4FinalUpdates, p4FinalEoRs);
+  EXPECT_EQ(p4FinalUpdates, 1) << "Peer4 should have received the third route";
+  EXPECT_EQ(p4FinalEoRs, 0) << "Peer4 should NOT have received extra EoR";
+}
 
 } // namespace facebook::bgp

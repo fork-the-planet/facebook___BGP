@@ -128,9 +128,7 @@ void AdjRibPrefixSet::markGoldenVip(const folly::CIDRNetwork& network) {
  ******************************************************************************/
 
 AdjRib::~AdjRib() {
-  if (isDetachedPeer()) {
-    deactivateDetachedModeProcessing();
-  }
+  cancelPackingTimers();
   setDetachedRibVersion(0);
   resetChangeListConsumer();
   policyCache_.reset();
@@ -456,8 +454,8 @@ AdjRibEntry* FOLLY_NULLABLE AdjRib::getRibEntryWithUpdateGroup(
   auto [entry, isPerPeerEntry] = adjRibOutGroup_->getRibEntrySharedOrPeer(
       prefix, getPeerOwnerKey(), pathId, detachedRibVersion_);
   if (entry && !isPerPeerEntry) {
-    return adjRibOutGroup_->copyEntryForPeer(
-        prefix, pathId, shared_from_this(), getPeerOwnerKey(), entry);
+    return adjRibOutGroup_->copyEntryForOwner(
+        prefix, pathId, getPeerOwnerKey(), entry);
   }
   return entry;
 }
@@ -612,14 +610,18 @@ void AdjRib::sessionEstablished(
     pendingIngressEoRAfis_.insert(BgpUpdateAfi::AFI_IPv6);
   }
 
-  /* reset egress eor flags and timestamps */
-  egressEoRsPending_ = false;
+  /* Reset egress eor timestamps and the one-time sent flag. */
   egressEoRsSent_ = false;
   eorSentTime_ = 0;
   eorReceivedTime_ = 0;
 
   /* Reset pending state from previous session */
   sendCoroScheduled_ = false;
+
+  /*
+   * The per-AFI EGRESS_EOR_PENDING_V4/V6 pending flags live in adjRibFlags_
+   * and are cleared by resetAdjRibFlags() below.
+   */
   resetAdjRibFlags();
 
   /* initialize update group key */
@@ -780,10 +782,12 @@ folly::coro::Task<void> AdjRib::sessionTerminated(
     PeerStats::incrTotalPurgeForGrDoubleFailure();
   }
 
-  /**
-   * Cleanup adjRibOut radix tree by freeing all bgp attrs
-   * Walk correct tree based on terminated session is enabled with
-   * send add-path capability enabled or not
+  /*
+   * Cleanup adjRibOut radix tree by freeing all bgp attrs.
+   * When update groups are enabled this loop frees nothing — a detached peer's
+   * per-peer entries were already erased by cleanUpDetachedRibEntries, and
+   * in-sync peers have no entries under the peer owner key (they share the
+   * group owner key).
    */
   std::vector<folly::CIDRNetwork> deletePrefixSet;
   if (sendAddPath_) {
@@ -1197,17 +1201,22 @@ AdjRib::getPostPolicyAttributesPolicyTermAndInfo(
 }
 
 /*
- * @brief  register consumer to the changeTracker to start now
- *         consuming any changes published to the tracker. To
- *         avoid registering client twice if accidently called
- *         twice, check for existence of changeListConsumeTimer_
- *         Presence of this timer means consumer is already
- *         registered
+ * @brief  Arm this peer's OWN change list consumer to track the FULL change
+ *         list. Used by an in-sync peer (and by all peers when update groups
+ *         are disabled).
  *
- *         schedule registered consumer to poll changes from
- *         the changeList at the time of timer expiry
+ *         The peer's changeListConsumer_ must already exist; this registers it
+ *         with the tracker and schedules a polled timer that, each cycle,
+ *         consumes ALL available changes via iterateChanges() — i.e. the peer
+ *         independently keeps up with the entire change list and builds/sends
+ *         its own BGP updates.
  *
- * @param  none
+ *         To avoid registering twice if accidentally called twice, check for
+ *         existence of changeListConsumeTimer_; its presence means the consumer
+ *         is already registered.
+ *
+ *         Contrast with registerDetachedConsumer(), which CREATES a separate
+ *         detached consumer that is BOUNDED to the group's marker.
  *
  * @return void
  */
@@ -1354,9 +1363,24 @@ void AdjRib::deactivateChangeListConsumer() noexcept {
   }
 }
 
-void AdjRib::registerDetachedConsumer(
+/*
+ * @brief  Create and register a separate DETACHED change list consumer for
+ *         this peer. Used by a detached peer running independently behind/at
+ *         its update group.
+ *
+ *         Unlike activateChangeListConsumer() (which arms the peer's existing
+ *         consumer to consume the ENTIRE change list), this CREATES a new
+ *         "DetachedCL-<peer>" consumer whose polled timer consumes only UP TO
+ *         the group consumer's marker via
+ *         iterateChangesUntilExcluding(groupMarker): a detached peer must never
+ *         advance past the group on the change list, to preserve lazy-clone
+ *         correctness. The timer is created unscheduled; sendBgpUpdates() arms
+ *         it after the packing list drains.
+ *
+ * @return void
+ */
+bool AdjRib::registerDetachedConsumer(
     std::shared_ptr<ChangeTracker<ShadowRibEntry>>& changeListTracker,
-    const std::shared_ptr<AdjRibOutGroupConsumer>& groupConsumer,
     ConsumerBitmap& addPathBitmap,
     ConsumerBitmap& nonAddPathBitmap) {
   if (changeListConsumer_) {
@@ -1364,7 +1388,7 @@ void AdjRib::registerDetachedConsumer(
         WARN,
         "Peer {} already has a detached consumer, skipping registration",
         getPeerName());
-    return;
+    return false;
   }
 
   if (!changeListTracker) {
@@ -1372,15 +1396,7 @@ void AdjRib::registerDetachedConsumer(
         ERR,
         "Cannot register detached consumer for peer {}: null changeListTracker",
         getPeerName());
-    return;
-  }
-
-  if (!groupConsumer) {
-    XLOGF(
-        ERR,
-        "Cannot register detached consumer for peer {}: null groupConsumer",
-        getPeerName());
-    return;
+    return false;
   }
 
   changeListConsumer_ = std::make_shared<AdjRibOutConsumer>(
@@ -1391,71 +1407,107 @@ void AdjRib::registerDetachedConsumer(
       addPathBitmap,
       nonAddPathBitmap);
 
-  // Register with tracker and join at group consumer's position
   changeListConsumer_->registerWithTracker();
   changeListConsumer_->setPolledMode();
   changeListConsumer_->setBitmap();
-  changeListTracker->joinConsumer(groupConsumer, changeListConsumer_);
 
-  // Create CL consumption timer (unscheduled). sendBgpUpdates will
-  // schedule it after PL drain if the peer is a DSP.
   /*
-   * Same co_withExecutor pattern as activateChangeListConsumer() — see
-   * comment there for rationale on cooperative scheduling under scale.
+   * Create CL consumption timer (unscheduled). sendBgpUpdates will
+   * schedule it after PL drain if the peer is a DSP.
+   *
+   * The callback runs the change list consumption inline in the timer
+   * callback. TODO(T274212842): consider running change list consumption as a
+   * cancellable coroutine on packing timer expiry instead.
    */
   changeListConsumeTimer_ = folly::AsyncTimeout::make(evb_, [this]() noexcept {
-    co_withExecutor(
-        &evb_, folly::coro::co_invoke([this]() -> folly::coro::Task<void> {
-          /*
-           * Guard against use-after-reset: DETACHED_INIT_DUMP peers call
-           * activateChangeListConsumer() which schedules this coroutine,
-           * then rapidly transition to DETACHED_READY_TO_JOIN and rejoin
-           * the group — the rejoin path resets the consumer while this
-           * coroutine is still pending on the EventBase.
-           */
-          if (!changeListConsumer_) {
-            XLOGF(
-                WARN,
-                "Peer {}: detached CL consume timer fired but "
-                "changeListConsumer_ is null, skipping",
-                getPeerName());
-            co_return;
-          }
-          // Consume available changes from CL
-          auto previousRibVersion = lastSeenRibVersion_;
-          changeListConsumer_->iterateChanges();
-          if (changeListConsumer_->isStale(kConsumerStalenessThreshold) &&
-              !changeListConsumer_->isStalenessLogged()) {
-            XLOGF(
-                WARN,
-                "Peer {}: detached change list consumer stale for {}ms, marker has not advanced",
-                getPeerName(),
-                changeListConsumer_->stalenessDuration().count());
-            changeListConsumer_->markStalenessLogged();
-          }
-          XLOGF(
-              DBG2,
-              "Peer {}: Updating cached RIB version from {} to {}",
-              getPeerName(),
-              previousRibVersion,
-              lastSeenRibVersion_);
+    /*
+     * Guard against use-after-reset: DETACHED_INIT_DUMP peers call
+     * activateChangeListConsumer() which schedules this timer,
+     * then rapidly transition to DETACHED_READY_TO_JOIN and rejoin
+     * the group — the rejoin path resets the consumer while this
+     * timer callback is still pending on the EventBase.
+     */
+    if (!changeListConsumer_) {
+      XLOGF(
+          WARN,
+          "Peer {}: detached CL consume timer fired but "
+          "changeListConsumer_ is null, skipping",
+          getPeerName());
+      return;
+    }
+    /*
+     * Consume changes up to the group consumer's marker.
+     * Detached peers must not advance past the group on the
+     * change list to preserve lazy-clone correctness.
+     */
+    auto previousRibVersion = lastSeenRibVersion_;
+    auto groupConsumer = adjRibOutGroup_->getChangeListConsumer();
+    auto* groupMarker = groupConsumer->getMarker();
+    changeListConsumer_->iterateChangesUntilExcluding(groupMarker);
+    if (changeListConsumer_->isStale(kConsumerStalenessThreshold) &&
+        !changeListConsumer_->isStalenessLogged()) {
+      XLOGF(
+          WARN,
+          "Peer {}: detached change list consumer stale for {}ms, "
+          "marker has not advanced",
+          getPeerName(),
+          changeListConsumer_->stalenessDuration().count());
+      changeListConsumer_->markStalenessLogged();
+    }
+    XLOGF(
+        DBG2,
+        "Peer {}: Updating cached RIB version from {} to {}",
+        getPeerName(),
+        previousRibVersion,
+        lastSeenRibVersion_);
 
-          // Drain any new PL entries generated by CL consumption
-          scheduleSendBgpUpdates(true /* tryPullNewChangeItems */);
+    /*
+     * Drain any new PL entries generated by CL consumption.
+     * Because the peer is not allowed to move if it is ahead
+     * of the group on the changelist, then exiting on
+     * backpressure only to not move forward by that much,
+     * is not efficient. We would like detached consumers
+     * to send out their packing list.
+     */
+    scheduleSendBgpUpdates(false /* tryPullNewChangeItems */);
 
-          // Reschedule for next cycle
-          if (changeListConsumeTimer_) {
-            changeListConsumeTimer_->scheduleTimeout(
-                std::chrono::milliseconds(mraiInterval));
-          }
-          co_return;
-        }))
-        .start();
+    // Reschedule for next cycle
+    if (changeListConsumeTimer_) {
+      changeListConsumeTimer_->scheduleTimeout(
+          std::chrono::milliseconds(mraiInterval));
+    }
   });
 
+  XLOGF(INFO, "Registered detached consumer for peer {}", getPeerName());
+  return true;
+}
+
+void AdjRib::registerDetachedConsumerAtGroupPosition(
+    std::shared_ptr<ChangeTracker<ShadowRibEntry>>& changeListTracker,
+    const std::shared_ptr<AdjRibOutGroupConsumer>& groupConsumer,
+    ConsumerBitmap& addPathBitmap,
+    ConsumerBitmap& nonAddPathBitmap) {
+  if (!groupConsumer) {
+    XLOGF(
+        ERR,
+        "Cannot join detached consumer for peer {} at group position: "
+        "null groupConsumer",
+        getPeerName());
+    return;
+  }
+  if (!registerDetachedConsumer(
+          changeListTracker, addPathBitmap, nonAddPathBitmap)) {
+    XLOGF(
+        ERR,
+        "Cannot join detached consumer for peer {} at group position: "
+        "failed to register detached consumer",
+        getPeerName());
+    return;
+  }
+  changeListTracker->joinConsumer(groupConsumer, changeListConsumer_);
   XLOGF(
       INFO,
-      "Registered detached consumer for peer {} at group's CL position",
+      "Joined detached consumer for peer {} at group's CL position",
       getPeerName());
 }
 

@@ -26,6 +26,7 @@
 #include "configerator/structs/neteng/fboss/bgp/gen-cpp2/bgp_config_types.h"
 #include "neteng/fboss/bgp/cpp/BgpServiceUtil.h"
 #include "neteng/fboss/bgp/cpp/adjrib/AdjRib.h"
+#include "neteng/fboss/bgp/cpp/adjrib/RouteFilterLogger.h"
 #include "neteng/fboss/bgp/cpp/adjrib/ShadowRibTypes.h"
 #include "neteng/fboss/bgp/cpp/adjrib/UpdateGroupManager.h"
 #include "neteng/fboss/bgp/cpp/changeTracker/ChangeItem.h"
@@ -466,7 +467,7 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
   /*
    * Test-only: defer DRJ acceptance for a specific peer.
    * Delegates to the update group manager's shared groups (not per-peer
-   * adjRibOutGroups_). checkAndAcceptDSPPeer runs on the shared update
+   * adjRibOutGroups_). maybeAcceptDSPPeer runs on the shared update
    * group, so the deferred flag must be set there.
    */
   void testOnlySetDeferDrjAcceptance(
@@ -949,8 +950,9 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
   // Route Filter Policy
   std::unique_ptr<RouteFilterPolicy> routeFilterPolicy_{nullptr};
 
-  // scuba logger for route filter policy
-  std::shared_ptr<rfe::ScubaData> scubaLogger_{nullptr};
+  // Builds per-statement route filter loggers; null when logging is
+  // unavailable.
+  std::unique_ptr<RouteFilterLoggerFactory> routeFilterLoggerFactory_{nullptr};
 
   /*
    * [AdjRib/PeerManager -> Rib]

@@ -513,6 +513,18 @@ class E2ETestFixture : public ::testing::Test {
     defaultQueueLowWm_ = lowWm;
   }
 
+  /*
+   * Set queue sizes for a specific peer, overriding the defaults.
+   * Call before bringUpPeer() for the target peer.
+   */
+  void setQueueSizeForPeer(
+      const folly::IPAddress& peerAddr,
+      int capacity,
+      int highWm,
+      int lowWm) {
+    perPeerQueueSizes_[peerAddr] = {capacity, highWm, lowWm};
+  }
+
   /* Create and start PeerManager with MockSessionManager
    * enableUpdateGroup: Enable update group optimization
    * enableEgressBackpressure: Enable egress queue backpressure
@@ -647,6 +659,18 @@ class E2ETestFixture : public ::testing::Test {
    */
   size_t drainPeerQueueCompletely(
       const BgpPeerId& peerId,
+      int maxRetries = 5,
+      int maxMessages = 100);
+
+  /*
+   * Drain all messages from a peer's outbound queue and report whether
+   * any EoR messages were found. Counts of updates and EoRs are returned
+   * via output parameters.
+   */
+  void drainAndClassifyMessages(
+      const BgpPeerId& peerId,
+      size_t& updateCount,
+      size_t& eorCount,
       int maxRetries = 5,
       int maxMessages = 100);
 
@@ -1115,6 +1139,23 @@ class E2ETestFixture : public ::testing::Test {
   int defaultQueueCapacity_{8};
   int defaultQueueHighWm_{6};
   int defaultQueueLowWm_{2};
+
+  // Per-peer queue size overrides (set via setQueueSizeForPeer)
+  struct QueueSizes {
+    int capacity;
+    int highWm;
+    int lowWm;
+  };
+  std::unordered_map<folly::IPAddress, QueueSizes> perPeerQueueSizes_;
+
+  // Resolve queue sizes for a peer: per-peer override if set, else defaults
+  QueueSizes getQueueSizesForPeer(const folly::IPAddress& peerAddr) const {
+    auto it = perPeerQueueSizes_.find(peerAddr);
+    if (it != perPeerQueueSizes_.end()) {
+      return it->second;
+    }
+    return {defaultQueueCapacity_, defaultQueueHighWm_, defaultQueueLowWm_};
+  }
 };
 
 /*

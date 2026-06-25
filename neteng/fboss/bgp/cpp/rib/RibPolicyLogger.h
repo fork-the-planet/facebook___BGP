@@ -16,30 +16,31 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 
-namespace facebook {
-namespace rfe {
-class ScubaData;
-} // namespace rfe
+namespace facebook::bgp {
 
-namespace bgp {
-
+/**
+ * Logs rib policy version transitions. Abstract so the logging backend is not
+ * part of the public interface; the concrete implementation lives in the
+ * build-specific source set and is built through createRibPolicyLogger(). OSS
+ * builds have no implementation.
+ */
 class RibPolicyLogger {
  public:
-  explicit RibPolicyLogger(
-      const std::string& deviceName,
-      std::shared_ptr<rfe::ScubaData> scubaLogger)
-      : deviceName_(deviceName), scubaLogger_(std::move(scubaLogger)) {}
-  ~RibPolicyLogger() = default;
+  virtual ~RibPolicyLogger() = default;
 
-  size_t log(int64_t psPolicyVersion, int64_t rfPolicyVersion);
-
- private:
-  const std::string deviceName_;
-  std::shared_ptr<rfe::ScubaData> scubaLogger_{nullptr};
+  virtual size_t log(int64_t psPolicyVersion, int64_t rfPolicyVersion) = 0;
 };
 
-} // namespace bgp
-} // namespace facebook
+/**
+ * Returns nullptr when rib policy logging is unavailable (e.g. OSS builds) or
+ * disabled by flag.
+ */
+std::unique_ptr<RibPolicyLogger> createRibPolicyLogger(
+    const std::string& deviceName);
+
+} // namespace facebook::bgp

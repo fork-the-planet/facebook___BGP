@@ -764,6 +764,16 @@ TBgpSession PeerManager::getSessionInfo(
           stats.getPostOutPrefixCount();
       tBgpSession.recv_update_msgs() = stats.getRecvUpdateMsgs();
       tBgpSession.sent_update_msgs() = stats.getSentUpdateMsgs();
+
+      /*
+       * Per-peer routes dropped because the peer reached its configured
+       * pre-filter max prefix limit. A non-zero value means the peer is
+       * actively shedding received (PR) routes; `show bgp summary` flags it and
+       * the health validator reuses this count.
+       */
+      tBgpSession.prepolicy_rcvd_dropped_prefix_count() =
+          stats.getPreFilterDroppedRouteCount();
+
       tBgpSession.rib_version() = adjRib->getLastSeenRibVersion();
       if (adjRib->getIngressPolicyName().has_value()) {
         tBgpSession.ingress_policy_name() =

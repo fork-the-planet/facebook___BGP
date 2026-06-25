@@ -544,6 +544,130 @@ TEST_F(AdjRibInboundFixture, V4GetNetworks2_Advertised) {
   evb_.loop();
 }
 
+// With update groups, an in-sync peer's RIB-OUT entries are stored under the
+// group owner key. getNetworks2 must surface them — previously it looked up
+// only the peer owner key and returned nothing.
+TEST_F(
+    AdjRibInboundFixture,
+    V4GetNetworks2_AdvertisedGroupKeyVisibleToInSyncPeer) {
+  setupAdjRib();
+  // The fixture's default group is update-group-disabled; attach an enabled
+  // group so the resolver consults the group owner key.
+  adjRib_->setUpdateGroup(
+      std::make_shared<AdjRibOutGroup>(
+          evb_, "ug", 1, /*enableUpdateGroup=*/true, UpdateGroupKey{}));
+
+  fm_->addTask([&] {
+    auto group = adjRib_->getUpdateGroup();
+    constexpr uint64_t kEntryVersion = 100;
+    auto prefix = kV4Prefix1;
+    auto inputUpdate = createV4BgpUpdateSingleAnnounce(prefix, kV4Nexthop1);
+    auto inputAttrs = std::make_shared<facebook::bgp::BgpPath>(
+        BgpPathFields(*BgpUpdate2toBgpPathC(*inputUpdate)));
+
+    // Entry stored under the GROUP owner key (no per-peer entry).
+    auto* groupEntry = group->addToLiteTree(
+        group->LiteTree_, prefix, group->getGroupOwnerKey(), kDefaultPathID);
+    groupEntry->setPreOut(inputAttrs);
+    groupEntry->setRibVersion(kEntryVersion);
+    group->setLastSeenRibVersion(kEntryVersion);
+
+    // A direct peer-owner-key lookup finds nothing — the entry lives under the
+    // group key (this is precisely the bug the resolver fixes).
+    EXPECT_EQ(
+        nullptr,
+        group->getFromLiteTree(
+            group->LiteTree_, prefix, adjRib_->getPeerOwnerKey()));
+
+    // Peer is non-detached -> sharingVersion == group version -> entry shared.
+    std::map<TIpPrefix, std::vector<TBgpPath>> prefixToPath;
+    adjRib_->getNetworks2(prefixToPath, RouteFilterType::PRE_FILTER_ADVERTISED);
+    EXPECT_EQ(1u, prefixToPath.size());
+
+    terminateAdjRib();
+  });
+
+  evb_.loop();
+}
+
+// A detached peer shares only group entries at/below its detach version; a
+// post-detach group entry it never saw must be omitted (the "missing" per-peer
+// entry is expected, not a bug).
+TEST_F(AdjRibInboundFixture, V4GetNetworks2_AdvertisedDetachedVersionGate) {
+  setupAdjRib();
+  // The fixture's default group is update-group-disabled; attach an enabled
+  // group so the resolver consults the group owner key.
+  adjRib_->setUpdateGroup(
+      std::make_shared<AdjRibOutGroup>(
+          evb_, "ug", 1, /*enableUpdateGroup=*/true, UpdateGroupKey{}));
+
+  fm_->addTask([&] {
+    auto group = adjRib_->getUpdateGroup();
+    constexpr uint64_t kEntryVersion = 100;
+    auto prefix = kV4Prefix1;
+    auto inputUpdate = createV4BgpUpdateSingleAnnounce(prefix, kV4Nexthop1);
+    auto inputAttrs = std::make_shared<facebook::bgp::BgpPath>(
+        BgpPathFields(*BgpUpdate2toBgpPathC(*inputUpdate)));
+
+    auto* groupEntry = group->addToLiteTree(
+        group->LiteTree_, prefix, group->getGroupOwnerKey(), kDefaultPathID);
+    groupEntry->setPreOut(inputAttrs);
+    groupEntry->setRibVersion(kEntryVersion);
+    group->setLastSeenRibVersion(kEntryVersion);
+
+    adjRib_->setPeerState(PeerUpdateState::DETACHED_RUNNING);
+
+    // Detached before the entry was announced -> never seen -> omitted.
+    adjRib_->setDetachedRibVersion(kEntryVersion - 1);
+    std::map<TIpPrefix, std::vector<TBgpPath>> omitted;
+    adjRib_->getNetworks2(omitted, RouteFilterType::PRE_FILTER_ADVERTISED);
+    EXPECT_EQ(0u, omitted.size());
+
+    // Detached at/after the entry version -> still shared -> visible.
+    adjRib_->setDetachedRibVersion(kEntryVersion);
+    std::map<TIpPrefix, std::vector<TBgpPath>> shared;
+    adjRib_->getNetworks2(shared, RouteFilterType::PRE_FILTER_ADVERTISED);
+    EXPECT_EQ(1u, shared.size());
+
+    terminateAdjRib();
+  });
+
+  evb_.loop();
+}
+
+// With update group disabled, a group-owner-key entry is invisible to the peer:
+// the show consults only the peer owner key. Guards the explicit
+// enableUpdateGroup_ gate in the resolver.
+TEST_F(
+    AdjRibInboundFixture,
+    V4GetNetworks2_AdvertisedDisabledUpdateGroupIgnoresGroupKey) {
+  setupAdjRib();
+  // enableUpdateGroup_ stays false (default).
+
+  fm_->addTask([&] {
+    auto group = adjRib_->getUpdateGroup();
+    auto prefix = kV4Prefix1;
+    auto inputUpdate = createV4BgpUpdateSingleAnnounce(prefix, kV4Nexthop1);
+    auto inputAttrs = std::make_shared<facebook::bgp::BgpPath>(
+        BgpPathFields(*BgpUpdate2toBgpPathC(*inputUpdate)));
+
+    auto* groupEntry = group->addToLiteTree(
+        group->LiteTree_, prefix, group->getGroupOwnerKey(), kDefaultPathID);
+    groupEntry->setPreOut(inputAttrs);
+    groupEntry->setRibVersion(100);
+    group->setLastSeenRibVersion(100);
+
+    // Update group disabled -> group key never consulted -> nothing surfaced.
+    std::map<TIpPrefix, std::vector<TBgpPath>> prefixToPath;
+    adjRib_->getNetworks2(prefixToPath, RouteFilterType::PRE_FILTER_ADVERTISED);
+    EXPECT_EQ(0u, prefixToPath.size());
+
+    terminateAdjRib();
+  });
+
+  evb_.loop();
+}
+
 // Ensure that getNetworks works properly
 TEST_F(AdjRibInboundFixture, V6GetNetworks) {
   setupAdjRib();

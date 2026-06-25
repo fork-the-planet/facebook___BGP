@@ -122,7 +122,13 @@
   FRIEND_TEST(AdjRibInboundFixture, StopDrainsPendingRibInPushes);            \
   FRIEND_TEST(AdjRibInboundFixture, StopBlocksUntilPendingPushCompletes);     \
   FRIEND_TEST(AdjRibInboundFixture, SchedulePendingRibInPushTrimsReady);      \
-  FRIEND_TEST(AdjRibInboundFixture, PushStaleWithdrawalPushesToRibInQ);
+  FRIEND_TEST(AdjRibInboundFixture, PushStaleWithdrawalPushesToRibInQ);       \
+  FRIEND_TEST(                                                                \
+      AdjRibProcessPeerAnnouncedFixture,                                      \
+      PreFilterDroppedRouteCountIncrementsOnCap);                             \
+  FRIEND_TEST(                                                                \
+      AdjRibProcessPeerAnnouncedFixture,                                      \
+      PreFilterDroppedRouteCountClearedOnSessionDown);
 
 #define AdjRibStats_TEST_FRIENDS                                               \
   friend class AdjRibInboundFixture;                                           \
@@ -165,7 +171,7 @@
 
 #include "fboss/lib/CommonUtils.h"
 #include "neteng/fboss/bgp/cpp/adjrib/AdjRib.h"
-#include "neteng/fboss/bgp/cpp/adjrib/RouteFilterLogger.h"
+#include "neteng/fboss/bgp/cpp/adjrib/facebook/RouteFilterLogger.h"
 #include "neteng/fboss/bgp/cpp/common/Consts.h"
 #include "neteng/fboss/bgp/cpp/common/RibMessage.h"
 #include "neteng/fboss/bgp/cpp/common/Utils.h"
@@ -1666,6 +1672,38 @@ TEST_F(AdjRibProcessPeerAnnouncedFixture, CanAddRibEntryTest_WithinLimit) {
   auto path = std::make_shared<BgpPath>(*buildBgpPathFields(1, 1, 1, 1));
   bool canAdd = adjRib_->canAddRibInEntry(kV4Prefix1, path);
   EXPECT_TRUE(canAdd);
+}
+
+TEST_F(
+    AdjRibProcessPeerAnnouncedFixture,
+    PreFilterDroppedRouteCountIncrementsOnCap) {
+  // Hitting the pre-filter cap increments the per-peer pre-filter dropped
+  // route counter (consumed by `show bgp summary` and the health validator).
+  for (int i = 0; i < adjRib_->peeringParams_.preRouteLimit->max_routes();
+       ++i) {
+    adjRib_->stats_.incrementPreInPrefixCount(
+        kV4Prefix1, false /* isVipPrefix */, false /* isGoldenVip */);
+  }
+  EXPECT_EQ(0, adjRib_->stats_.getPreFilterDroppedRouteCount());
+
+  auto path = std::make_shared<BgpPath>(*buildBgpPathFields(1, 1, 1, 1));
+  EXPECT_FALSE(adjRib_->canAddRibInEntry(kV4Prefix1, path));
+
+  EXPECT_EQ(1, adjRib_->stats_.getPreFilterDroppedRouteCount());
+}
+
+TEST_F(
+    AdjRibProcessPeerAnnouncedFixture,
+    PreFilterDroppedRouteCountClearedOnSessionDown) {
+  // clear() is invoked on session teardown (AdjRib::sessionTerminated), so the
+  // per-peer dropped counter resets when the session goes down.
+  adjRib_->stats_.incrementPreFilterDroppedRouteCount();
+  adjRib_->stats_.incrementPreFilterDroppedRouteCount();
+  EXPECT_EQ(2, adjRib_->stats_.getPreFilterDroppedRouteCount());
+
+  adjRib_->stats_.clear();
+
+  EXPECT_EQ(0, adjRib_->stats_.getPreFilterDroppedRouteCount());
 }
 
 TEST_F(
@@ -6170,7 +6208,7 @@ TEST_F(AdjRibInboundFixture, VerifyRouteFilterPolicyDeny) {
             EXPECT_EQ(0, sample.getNormVectorValue("communities").size());
             return 1;
           }));
-  auto logger = std::make_unique<RouteFilterLogger>(
+  auto logger = std::make_unique<ScubaRouteFilterLogger>(
       "rsw001", "rsw.*", "fsw001", mockScuba);
 
   fm_->addTask([&] {
@@ -6248,7 +6286,7 @@ TEST_F(AdjRibInboundFixture, VerifyRouteFilterPolicyAllow) {
   setupAdjRib(policyManager, policyName);
 
   auto mockScuba = std::make_shared<MockScubaData>();
-  auto logger = std::make_unique<RouteFilterLogger>(
+  auto logger = std::make_unique<ScubaRouteFilterLogger>(
       "rsw001", "rsw.*", "fsw001", mockScuba);
 
   fm_->addTask([&] {
@@ -6331,7 +6369,7 @@ TEST_F(
   setupAdjRib(policyManager, policyName);
 
   auto mockScuba = std::make_shared<MockScubaData>();
-  auto logger = std::make_unique<RouteFilterLogger>(
+  auto logger = std::make_unique<ScubaRouteFilterLogger>(
       "rsw001", "rsw.*", "fsw001", mockScuba);
 
   fm_->addTask([&] {
@@ -6462,7 +6500,7 @@ TEST_F(AdjRibInboundFixture, VerifyAnnouncementsWithEgressRouteFilterPolicy) {
   setupAdjRib(policyManager, policyName);
 
   auto mockScuba = std::make_shared<MockScubaData>();
-  auto logger = std::make_unique<RouteFilterLogger>(
+  auto logger = std::make_unique<ScubaRouteFilterLogger>(
       "rsw001", "rsw.*", "fsw001", mockScuba);
 
   fm_->addTask([&] {
@@ -6545,7 +6583,7 @@ TEST_F(
   EXPECT_TRUE(adjRib_->isStateEstablished());
 
   auto mockScuba = std::make_shared<MockScubaData>();
-  auto logger = std::make_unique<RouteFilterLogger>(
+  auto logger = std::make_unique<ScubaRouteFilterLogger>(
       "rsw001", "rsw.*", "fsw001", mockScuba);
 
   fm_->addTask([&] {
@@ -6693,7 +6731,7 @@ TEST_F(
   adjRib_->policyReEvaluationBatchSize_ = 2;
 
   auto mockScuba = std::make_shared<MockScubaData>();
-  auto logger = std::make_unique<RouteFilterLogger>(
+  auto logger = std::make_unique<ScubaRouteFilterLogger>(
       "rsw001", "rsw.*", "fsw001", mockScuba);
   std::array<folly::fibers::Baton, 4> syncBaton; // Added one more baton
   std::vector<folly::CIDRNetwork> prefixSet1{
@@ -6919,7 +6957,7 @@ TEST_F(
   EXPECT_TRUE(adjRib_->isStateEstablished());
 
   auto mockScuba = std::make_shared<MockScubaData>();
-  auto logger = std::make_unique<RouteFilterLogger>(
+  auto logger = std::make_unique<ScubaRouteFilterLogger>(
       "rsw001", "rsw.*", "fsw001", mockScuba);
 
   std::array<folly::fibers::Baton, 3> syncBaton;
@@ -7087,7 +7125,7 @@ TEST_F(AdjRibInboundFixture, VerifyRouteFilterPolicyReEvaluationWithGR) {
   adjRib_->markStateEstablished();
   EXPECT_TRUE(adjRib_->isStateEstablished());
   auto mockScuba = std::make_shared<MockScubaData>();
-  auto logger = std::make_unique<RouteFilterLogger>(
+  auto logger = std::make_unique<ScubaRouteFilterLogger>(
       "rsw001", "rsw.*", "fsw001", mockScuba);
 
   fm_->addTask([&] {
@@ -7169,7 +7207,7 @@ TEST_F(AdjRibInboundFixture, VerifyRouteFilterPolicyReEvaluationWithGR) {
     auto emptyStmt = createTRouteFilterStatement(
         {}, false /* permissive */, false /* egress */);
 
-    logger = std::make_unique<RouteFilterLogger>(
+    logger = std::make_unique<ScubaRouteFilterLogger>(
         "rsw001", "rsw.*", "fsw001", mockScuba);
 
     auto [ingressChanged2, egressChanged2] = adjRib_->setRouteFilterStatement(
@@ -7342,7 +7380,7 @@ TEST_F(
   EXPECT_TRUE(adjRib_->isStateEstablished());
 
   auto mockScuba = std::make_shared<MockScubaData>();
-  auto logger = std::make_unique<RouteFilterLogger>(
+  auto logger = std::make_unique<ScubaRouteFilterLogger>(
       "rsw001", "rsw.*", "fsw001", mockScuba);
 
   fm_->addTask([&] {
@@ -7447,7 +7485,7 @@ TEST_F(
     auto emptyStmt = createTRouteFilterStatement(
         {}, false /* permissive */, false /* egress */);
 
-    logger = std::make_unique<RouteFilterLogger>(
+    logger = std::make_unique<ScubaRouteFilterLogger>(
         "rsw001", "rsw.*", "fsw001", mockScuba);
 
     auto [ingressChanged2, egressChanged2] = adjRib_->setRouteFilterStatement(

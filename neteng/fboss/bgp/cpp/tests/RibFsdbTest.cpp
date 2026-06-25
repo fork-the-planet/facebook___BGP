@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <folly/ScopeGuard.h>
 #include <folly/coro/BlockingWait.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -221,18 +222,19 @@ TEST_F(RibFsdbFixture, RibEntryFsdbWithdrawnWhenBestPathDeniedByCps) {
 }
 
 /*
- * End-to-end gating test for the new partial-drain FSDB publish path. Runs
- * the Rib through a real partial-drain transition (entry then exit) and
- * verifies that FsdbSyncer::setPartialDrainState is invoked with the
- * expected state by observing FSDB via a subscriber. This exercises both
- * branches added in Rib::prepareFibProgramming:
- *   - drainedPrefixCount_ > 0 → publish populated TPartialDrainState
- *   - drainedPrefixCount_ == 0 → publish std::nullopt (clear)
- *
- * Setup mirrors PartialDrainStatusReflectsRibState in RibTest.cpp, but
- * runs under RibFsdbFixture so a real FSDB syncer is wired into the Rib.
+ * End-to-end publish path with publish_partial_drain_state_to_fsdb enabled.
+ * Drives the Rib through a partial-drain transition (entry then exit) and
+ * verifies both edges publish a populated TPartialDrainState (never nullopt):
+ * is_partially_drained=true on entry, =false on exit. Mirrors
+ * PartialDrainStatusReflectsRibState (RibTest.cpp) but under RibFsdbFixture so
+ * a real FSDB syncer is wired in.
  */
 TEST_F(RibFsdbFixture, PartialDrainStatePublishedToFsdbOnTransition) {
+  FLAGS_publish_partial_drain_state_to_fsdb = true;
+  SCOPE_EXIT {
+    FLAGS_publish_partial_drain_state_to_fsdb = false;
+  };
+
   auto subscribedState = fsdbSubscriber_->subscribe(
       fsdbSubscriber_->getRootStatePath().bgp().partialDrainState());
 
@@ -324,11 +326,124 @@ TEST_F(RibFsdbFixture, PartialDrainStatePublishedToFsdbOnTransition) {
                                 .has_value());
   })
 
-  // Withdraw the only path → entry has no routes → selectBestPath resets
-  // isPartialDrain_ → drainedPrefixCount_ flips 1 → 0 →
-  // setPartialDrainState(std::nullopt) fires (clear branch). Because
-  // partialDrainState is an optional field on BgpData, the FSDB ref-to-
-  // nullptr publish surfaces to the subscriber as !has_value().
+  // Withdraw the only path → drainedPrefixCount_ flips 1 → 0. The exit edge
+  // publishes a populated is_partially_drained=false snapshot (not nullopt), so
+  // the node stays present with an empty drained set and transition_count=2.
+  fibFuture = fib_->getFibProgramFuture();
+  sendWithdrawal(prefixBatch, eBgpPeer1_);
+  fibFuture.wait();
+
+  WITH_RETRIES_N(5, {
+    auto stateLk = subscribedState.rlock();
+    ASSERT_EVENTUALLY_TRUE(stateLk->has_value());
+    EXPECT_EVENTUALLY_FALSE(
+        *(*stateLk)->partial_drain_state()->is_partially_drained());
+    EXPECT_EVENTUALLY_EQ(
+        *(*stateLk)->partial_drain_state()->num_affected_prefixes(), 0);
+    EXPECT_EVENTUALLY_EQ(
+        *(*stateLk)->partial_drain_state()->partial_drain_transition_count(),
+        2);
+    EXPECT_EVENTUALLY_TRUE((*stateLk)->drained_prefixes()->empty());
+  })
+}
+
+/*
+ * Initial-publish path with no drain transition. With
+ * publish_partial_drain_state_to_fsdb enabled, the first completed FIB pass
+ * publishes the device partial-drain state even though no prefix ever drains,
+ * so a never-drained device reports a populated is_partially_drained=false (not
+ * nullopt) with transition_count=0 and an empty drained set. Guards the
+ * single-gate behavior that replaced the separate post-start seed.
+ */
+TEST_F(RibFsdbFixture, PartialDrainStateInitialFalsePublishedWhenNeverDrained) {
+  FLAGS_publish_partial_drain_state_to_fsdb = true;
+  SCOPE_EXIT {
+    FLAGS_publish_partial_drain_state_to_fsdb = false;
+  };
+
+  auto subscribedState = fsdbSubscriber_->subscribe(
+      fsdbSubscriber_->getRootStatePath().bgp().partialDrainState());
+
+  auto fibFuture = fib_->getFibProgramFuture();
+  sendInitialPathComputation();
+  fibFuture.wait();
+  rib_->setFibBatchTime(milliseconds(2));
+
+  WITH_RETRIES({ ASSERT_EVENTUALLY_EQ(ribOutQ_.size(), 2); });
+  REPEAT_N(2, folly::coro::blockingWait(ribOutQ_.pop()));
+
+  // Install a path with no drain-triggering policy, so the device never enters
+  // partial drain.
+  auto prefixBatch = PrefixPathIds{{kV4Prefix1, kDefaultPathID}};
+  fibFuture = fib_->getFibProgramFuture();
+  sendAnnouncement(prefixBatch, eBgpPeer1_, attr_);
+  fibFuture.wait();
+
+  // The first completed FIB pass publishes a positive
+  // is_partially_drained=false snapshot without any transition: node present,
+  // no affected prefixes, empty drained set, and transition_count still 0 (the
+  // initial publish does not bump the enter/exit counter).
+  WITH_RETRIES_N(5, {
+    auto stateLk = subscribedState.rlock();
+    ASSERT_EVENTUALLY_TRUE(stateLk->has_value());
+    EXPECT_EVENTUALLY_FALSE(
+        *(*stateLk)->partial_drain_state()->is_partially_drained());
+    EXPECT_EVENTUALLY_EQ(
+        *(*stateLk)->partial_drain_state()->num_affected_prefixes(), 0);
+    EXPECT_EVENTUALLY_EQ(
+        *(*stateLk)->partial_drain_state()->partial_drain_transition_count(),
+        0);
+    EXPECT_EVENTUALLY_TRUE((*stateLk)->drained_prefixes()->empty());
+  })
+}
+
+/*
+ * Disabled (default) path: with publish_partial_drain_state_to_fsdb off,
+ * publishPartialDrainState is a no-op on both edges. Drives the same drain
+ * entry/exit as PartialDrainStatePublishedToFsdbOnTransition and asserts the
+ * FSDB node stays absent (!has_value()) throughout.
+ */
+TEST_F(RibFsdbFixture, PartialDrainStateNotPublishedWhenFlagDisabled) {
+  ASSERT_FALSE(FLAGS_publish_partial_drain_state_to_fsdb);
+
+  auto subscribedState = fsdbSubscriber_->subscribe(
+      fsdbSubscriber_->getRootStatePath().bgp().partialDrainState());
+
+  auto fibFuture = fib_->getFibProgramFuture();
+  sendInitialPathComputation();
+  fibFuture.wait();
+  rib_->setFibBatchTime(milliseconds(2));
+
+  WITH_RETRIES({ ASSERT_EVENTUALLY_EQ(ribOutQ_.size(), 2); });
+  REPEAT_N(2, folly::coro::blockingWait(ribOutQ_.pop()));
+
+  auto prefixBatch = PrefixPathIds{{kV4Prefix1, kDefaultPathID}};
+  fibFuture = fib_->getFibProgramFuture();
+  sendAnnouncement(prefixBatch, eBgpPeer1_, attr_);
+  fibFuture.wait();
+
+  WITH_RETRIES({ ASSERT_EVENTUALLY_GE(ribOutQ_.size(), 1); });
+  folly::coro::blockingWait(ribOutQ_.pop());
+
+  // mnh=3 with a single installed path → prefix enters partial drain
+  // (drainedPrefixCount_ 0 → 1). Flag off → no publish.
+  TPathSelector tPathSelector;
+  tPathSelector.bgp_native_path_selection_min_nexthop() = 3;
+  tPathSelector.drain_on_min_nexthop_violation() = true;
+
+  auto ribFuture = rib_->getRibPrepareFibProgrammingFuture();
+  sendPathSelectionPolicySet(
+      createTPathSelectionPolicyWithPathSelector({kV4Prefix1}, tPathSelector));
+  rib_->waitForPathSelectionPolicyUpdate();
+  ribFuture.wait();
+
+  WITH_RETRIES_N(5, {
+    auto stateLk = subscribedState.rlock();
+    EXPECT_EVENTUALLY_FALSE(stateLk->has_value());
+  })
+
+  // Withdraw the only path → drainedPrefixCount_ flips 1 → 0. Still off, so the
+  // exit edge is also a no-op and the node remains absent.
   fibFuture = fib_->getFibProgramFuture();
   sendWithdrawal(prefixBatch, eBgpPeer1_);
   fibFuture.wait();
@@ -353,6 +468,11 @@ TEST_F(RibFsdbFixture, PartialDrainStatePublishedToFsdbOnTransition) {
  * — fails here.
  */
 TEST_F(RibFsdbFixture, PartialDrainStatePublishedWithLbwThresholdOnTransition) {
+  FLAGS_publish_partial_drain_state_to_fsdb = true;
+  SCOPE_EXIT {
+    FLAGS_publish_partial_drain_state_to_fsdb = false;
+  };
+
   auto subscribedState = fsdbSubscriber_->subscribe(
       fsdbSubscriber_->getRootStatePath().bgp().partialDrainState());
 

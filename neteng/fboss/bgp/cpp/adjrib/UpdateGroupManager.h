@@ -110,6 +110,13 @@ class UpdateGroupManager {
   }
 
   /*
+   * Re-key a group after egress policy re-evaluation.
+   * Calls buildAndSetUpdateGroupKey on all peers in the group,
+   * then moves the group's entry in the map to the new key.
+   */
+  void rekeyGroup(const std::shared_ptr<AdjRibOutGroup>& group);
+
+  /*
    * Trigger initial dumps for all update groups in UNINITIALIZED state.
    * Called when BGP initialization completes.
    */
