@@ -1271,23 +1271,8 @@ class AdjRibOutGroupConsumer : public Consumer<ShadowRibEntry> {
   ProcessResult processChangeItem(ChangeItem<ShadowRibEntry>* item) {
     ShadowRibEntry& srEntry = item->getTypedObject();
 
-    /*
-     * Transition to READY when receiving new change tracker item
-     * Expected states: IDLE or WAITING
-     * If in other states, log error but still transition to READY
-     */
-    auto currentState = adjRibOutGroup_->getState();
-    if (currentState == UpdateGroupState::IDLE ||
-        currentState == UpdateGroupState::WAITING) {
-      adjRibOutGroup_->setState(UpdateGroupState::READY);
-    } else {
-      XLOGF(
-          ERR,
-          "Group {} received change item in unexpected state {}, transitioning to READY anyway",
-          adjRibOutGroup_->getGroupDescriptor(),
-          static_cast<int>(currentState));
-      adjRibOutGroup_->setState(UpdateGroupState::READY);
-    }
+    /* Transition to READY when receiving a new change tracker item. */
+    adjRibOutGroup_->setState(UpdateGroupState::READY);
 
     adjRibOutGroup_->processShadowRibEntryChange(srEntry);
     return ProcessResult::CONTINUE;

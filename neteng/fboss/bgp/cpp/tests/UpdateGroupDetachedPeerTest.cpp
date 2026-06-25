@@ -3391,7 +3391,7 @@ TEST_F(UpdateGroupDetachedPeerTest, RibWalkDetachCopiesEgressEoRsPending) {
 
 /*
  * Test: collapseLiteEntry skips detachedRibVersion check for init dump peers
- * (WAS_DETACHED_INIT_DUMP_PEER flag) and queues announcements for all
+ * (DETACHED_INIT_DUMP_PEER flag) and queues announcements for all
  * group-only entries.
  */
 TEST_F(
@@ -3410,7 +3410,7 @@ TEST_F(
 
   /* Set detachedRibVersion=10 — normally ribVersion(5) <= 10 would skip */
   adjRib->setDetachedRibVersion(10);
-  adjRib->setAdjRibFlag(AdjRib::WAS_DETACHED_INIT_DUMP_PEER);
+  adjRib->setAdjRibFlag(AdjRib::DETACHED_INIT_DUMP_PEER);
   adjRib->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
   group_->markPeerDetached(adjRib);
 
@@ -3424,7 +3424,7 @@ TEST_F(
 
 /**
  * Test: collapsePathEntry skips detachedRibVersion check for init dump peers
- * (WAS_DETACHED_INIT_DUMP_PEER flag) and queues announcements for all
+ * (DETACHED_INIT_DUMP_PEER flag) and queues announcements for all
  * group-only entries.
  */
 TEST_F(
@@ -3449,7 +3449,7 @@ TEST_F(
 
   /* Set detachedRibVersion=10 — normally ribVersion(5) <= 10 would skip */
   adjRib->setDetachedRibVersion(10);
-  adjRib->setAdjRibFlag(AdjRib::WAS_DETACHED_INIT_DUMP_PEER);
+  adjRib->setAdjRibFlag(AdjRib::DETACHED_INIT_DUMP_PEER);
   adjRib->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
   group_->markPeerDetached(adjRib);
 

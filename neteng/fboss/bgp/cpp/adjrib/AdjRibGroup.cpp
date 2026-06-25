@@ -2336,7 +2336,7 @@ void AdjRibOutGroup::registerPeer(const std::shared_ptr<AdjRib>& adjRib) {
         adjRib->getPeerState(),
         PeerUpdateState::DETACHED_INIT_DUMP);
     adjRib->setPeerState(PeerUpdateState::DETACHED_INIT_DUMP);
-    adjRib->setAdjRibFlag(AdjRib::WAS_DETACHED_INIT_DUMP_PEER);
+    adjRib->setAdjRibFlag(AdjRib::DETACHED_INIT_DUMP_PEER);
 
     // Schedule individual initial dump for this peer
     // This will be done by PeerManager after registerPeer returns
@@ -2983,7 +2983,7 @@ std::vector<std::shared_ptr<AdjRib>> AdjRibOutGroup::tryAcceptPeersToGroup(
     }
 
     peer->deactivateDetachedModeProcessing();
-    peer->clearAdjRibFlag(AdjRib::WAS_DETACHED_INIT_DUMP_PEER);
+    peer->clearAdjRibFlag(AdjRib::DETACHED_INIT_DUMP_PEER);
     // Reset block info on rejoin rather than on detach activation, because
     // block info is used for frequency-based slow peer detection and should
     // only be reset when the peer rejoins the group with a fresh start.
@@ -3154,12 +3154,12 @@ bool AdjRibOutGroup::collapsePathEntry(
   } else if (peerIt == ownerMap.end() && groupIt != ownerMap.end()) {
     /*
      * Group-only entries: queue announcements for post-detach pathIds.
-     * For init dump peers (WAS_DETACHED_INIT_DUMP_PEER), skip the rib version
+     * For init dump peers (DETACHED_INIT_DUMP_PEER), skip the rib version
      * check since they have no meaningful detachedRibVersion — they need all
      * entries.
      */
     bool isDetachedInitDump =
-        peer->isAdjRibFlagSet(AdjRib::WAS_DETACHED_INIT_DUMP_PEER);
+        peer->isAdjRibFlagSet(AdjRib::DETACHED_INIT_DUMP_PEER);
     bool hasDiscrepancy = isDetachedInitDump;
     for (const auto& [pathId, groupEntry] : groupIt->second) {
       if (isDetachedInitDump ||
@@ -3362,13 +3362,13 @@ bool AdjRibOutGroup::collapseLiteEntry(
     return true;
   } else if (peerIt == ownerMap.end() && groupIt != ownerMap.end()) {
     /*
-     * Group-only entry: for init dump peers (WAS_DETACHED_INIT_DUMP_PEER),
+     * Group-only entry: for init dump peers (DETACHED_INIT_DUMP_PEER),
      * skip the rib version check since they have no meaningful
      * detachedRibVersion — they need all entries. For DSP peers, only
      * post-detach entries (ribVersion > detachedRibVersion) are discrepancies.
      */
     bool isDetachedInitDump =
-        peer->isAdjRibFlagSet(AdjRib::WAS_DETACHED_INIT_DUMP_PEER);
+        peer->isAdjRibFlagSet(AdjRib::DETACHED_INIT_DUMP_PEER);
     if (isDetachedInitDump ||
         groupIt->second->getRibVersion() > peer->getDetachedRibVersion()) {
       /* Peer never saw this entry, queue announcement (discrepancy found). */

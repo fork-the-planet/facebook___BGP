@@ -1010,15 +1010,15 @@ class AdjRib : boost::noncopyable,
   }
 
   /*
-   * Bit 0: RIB_OUT_DISCREPANCY — peer's RIB-OUT entries diverged from
+   * RIB_OUT_DISCREPANCY — peer's RIB-OUT entries diverged from
    *        the group during collapse, preventing rejoin.
-   * Bit 1: IS_DETACHED_FAST_PEER — peer caught up before the group moved on
+   * IS_DETACHED_FAST_PEER — peer caught up before the group moved on
    *        CL (DFP). No collapse needed on rejoin.
-   * Bit 2: WAS_DETACHED_INIT_DUMP_PEER — peer entered the group via initial
+   * DETACHED_INIT_DUMP_PEER — peer entered the group via initial
    *        dump (DETACHED_INIT_DUMP), not via detachSlowPeer. During collapse,
    *        all group-only entries must be announced since the peer has no
    *        meaningful detachedRibVersion.
-   * Bit 3: SCHEDULED_PUSH_TO_PEER — a sendBgpUpdates or
+   * SCHEDULED_PUSH_TO_PEER — a sendBgpUpdates or
    *        deferredPushToPeer coroutine is pending for this peer.
    *        Set when scheduled, cleared when the coroutine completes.
    *        While set, processRibDumpReq skips activateChangeListConsumer
@@ -1034,11 +1034,11 @@ class AdjRib : boost::noncopyable,
    */
   enum AdjRibFlag : uint32_t {
     RIB_OUT_DISCREPANCY = 0,
-    IS_DETACHED_FAST_PEER = 1,
-    WAS_DETACHED_INIT_DUMP_PEER = 2,
+    IS_DETACHED_FAST_PEER,
+    DETACHED_INIT_DUMP_PEER,
     /* A sendBgpUpdates (detached) or deferredPushToPeer (in-sync) coroutine
      * is pending. Mutually exclusive by peer state — see comment above. */
-    SCHEDULED_PUSH_TO_PEER = 3,
+    SCHEDULED_PUSH_TO_PEER,
   };
 
   bool isAdjRibFlagSet(AdjRibFlag flag) const {
