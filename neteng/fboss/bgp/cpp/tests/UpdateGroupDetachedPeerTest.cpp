@@ -107,7 +107,10 @@
       PeerAheadOfGroupDoesNotProceedOnChangelist);                             \
   FRIEND_TEST(                                                                 \
       UpdateGroupDetachLifecycleTest,                                          \
-      DSPRejoinDeferredUntilGroupPackingListDrains);
+      DSPRejoinDeferredUntilGroupPackingListDrains);                           \
+  FRIEND_TEST(                                                                 \
+      UpdateGroupDetachLifecycleTest,                                          \
+      AheadDepASelfPromotesWhenGroupHasNoSharingPeers);
 
 #define AdjRibOutGroup_TEST_FRIENDS                                            \
   friend class UpdateGroupDetachedPeerTest;                                    \
@@ -2940,6 +2943,11 @@ class UpdateGroupDetachLifecycleTest : public ::testing::Test {
     groupConsumer_->setMarker(nullptr);
   }
 
+  bool isGroupConsumeTimerScheduled() const {
+    return group_->changeListConsumeTimer_ &&
+        group_->changeListConsumeTimer_->isScheduled();
+  }
+
   /*
    * Set up a peer's CL consumer in ready state so isReadyToRejoinGroup()
    * returns true. Required for DSP peers going through
@@ -4968,6 +4976,53 @@ TEST_F(
 
   // Peer should stay in DETACHED_READY_TO_JOIN, not set to DETACHED_RUNNING
   EXPECT_EQ(adjRib0->getPeerState(), PeerUpdateState::DETACHED_READY_TO_JOIN);
+}
+
+/*
+ * A DEP-A finishing its drain (transitionPeerUpdateState) while the group is
+ * frozen with no SYNC peers and no peer sharing its entries self-promotes to
+ * SYNC via promoteDetachedPeerToSync.
+ */
+TEST_F(
+    UpdateGroupDetachLifecycleTest,
+    AheadDepASelfPromotesWhenGroupHasNoSharingPeers) {
+  auto depA = createAndRegisterPeer(0);
+
+  /*
+   * DEP-A ahead of the group (detachedRibVersion 0), still draining. The group
+   * has no SYNC peers and nothing sharing its entries, so it is frozen waiting
+   * for a detached peer to promote itself.
+   */
+  depA->setPeerState(PeerUpdateState::DETACHED_RUNNING);
+  depA->setLastSeenRibVersion(100);
+  group_->setLastSeenRibVersion(50);
+  group_->markPeerDetached(depA);
+  setUpReadyPeerConsumer(depA);
+  /*
+   * Group consumer not at end of CL -> isReadyToRejoinGroup() is false, so the
+   * peer takes the "ahead of group" branch.
+   */
+  publishChangeItem(folly::CIDRNetwork{folly::IPAddress("10.1.0.0"), 24});
+  ASSERT_EQ(group_->getNumInSyncPeers(), 0);
+  ASSERT_EQ(group_->getNumPeersDetachedAfterJoin(), 0);
+
+  depA->transitionPeerUpdateState();
+
+  // The DEP-A self-promoted to SYNC and the group adopted its RIB version.
+  EXPECT_EQ(depA->getPeerState(), PeerUpdateState::JOINED_RUNNING);
+  EXPECT_TRUE(group_->isPeerInSync(0));
+  EXPECT_FALSE(group_->getDetachedPeers().contains(depA));
+  EXPECT_EQ(group_->getNumInSyncPeers(), 1);
+  EXPECT_EQ(group_->getLastSeenRibVersion(), 100);
+
+  // The group's consume timer was restarted now that it has a SYNC peer again.
+  EXPECT_TRUE(isGroupConsumeTimerScheduled());
+
+  /*
+   * promoteDetachedPeerToSync rebuilt the group consumer; repoint the fixture's
+   * handle so TearDown tears down the live one.
+   */
+  groupConsumer_ = group_->getChangeListConsumer();
 }
 
 /*

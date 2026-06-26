@@ -1756,6 +1756,26 @@ void AdjRib::transitionPeerUpdateState() noexcept {
         PeerUpdateState::DETACHED_READY_TO_JOIN);
     setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
     cancelPackingTimers();
+
+    /*
+     * If the group has no SYNC peers it is frozen waiting for a detached peer
+     * to promote itself (handleNoSyncPeers). This DEP-A has just finished
+     * draining, so it can re-seed the group. Only do so when no detached peer
+     * still shares the group's entries (numPeersDetachedAfterJoin_ == 0):
+     * promoteDetachedPeerToSync deletes group-only entries, which would corrupt
+     * a sharing DSP's pending rejoin, so leave the DEP-A parked and let that
+     * DSP catch up and collapse first.
+     */
+    if (adjRibOutGroup_->getNumInSyncPeers() == 0 &&
+        adjRibOutGroup_->getNumPeersDetachedAfterJoin() == 0) {
+      adjRibOutGroup_->promoteDetachedPeerToSync(shared_from_this());
+      adjRibOutGroup_->scheduleChangeListConsumeTimer();
+    }
+    /*
+     * Otherwise the DEP-A stays parked in DETACHED_READY_TO_JOIN: once the
+     * group starts moving again it will catch up to the peer's position and
+     * pick it up via checkAndAcceptReadyToJoinPeers.
+     */
   } else {
     reschedulePackingTimers();
   }
