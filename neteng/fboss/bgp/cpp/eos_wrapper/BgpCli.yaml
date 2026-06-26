@@ -24,7 +24,7 @@ commands:
       | (table [detail | (prefix {<ipPrefix>}) | (more-specifics {<ipPrefix>}) | (community {<community>})])
       | techsupport
       | (update-group [{<groupId>}])
-      | (rib-policy [criteria {<ipPrefix>}])
+      | (rib-policy [(criteria {<ipPrefix>}) | crf])
       | health
       | (holdtimers [{<ipAddr>}])
       | (nexthopinfo <ipAddr>)
@@ -46,6 +46,7 @@ commands:
       config: { keyword: { help: Show BGP configuration } }
       community: { keyword: { help: Show BGP routes with paths matching community value or name } }
       criteria: { keyword: { help: Show BGP RibPolicy active path selection criteria for prefixes } }
+      crf: { keyword: { help: Show BGP RibPolicy active route filters } }
       detail: { keyword: { help: Show BGP RIB route details } }
       dryrun-post-policy: { keyword: { help: Routes after dry run on new policy configuration at /var/tmp/bgpcpp.conf } }
       entries: { keyword: { help: Show entry statistics } }
