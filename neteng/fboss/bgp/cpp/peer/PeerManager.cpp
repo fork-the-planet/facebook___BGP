@@ -1016,6 +1016,7 @@ void PeerManager::processRibDumpReq(
     const std::shared_ptr<AdjRib>& adjRib,
     bool sendAddPath) {
   [[maybe_unused]] ScopedProfile profile("PeerManager::processRibDumpReq");
+  auto ribVersionBeforeWalk = adjRib->getLastSeenRibVersion();
   XLOGF(
       DBG1,
       "Handling RibDumpReq inside ShadowRib from peer {}",
@@ -1138,6 +1139,14 @@ void PeerManager::processRibDumpReq(
         changeListTracker_, addPathConsumerBitmap_, nonAddPathConsumerBitmap_);
     adjRib->activateDetachedModeProcessing();
   }
+
+  XLOGF(
+      INFO,
+      "Peer {}: processRibDumpReq complete "
+      "(lastSeenRibVersion: {} -> {})",
+      adjRib->getPeerName(),
+      ribVersionBeforeWalk,
+      adjRib->getLastSeenRibVersion());
 }
 
 bool PeerManager::isRibDumpScheduledForAdjRib(
