@@ -5053,7 +5053,7 @@ TEST(ChangeTrackerTest, ConsumeWithIteratorUntil_YieldBeforeBoundary) {
 }
 
 // ============================================================
-// skipUntilMarker Tests
+// attachToMarkerAhead Tests
 // ============================================================
 
 namespace {
@@ -5062,7 +5062,7 @@ namespace {
  * Advance `consumer` forward `steps` items using the iterator API, acking each
  * via markProcessed() WITHOUT invoking the process callback, then pend it at
  * the resulting marker. Used to deterministically set up "ahead"/"behind"
- * consumer positions for skipUntilMarker tests without polluting
+ * consumer positions for attachToMarkerAhead tests without polluting
  * getProcessedItems().
  */
 void advanceConsumerBySteps(
@@ -5086,7 +5086,7 @@ void advanceConsumerBySteps(
  * its process callback. This also exercises the get-next-before-ack ordering:
  * items are freed mid-walk, so the wrong order would use-after-free.
  */
-TEST(ChangeTrackerTest, SkipUntilMarker_TargetAhead_Aligns) {
+TEST(ChangeTrackerTest, AttachToMarkerAhead_TargetAhead_Aligns) {
   std::vector<int> freed;
   ChangeTracker<TestObject> tracker("SkipTargetAheadTracker");
   TestProducer producer(tracker);
@@ -5119,7 +5119,7 @@ TEST(ChangeTrackerTest, SkipUntilMarker_TargetAhead_Aligns) {
         }
       });
 
-  tracker.skipUntilMarker(current, target);
+  tracker.attachToMarkerAhead(current, target);
 
   // current is now aligned at target's marker (item 3).
   ASSERT_NE(current->getMarker(), nullptr);
@@ -5147,7 +5147,7 @@ TEST(ChangeTrackerTest, SkipUntilMarker_TargetAhead_Aligns) {
  * item through to the end and becomes a ready consumer (null marker, in ready
  * list). With both consumers acking, all items are freed.
  */
-TEST(ChangeTrackerTest, SkipUntilMarker_TargetReady_CurrentBecomesReady) {
+TEST(ChangeTrackerTest, AttachToMarkerAhead_TargetReady_CurrentBecomesReady) {
   std::vector<int> freed;
   ChangeTracker<TestObject> tracker("SkipTargetReadyTracker");
   TestProducer producer(tracker);
@@ -5175,7 +5175,7 @@ TEST(ChangeTrackerTest, SkipUntilMarker_TargetReady_CurrentBecomesReady) {
         }
       });
 
-  tracker.skipUntilMarker(current, target);
+  tracker.attachToMarkerAhead(current, target);
 
   // current walked to the end and is now ready.
   EXPECT_TRUE(current->isReady());
@@ -5193,10 +5193,10 @@ TEST(ChangeTrackerTest, SkipUntilMarker_TargetReady_CurrentBecomesReady) {
 }
 
 /*
- * current and target already at the same marker: skipUntilMarker is a no-op.
- * Nothing is acked or freed and current's position is unchanged.
+ * current and target already at the same marker: attachToMarkerAhead is a
+ * no-op. Nothing is acked or freed and current's position is unchanged.
  */
-TEST(ChangeTrackerTest, SkipUntilMarker_AlreadyAligned_NoOp) {
+TEST(ChangeTrackerTest, AttachToMarkerAhead_AlreadyAligned_NoOp) {
   std::vector<int> freed;
   ChangeTracker<TestObject> tracker("SkipAlignedTracker");
   TestProducer producer(tracker);
@@ -5223,7 +5223,7 @@ TEST(ChangeTrackerTest, SkipUntilMarker_AlreadyAligned_NoOp) {
         }
       });
 
-  tracker.skipUntilMarker(current, target);
+  tracker.attachToMarkerAhead(current, target);
 
   // No-op: current still at item 1, nothing freed, callback never ran.
   ASSERT_NE(current->getMarker(), nullptr);
@@ -5241,7 +5241,7 @@ TEST(ChangeTrackerTest, SkipUntilMarker_AlreadyAligned_NoOp) {
  * current acks through to the end and becomes ready. Nothing is freed here
  * because target still owns every item (its bit stays set).
  */
-TEST(ChangeTrackerTest, SkipUntilMarker_TargetBehind_CurrentBecomesReady) {
+TEST(ChangeTrackerTest, AttachToMarkerAhead_TargetBehind_CurrentBecomesReady) {
   ChangeTracker<TestObject> tracker("SkipTargetBehindTracker");
   TestProducer producer(tracker);
 
@@ -5266,7 +5266,7 @@ TEST(ChangeTrackerTest, SkipUntilMarker_TargetBehind_CurrentBecomesReady) {
   ASSERT_EQ(current->getMarker()->getTypedObject().getValue(), 3);
   ASSERT_EQ(target->getMarker()->getTypedObject().getValue(), 1);
 
-  tracker.skipUntilMarker(current, target);
+  tracker.attachToMarkerAhead(current, target);
 
   // current walked off the end (never found the behind target) -> ready.
   EXPECT_TRUE(current->isReady());
@@ -5282,10 +5282,10 @@ TEST(ChangeTrackerTest, SkipUntilMarker_TargetBehind_CurrentBecomesReady) {
 }
 
 /*
- * skipUntilMarker is a safe no-op on invalid arguments: null current, null
+ * attachToMarkerAhead is a safe no-op on invalid arguments: null current, null
  * target, or an unregistered current consumer.
  */
-TEST(ChangeTrackerTest, SkipUntilMarker_InvalidArgs_NoOp) {
+TEST(ChangeTrackerTest, AttachToMarkerAhead_InvalidArgs_NoOp) {
   ChangeTracker<TestObject> tracker("SkipInvalidArgsTracker");
   TestProducer producer(tracker);
 
@@ -5299,9 +5299,9 @@ TEST(ChangeTrackerTest, SkipUntilMarker_InvalidArgs_NoOp) {
   // Unregistered consumer: no registerWithTracker, so bitPosition == -1.
   auto unregistered = std::make_shared<TestConsumer>(tracker, "Unregistered");
 
-  tracker.skipUntilMarker(nullptr, target);
-  tracker.skipUntilMarker(target, nullptr);
-  tracker.skipUntilMarker(unregistered, target);
+  tracker.attachToMarkerAhead(nullptr, target);
+  tracker.attachToMarkerAhead(target, nullptr);
+  tracker.attachToMarkerAhead(unregistered, target);
 
   // target and the unregistered consumer are both untouched.
   EXPECT_EQ(target->getMarker(), markerBefore);
@@ -5312,9 +5312,9 @@ TEST(ChangeTrackerTest, SkipUntilMarker_InvalidArgs_NoOp) {
 
 /*
  * current already at the end of the list (ready, null marker) when called:
- * skipUntilMarker is a no-op and current remains a ready consumer.
+ * attachToMarkerAhead is a no-op and current remains a ready consumer.
  */
-TEST(ChangeTrackerTest, SkipUntilMarker_CurrentAlreadyReady_NoOp) {
+TEST(ChangeTrackerTest, AttachToMarkerAhead_CurrentAlreadyReady_NoOp) {
   ChangeTracker<TestObject> tracker("SkipCurrentReadyTracker");
   TestProducer producer(tracker);
 
@@ -5335,7 +5335,7 @@ TEST(ChangeTrackerTest, SkipUntilMarker_CurrentAlreadyReady_NoOp) {
   ASSERT_EQ(current->getMarker(), nullptr);
   ASSERT_NE(target->getMarker(), nullptr);
 
-  tracker.skipUntilMarker(current, target);
+  tracker.attachToMarkerAhead(current, target);
 
   // current is unchanged: still ready with a null marker.
   EXPECT_TRUE(current->isReady());
@@ -5356,7 +5356,7 @@ TEST(ChangeTrackerTest, SkipUntilMarker_CurrentAlreadyReady_NoOp) {
  */
 TEST(
     ChangeTrackerTest,
-    SkipUntilMarker_TargetMarkerNotOwnedByCurrent_ParksAtTarget) {
+    AttachToMarkerAhead_TargetMarkerNotOwnedByCurrent_ParksAtTarget) {
   ChangeTracker<TestObject> tracker("SkipTargetNotOwnedTracker");
   TestProducer producer(tracker);
 
@@ -5383,7 +5383,7 @@ TEST(
   ASSERT_NE(current->getMarker(), nullptr);
   ASSERT_EQ(current->getMarker()->getTypedObject().getValue(), 1);
 
-  tracker.skipUntilMarker(current, target);
+  tracker.attachToMarkerAhead(current, target);
 
   // The raw walk stops at target's marker by pointer identity even though
   // current does not own object2, so current acks object1 and parks at object2,
@@ -5402,6 +5402,246 @@ TEST(
   EXPECT_EQ(target->getMarker()->getTypedObject().getValue(), 2);
 
   current->deregisterFromTracker();
+  target->deregisterFromTracker();
+}
+
+// ============================================================
+// attachToMarkerBehind Tests
+// ============================================================
+
+namespace {
+
+/*
+ * Count how many times `consumer` appears in `item`'s pending list. Used to
+ * verify pending-list membership and that no duplicate entry is created.
+ */
+size_t pendingListCount(
+    ChangeItem<TestObject>* item,
+    const std::shared_ptr<TestConsumer>& consumer) {
+  size_t count = 0;
+  for (auto& pending : item->pendingConsumers) {
+    if (&pending == consumer.get()) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+bool isInPendingList(
+    ChangeItem<TestObject>* item,
+    const std::shared_ptr<TestConsumer>& consumer) {
+  return pendingListCount(item, consumer) > 0;
+}
+
+} // namespace
+
+/*
+ * attachToMarkerBehind core: source has advanced ahead (acking a prefix) while
+ * target sits behind. source is rewound onto target's marker, re-owning every
+ * item from target's position through source's old marker, and target is reset.
+ * Nothing is freed because source now owns the whole tail target used to own.
+ */
+TEST(ChangeTrackerTest, AttachToMarkerBehind_RewindsSourceAndRetiresTarget) {
+  std::vector<int> freed;
+  ChangeTracker<TestObject> tracker("AttachBehindRewindTracker");
+  TestProducer producer(tracker);
+
+  auto source = std::make_shared<TestConsumer>(tracker, "Source");
+  auto target = std::make_shared<TestConsumer>(tracker, "Target");
+  source->registerWithTracker();
+  target->registerWithTracker();
+
+  auto* object1 = producer.createObject(1);
+  auto* object2 = producer.createObject(2);
+  auto* object3 = producer.createObject(3);
+  auto* object4 = producer.createObject(4);
+  auto* object5 = producer.createObject(5);
+  producer.publishChange(object1);
+  producer.publishChange(object2);
+  producer.publishChange(object3);
+  producer.publishChange(object4);
+  producer.publishChange(object5);
+
+  // Move source ahead to item 3 (acking items 1-2 without processing them);
+  // target stays behind at item 1. Items survive because target still owns
+  // them.
+  advanceConsumerBySteps(source, 2);
+  ASSERT_NE(source->getMarker(), nullptr);
+  ASSERT_EQ(source->getMarker()->getTypedObject().getValue(), 3);
+  ASSERT_EQ(target->getMarker()->getTypedObject().getValue(), 1);
+  ASSERT_FALSE(tracker.isConsumerSetOnTrackableObject(object1, source));
+
+  tracker.setGlobalOnChangeProcessedCallback(
+      [&freed](TrackableObject<TestObject>* obj) {
+        if (obj) {
+          freed.push_back(obj->get().getValue());
+        }
+      });
+
+  auto* item1 = target->getMarker();
+  tracker.attachToMarkerBehind(source, target);
+
+  // source is rewound onto target's old marker (item 1) and pended there.
+  ASSERT_NE(source->getMarker(), nullptr);
+  EXPECT_EQ(source->getMarker(), item1);
+  EXPECT_EQ(source->getMarker()->getTypedObject().getValue(), 1);
+  EXPECT_TRUE(isInPendingList(item1, source));
+  EXPECT_FALSE(source->isInReadyList());
+
+  // source re-owns every item from item 1 to the end -- including the prefix it
+  // had already acked -- so it will reprocess them.
+  EXPECT_TRUE(tracker.isConsumerSetOnTrackableObject(object1, source));
+  EXPECT_TRUE(tracker.isConsumerSetOnTrackableObject(object2, source));
+  EXPECT_TRUE(tracker.isConsumerSetOnTrackableObject(object3, source));
+  EXPECT_TRUE(tracker.isConsumerSetOnTrackableObject(object4, source));
+  EXPECT_TRUE(tracker.isConsumerSetOnTrackableObject(object5, source));
+
+  // target is reset: marker null, unpended, owns no item all the way to the
+  // end.
+  EXPECT_EQ(target->getMarker(), nullptr);
+  EXPECT_FALSE(isInPendingList(item1, target));
+  EXPECT_FALSE(tracker.isConsumerSetOnTrackableObject(object1, target));
+  EXPECT_FALSE(tracker.isConsumerSetOnTrackableObject(object3, target));
+  EXPECT_FALSE(tracker.isConsumerSetOnTrackableObject(object5, target));
+
+  // Nothing freed: source now owns the whole list target used to own.
+  EXPECT_TRUE(freed.empty());
+  EXPECT_EQ(tracker.getChangeList().size(), 5u);
+
+  source->deregisterFromTracker();
+  target->deregisterFromTracker();
+}
+
+/*
+ * attachToMarkerBehind with a source that has run to the end (ready, null
+ * marker). source owns nothing; the rewind sets its bit from target's marker
+ * through the end of the list and pends it at target's marker.
+ */
+TEST(ChangeTrackerTest, AttachToMarkerBehind_ReadySourceRewindsToTarget) {
+  ChangeTracker<TestObject> tracker("AttachBehindReadySourceTracker");
+  TestProducer producer(tracker);
+
+  auto source = std::make_shared<TestConsumer>(tracker, "Source");
+  auto target = std::make_shared<TestConsumer>(tracker, "Target");
+  source->registerWithTracker();
+  target->registerWithTracker();
+
+  auto* object1 = producer.createObject(1);
+  auto* object2 = producer.createObject(2);
+  auto* object3 = producer.createObject(3);
+  producer.publishChange(object1);
+  producer.publishChange(object2);
+  producer.publishChange(object3);
+
+  // Drive source off the end -> ready with a null marker; target stays at
+  // item1.
+  advanceConsumerBySteps(source, 3);
+  ASSERT_TRUE(source->isReady());
+  ASSERT_TRUE(source->isInReadyList());
+  auto* item1 = target->getMarker();
+  ASSERT_NE(item1, nullptr);
+
+  tracker.attachToMarkerBehind(source, target);
+
+  // source leaves the ready list, pends at target's marker, and owns the whole
+  // list again.
+  EXPECT_EQ(source->getMarker(), item1);
+  EXPECT_FALSE(source->isReady());
+  EXPECT_FALSE(source->isInReadyList());
+  EXPECT_TRUE(isInPendingList(item1, source));
+  EXPECT_TRUE(tracker.isConsumerSetOnTrackableObject(object1, source));
+  EXPECT_TRUE(tracker.isConsumerSetOnTrackableObject(object2, source));
+  EXPECT_TRUE(tracker.isConsumerSetOnTrackableObject(object3, source));
+
+  // target reset.
+  EXPECT_EQ(target->getMarker(), nullptr);
+  EXPECT_FALSE(tracker.isConsumerSetOnTrackableObject(object1, target));
+
+  EXPECT_EQ(tracker.getChangeList().size(), 3u);
+
+  source->deregisterFromTracker();
+  target->deregisterFromTracker();
+}
+
+/*
+ * attachToMarkerBehind where source and target start at the SAME marker. source
+ * keeps its position and re-owns the tail (its bit is already set there);
+ * target is retired. Nothing is freed.
+ */
+TEST(ChangeTrackerTest, AttachToMarkerBehind_SameMarker_AbsorbsAndRetires) {
+  ChangeTracker<TestObject> tracker("AttachBehindSameMarkerTracker");
+  TestProducer producer(tracker);
+
+  auto source = std::make_shared<TestConsumer>(tracker, "Source");
+  auto target = std::make_shared<TestConsumer>(tracker, "Target");
+  source->registerWithTracker();
+  target->registerWithTracker();
+
+  auto* object1 = producer.createObject(1);
+  auto* object2 = producer.createObject(2);
+  auto* object3 = producer.createObject(3);
+  producer.publishChange(object1);
+  producer.publishChange(object2);
+  producer.publishChange(object3);
+
+  auto* item1 = source->getMarker();
+  ASSERT_EQ(source->getMarker(), target->getMarker());
+
+  tracker.attachToMarkerBehind(source, target);
+
+  // source unchanged at item1 and owns the whole list.
+  EXPECT_EQ(source->getMarker(), item1);
+  EXPECT_TRUE(isInPendingList(item1, source));
+  EXPECT_TRUE(tracker.isConsumerSetOnTrackableObject(object1, source));
+  EXPECT_TRUE(tracker.isConsumerSetOnTrackableObject(object3, source));
+
+  // target retired: marker null, unpended, owns nothing.
+  EXPECT_EQ(target->getMarker(), nullptr);
+  EXPECT_FALSE(isInPendingList(item1, target));
+  EXPECT_FALSE(tracker.isConsumerSetOnTrackableObject(object1, target));
+
+  // source still owns everything -> nothing freed.
+  EXPECT_EQ(tracker.getChangeList().size(), 3u);
+
+  source->deregisterFromTracker();
+  target->deregisterFromTracker();
+}
+
+/*
+ * attachToMarkerBehind is a safe no-op on invalid arguments: null source, null
+ * target, or an unregistered source. The valid consumer is left untouched (in
+ * particular, target is NOT reset).
+ */
+TEST(ChangeTrackerTest, AttachToMarkerBehind_InvalidArgs_NoOp) {
+  ChangeTracker<TestObject> tracker("AttachBehindInvalidArgsTracker");
+  TestProducer producer(tracker);
+
+  auto source = std::make_shared<TestConsumer>(tracker, "Source");
+  auto target = std::make_shared<TestConsumer>(tracker, "Target");
+  source->registerWithTracker();
+  target->registerWithTracker();
+
+  auto* object1 = producer.createObject(1);
+  producer.publishChange(object1);
+  auto* item1 = target->getMarker();
+  ASSERT_NE(item1, nullptr);
+
+  // Unregistered consumer: never registered, so bitPosition == -1.
+  auto unregistered = std::make_shared<TestConsumer>(tracker, "Unregistered");
+
+  std::shared_ptr<TestConsumer> nullConsumer;
+  tracker.attachToMarkerBehind(nullConsumer, target);
+  tracker.attachToMarkerBehind(source, nullConsumer);
+  tracker.attachToMarkerBehind(unregistered, target);
+
+  // target untouched (NOT reset), source untouched, unregistered untouched.
+  EXPECT_EQ(target->getMarker(), item1);
+  EXPECT_TRUE(isInPendingList(item1, target));
+  EXPECT_TRUE(tracker.isConsumerSetOnTrackableObject(object1, target));
+  EXPECT_EQ(source->getMarker(), item1);
+  EXPECT_EQ(unregistered->getMarker(), nullptr);
+
+  source->deregisterFromTracker();
   target->deregisterFromTracker();
 }
 
