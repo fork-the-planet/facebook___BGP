@@ -766,7 +766,7 @@ TEST_F(UpdateGroupDetachedPeerTest, MovePeerDecrementsDetachedAfterJoin) {
   // Move the detached peer to another group -> must decrement the source
   // group's count (adjRib1 stays in sync, so the group is not frozen).
   auto targetGroup = std::make_shared<AdjRibOutGroup>(*evb_, "target_group");
-  group_->movePeer(adjRib0, targetGroup, targetGroup->getGroupOwnerKey());
+  group_->movePeers({adjRib0}, targetGroup);
   EXPECT_EQ(group_->getNumPeersDetachedAfterJoin(), 0);
   EXPECT_EQ(adjRib0->getUpdateGroup(), targetGroup);
 
@@ -802,7 +802,7 @@ TEST_F(
   // Moving it out decrements back to 0; adjRib1 stays in sync so the group is
   // not frozen.
   auto targetGroup = std::make_shared<AdjRibOutGroup>(*evb_, "target_group");
-  group_->movePeer(adjRib0, targetGroup, targetGroup->getGroupOwnerKey());
+  group_->movePeers({adjRib0}, targetGroup);
   EXPECT_EQ(group_->getNumPeersDetachedAfterJoin(), 0);
   EXPECT_EQ(adjRib0->getUpdateGroup(), targetGroup);
 
@@ -3409,7 +3409,7 @@ TEST_F(
   setGroupConsumerReady();
 
   // Move out the last SYNC peer -> immediate promotion sweep runs.
-  group_->movePeer(syncPeer, targetGroup, targetGroup->getGroupOwnerKey());
+  group_->movePeers({syncPeer}, targetGroup);
 
   // All 6 detached peers became SYNC.
   EXPECT_EQ(group_->getNumInSyncPeers(), 6);
@@ -3459,7 +3459,7 @@ TEST_F(
   group_->markPeerDetached(adjRib1);
   adjRib1->setPeerState(PeerUpdateState::DETACHED_RUNNING);
 
-  group_->movePeer(adjRib0, targetGroup, targetGroup->getGroupOwnerKey());
+  group_->movePeers({adjRib0}, targetGroup);
 
   /*
    * No promotable peer -> group stays frozen with no SYNC peers, adjRib1
@@ -3528,7 +3528,7 @@ TEST_F(
   }
 
   // Move the last SYNC peer out -> removePeer drives the no-sync-peers sweep.
-  group_->movePeer(syncPeer, targetGroup, targetGroup->getGroupOwnerKey());
+  group_->movePeers({syncPeer}, targetGroup);
 
   // DEP-A promoted to SYNC; group adopted its RIB version.
   EXPECT_EQ(depA->getPeerState(), PeerUpdateState::JOINED_RUNNING);

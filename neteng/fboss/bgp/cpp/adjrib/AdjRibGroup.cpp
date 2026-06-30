@@ -2633,13 +2633,10 @@ void AdjRibOutGroup::removePeer(
   }
 }
 
-void AdjRibOutGroup::movePeerPathTreeEntries(
-    const std::shared_ptr<AdjRib>& adjRib,
-    const std::shared_ptr<AdjRibOutGroup>& newGroup,
-    const AdjRibOutOwnerKey& effectiveOwnerKey) noexcept {
-  auto peerOwnerKey = adjRib->getPeerOwnerKey();
+void AdjRibOutGroup::movePeerMaterializedRibOutPathEntries(
+    const std::vector<std::shared_ptr<AdjRib>>& peersToMove,
+    const std::shared_ptr<AdjRibOutGroup>& newGroup) noexcept {
   auto groupOwnerKey = getGroupOwnerKey();
-  auto detachedRibVersion = adjRib->getDetachedRibVersion();
   size_t movedCount = 0;
   size_t copiedCount = 0;
   std::vector<AdjRibPathTree::Iterator> emptyNodes;
@@ -2648,25 +2645,30 @@ void AdjRibOutGroup::movePeerPathTreeEntries(
     auto& ownerMap = itr->value();
     auto prefix = folly::CIDRNetwork{itr.ipAddress(), itr.masklen()};
 
-    // Copy per-peer entries to new group, then delete from old group
-    auto entryItr = ownerMap.find(peerOwnerKey);
-    if (entryItr != ownerMap.end()) {
-      for (auto& [pathId, entry] : entryItr->second) {
-        newGroup->copyEntryForOwner(
-            prefix, pathId, effectiveOwnerKey, entry.get());
-        movedCount++;
-      }
-      ownerMap.erase(entryItr);
-    }
+    for (const auto& adjRib : peersToMove) {
+      auto peerOwnerKey = adjRib->getPeerOwnerKey();
+      auto detachedRibVersion = adjRib->getDetachedRibVersion();
 
-    // Copy shared group entries the peer was using before detachment
-    auto groupItr = ownerMap.find(groupOwnerKey);
-    if (groupItr != ownerMap.end()) {
-      for (auto& [pathId, entry] : groupItr->second) {
-        if (isEntryShared(detachedRibVersion, entry->getRibVersion())) {
+      // Move the peer's own entries to the new group, then delete from old.
+      auto entryItr = ownerMap.find(peerOwnerKey);
+      if (entryItr != ownerMap.end()) {
+        for (auto& [pathId, entry] : entryItr->second) {
           newGroup->copyEntryForOwner(
-              prefix, pathId, effectiveOwnerKey, entry.get());
-          copiedCount++;
+              prefix, pathId, peerOwnerKey, entry.get());
+          movedCount++;
+        }
+        ownerMap.erase(entryItr);
+      }
+
+      // Copy shared group entries the peer was using before detachment.
+      auto groupItr = ownerMap.find(groupOwnerKey);
+      if (groupItr != ownerMap.end()) {
+        for (auto& [pathId, entry] : groupItr->second) {
+          if (isEntryShared(detachedRibVersion, entry->getRibVersion())) {
+            newGroup->copyEntryForOwner(
+                prefix, pathId, peerOwnerKey, entry.get());
+            copiedCount++;
+          }
         }
       }
     }
@@ -2684,21 +2686,18 @@ void AdjRibOutGroup::movePeerPathTreeEntries(
   XLOGF(
       INFO,
       "Group {}: Moved {} per-peer PathTree entries, copied {} shared entries "
-      "for peer {} to group {}",
+      "for {} peer(s) to group {}",
       groupDescriptor_,
       movedCount,
       copiedCount,
-      adjRib->getPeerName(),
+      peersToMove.size(),
       newGroup->getAdjRibGroupName());
 }
 
-void AdjRibOutGroup::movePeerLiteTreeEntries(
-    const std::shared_ptr<AdjRib>& adjRib,
-    const std::shared_ptr<AdjRibOutGroup>& newGroup,
-    const AdjRibOutOwnerKey& effectiveOwnerKey) noexcept {
-  auto peerOwnerKey = adjRib->getPeerOwnerKey();
+void AdjRibOutGroup::movePeerMaterializedRibOutLiteEntries(
+    const std::vector<std::shared_ptr<AdjRib>>& peersToMove,
+    const std::shared_ptr<AdjRibOutGroup>& newGroup) noexcept {
   auto groupOwnerKey = getGroupOwnerKey();
-  auto detachedRibVersion = adjRib->getDetachedRibVersion();
   size_t movedCount = 0;
   size_t copiedCount = 0;
   std::vector<AdjRibLiteTree::Iterator> emptyNodes;
@@ -2707,29 +2706,35 @@ void AdjRibOutGroup::movePeerLiteTreeEntries(
     auto& ownerMap = itr->value();
     auto prefix = folly::CIDRNetwork{itr.ipAddress(), itr.masklen()};
 
-    // Copy per-peer entries to new group, then delete from old group
-    auto entryItr = ownerMap.find(peerOwnerKey);
-    if (entryItr != ownerMap.end()) {
-      newGroup->copyEntryForOwner(
-          prefix, kDefaultPathID, effectiveOwnerKey, entryItr->second.get());
-      ownerMap.erase(entryItr);
-      movedCount++;
-      // Clean up empty ownerMaps to not leave any empty radix node
-      if (ownerMap.empty()) {
-        emptyNodes.push_back(itr);
+    for (const auto& adjRib : peersToMove) {
+      auto peerOwnerKey = adjRib->getPeerOwnerKey();
+      auto detachedRibVersion = adjRib->getDetachedRibVersion();
+
+      // Move the peer's own entry to the new group, then delete from old.
+      auto entryItr = ownerMap.find(peerOwnerKey);
+      if (entryItr != ownerMap.end()) {
+        newGroup->copyEntryForOwner(
+            prefix, kDefaultPathID, peerOwnerKey, entryItr->second.get());
+        ownerMap.erase(entryItr);
+        movedCount++;
+        continue;
       }
-      continue;
+
+      // Copy shared group entries the peer was using before detachment.
+      auto groupItr = ownerMap.find(groupOwnerKey);
+      if (groupItr != ownerMap.end()) {
+        auto groupEntry = groupItr->second.get();
+        if (isEntryShared(detachedRibVersion, groupEntry->getRibVersion())) {
+          newGroup->copyEntryForOwner(
+              prefix, kDefaultPathID, peerOwnerKey, groupEntry);
+          copiedCount++;
+        }
+      }
     }
 
-    // Copy shared group entries the peer was using before detachment
-    auto groupItr = ownerMap.find(groupOwnerKey);
-    if (groupItr != ownerMap.end()) {
-      auto groupEntry = groupItr->second.get();
-      if (isEntryShared(detachedRibVersion, groupEntry->getRibVersion())) {
-        newGroup->copyEntryForOwner(
-            prefix, kDefaultPathID, effectiveOwnerKey, groupEntry);
-        copiedCount++;
-      }
+    // Clean up empty ownerMaps to not leave any empty radix node
+    if (ownerMap.empty()) {
+      emptyNodes.push_back(itr);
     }
   }
 
@@ -2740,81 +2745,79 @@ void AdjRibOutGroup::movePeerLiteTreeEntries(
   XLOGF(
       INFO,
       "Group {}: Moved {} per-peer LiteTree entries, copied {} shared entries "
-      "for peer {} to group {}",
+      "for {} peer(s) to group {}",
       groupDescriptor_,
       movedCount,
       copiedCount,
-      adjRib->getPeerName(),
+      peersToMove.size(),
       newGroup->getAdjRibGroupName());
 }
 
-void AdjRibOutGroup::movePeer(
-    const std::shared_ptr<AdjRib>& adjRib,
-    const std::shared_ptr<AdjRibOutGroup>& newGroup,
-    const AdjRibOutOwnerKey& effectiveOwnerKey) noexcept {
+void AdjRibOutGroup::movePeers(
+    const std::vector<std::shared_ptr<AdjRib>>& peersToMove,
+    const std::shared_ptr<AdjRibOutGroup>& newGroup) noexcept {
   XLOGF(
       INFO,
-      "Group {}: Moving peer entries {} at bit {} to group {}",
+      "Group {}: Moving {} peer(s) to group {}",
       groupDescriptor_,
-      adjRib->getPeerName(),
-      adjRib->getGroupBitPosition(),
+      peersToMove.size(),
       newGroup->getAdjRibGroupName());
 
-  if (adjRib->sendAddPath()) {
-    movePeerPathTreeEntries(adjRib, newGroup, effectiveOwnerKey);
+  /*
+   * Move the materialized RIB-OUT entries for all peers in a single pass over
+   * the group's tree. The peers' entries (and the shared group entries they
+   * were using) are copied to the new group under each peer's own owner key.
+   */
+  if (groupKey_.sendAddPath) {
+    movePeerMaterializedRibOutPathEntries(peersToMove, newGroup);
   } else {
-    movePeerLiteTreeEntries(adjRib, newGroup, effectiveOwnerKey);
+    movePeerMaterializedRibOutLiteEntries(peersToMove, newGroup);
   }
 
-  XLOGF(
-      INFO,
-      "Group {}: Removing peer {} due to group move",
-      groupDescriptor_,
-      adjRib->getPeerName());
-
-  removePeer(adjRib);
-  adjRib->setUpdateGroup(newGroup);
-
   /*
-   * Register the moved peer into the new group as a detached peer. Its RIB-OUT
+   * Register each moved peer into the new group as a detached peer. Its RIB-OUT
    * entries were already copied above, so it needs no initial dump: it drains
    * its packing list and rejoins via the detached (DEP-A) recovery path. We do
    * not special-case an empty target group -- a sole moved peer becomes SYNC
    * through promoteDetachedPeerToSync once it is ready.
    */
-  uint64_t bit = newGroup->bitManager_.getConsumerBit();
-  XLOGF(
-      INFO,
-      "Group {}: Registering moved peer {} into group {} at bit {}",
-      groupDescriptor_,
-      adjRib->getPeerName(),
-      newGroup->getAdjRibGroupName(),
-      bit);
-  newGroup->bitToAdjRibs_[bit] = adjRib;
-  adjRib->setGroupBitPosition(bit);
-  if (!newGroup->peeringParams_.has_value()) {
-    newGroup->peeringParams_ = adjRib->getPeeringParams();
+  for (const auto& adjRib : peersToMove) {
+    XLOGF(
+        INFO,
+        "Group {}: Removing peer {} due to group move",
+        groupDescriptor_,
+        adjRib->getPeerName());
+
+    removePeer(adjRib);
+    adjRib->setUpdateGroup(newGroup);
+
+    uint64_t bit = newGroup->bitManager_.getConsumerBit();
+    newGroup->bitToAdjRibs_[bit] = adjRib;
+    adjRib->setGroupBitPosition(bit);
+    if (!newGroup->peeringParams_.has_value()) {
+      newGroup->peeringParams_ = adjRib->getPeeringParams();
+    }
+    BitmapUtils::setBit(newGroup->adjRibEstablishedBitmap_, bit);
+
+    /* Clear state that pertained to the old group. */
+    adjRib->setDetachedRibVersion(0);
+    adjRib->clearAdjRibFlag(AdjRib::RIB_OUT_DISCREPANCY);
+    adjRib->clearAdjRibFlag(AdjRib::IS_DETACHED_FAST_PEER);
+
+    /*
+     * Join as a detached peer (a blocked peer stays blocked); it catches up
+     * independently and rejoins the new group.
+     */
+    auto peerState = adjRib->getPeerState();
+    auto targetState = (peerState == PeerUpdateState::DETACHED_BLOCKED ||
+                        peerState == PeerUpdateState::JOINED_BLOCKED)
+        ? PeerUpdateState::DETACHED_BLOCKED
+        : PeerUpdateState::DETACHED_INIT_DUMP;
+    adjRib->setPeerState(targetState);
+    adjRib->setAdjRibFlag(AdjRib::DETACHED_INIT_DUMP_PEER);
+
+    newGroup->detachedPeers_.insert(adjRib);
   }
-  BitmapUtils::setBit(newGroup->adjRibEstablishedBitmap_, bit);
-
-  /* Clear state that pertained to the old group. */
-  adjRib->setDetachedRibVersion(0);
-  adjRib->clearAdjRibFlag(AdjRib::RIB_OUT_DISCREPANCY);
-  adjRib->clearAdjRibFlag(AdjRib::IS_DETACHED_FAST_PEER);
-
-  /*
-   * Join as a detached peer (a blocked peer stays blocked); it catches up
-   * independently and rejoins the new group.
-   */
-  auto peerState = adjRib->getPeerState();
-  auto targetState = (peerState == PeerUpdateState::DETACHED_BLOCKED ||
-                      peerState == PeerUpdateState::JOINED_BLOCKED)
-      ? PeerUpdateState::DETACHED_BLOCKED
-      : PeerUpdateState::DETACHED_INIT_DUMP;
-  adjRib->setPeerState(targetState);
-  adjRib->setAdjRibFlag(AdjRib::DETACHED_INIT_DUMP_PEER);
-
-  newGroup->detachedPeers_.insert(adjRib);
 }
 
 /*

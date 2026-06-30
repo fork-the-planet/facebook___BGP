@@ -753,16 +753,15 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
       const std::shared_ptr<AdjRib>& adjRib) noexcept;
 
   /*
-   * High-level method that transfers per-peer RIB-OUT entries to the new
-   * group, cleans up this group's bitmaps and tracking state, and registers
-   * the peer with the new group.
+   * High-level method that transfers per-peer RIB-OUT entries for a set of
+   * peers to the new group, cleans up this group's bitmaps and tracking state,
+   * and registers each peer with the new group.
    * Change list consumer deactivation/activation is handled outside of
-   * movePeer by the caller.
+   * movePeers by the caller.
    */
-  void movePeer(
-      const std::shared_ptr<AdjRib>& adjRib,
-      const std::shared_ptr<AdjRibOutGroup>& newGroup,
-      const AdjRibOutOwnerKey& effectiveOwnerKey) noexcept;
+  void movePeers(
+      const std::vector<std::shared_ptr<AdjRib>>& peersToMove,
+      const std::shared_ptr<AdjRibOutGroup>& newGroup) noexcept;
 
   /*
    * Mark a peer as blocked due to TCP backpressure.
@@ -1050,15 +1049,21 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
    */
   void removePeer(const std::shared_ptr<AdjRib>& adjRib) noexcept;
 
-  void movePeerPathTreeEntries(
-      const std::shared_ptr<AdjRib>& adjRib,
-      const std::shared_ptr<AdjRibOutGroup>& newGroup,
-      const AdjRibOutOwnerKey& effectiveOwnerKey) noexcept;
+  /*
+   * Move each peer's RIB-OUT entries to the new group. These methods do NOT
+   * copy this group's group-owned entries across as group-owned entries.
+   * Instead, for each shared group entry a peer was still using, the peer gets
+   * its own copy under its peer owner key (alongside its already-diverged
+   * per-peer entries). The result is that each moved peer has its full RIB-OUT
+   * materialized under its own peer owner key in the new group.
+   */
+  void movePeerMaterializedRibOutPathEntries(
+      const std::vector<std::shared_ptr<AdjRib>>& peersToMove,
+      const std::shared_ptr<AdjRibOutGroup>& newGroup) noexcept;
 
-  void movePeerLiteTreeEntries(
-      const std::shared_ptr<AdjRib>& adjRib,
-      const std::shared_ptr<AdjRibOutGroup>& newGroup,
-      const AdjRibOutOwnerKey& effectiveOwnerKey) noexcept;
+  void movePeerMaterializedRibOutLiteEntries(
+      const std::vector<std::shared_ptr<AdjRib>>& peersToMove,
+      const std::shared_ptr<AdjRibOutGroup>& newGroup) noexcept;
 
   /*
    * Clone decision algorithm: determines if a group entry must be cloned

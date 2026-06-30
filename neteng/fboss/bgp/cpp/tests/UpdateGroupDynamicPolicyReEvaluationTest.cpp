@@ -755,9 +755,8 @@ TEST_F(SinglePeerPolicyReEvaluation, MovePeerPathTreeMixedEntries) {
 
   ASSERT_EQ(targetGroup->PathTree_.begin(), targetGroup->PathTree_.end());
 
-  // Empty target -> entries land under the target's group owner key.
-  auto effectiveOwnerKey = targetGroup->getGroupOwnerKey();
-  sourceGroup->movePeerPathTreeEntries(adjRib_, targetGroup, effectiveOwnerKey);
+  // Moved entries land under the peer's own owner key.
+  sourceGroup->movePeerMaterializedRibOutPathEntries({adjRib_}, targetGroup);
 
   // Source: per-peer entry gone, group entries untouched.
   EXPECT_EQ(
@@ -782,20 +781,20 @@ TEST_F(SinglePeerPolicyReEvaluation, MovePeerPathTreeMixedEntries) {
   // Target: per-peer + shared copied, unshared not.
   EXPECT_NE(
       targetGroup->getFromPathTree(
-          targetGroup->PathTree_, prefixPeer, effectiveOwnerKey, /*pathId=*/0),
+          targetGroup->PathTree_, prefixPeer, peerOwnerKey, /*pathId=*/0),
       nullptr);
   EXPECT_NE(
       targetGroup->getFromPathTree(
           targetGroup->PathTree_,
           prefixShared,
-          effectiveOwnerKey,
+          peerOwnerKey,
           /*pathId=*/0),
       nullptr);
   EXPECT_EQ(
       targetGroup->getFromPathTree(
           targetGroup->PathTree_,
           prefixUnshared,
-          effectiveOwnerKey,
+          peerOwnerKey,
           /*pathId=*/0),
       nullptr);
 }
@@ -849,7 +848,7 @@ TEST_F(
   ASSERT_NE(existingEntry, nullptr);
 
   // Non-empty target -> peer joins as a per-peer member.
-  sourceGroup->movePeerPathTreeEntries(adjRib_, targetGroup, peerOwnerKey);
+  sourceGroup->movePeerMaterializedRibOutPathEntries({adjRib_}, targetGroup);
 
   // Target's existing entry is untouched.
   EXPECT_EQ(
@@ -911,10 +910,8 @@ TEST_F(SinglePeerPolicyReEvaluation, MovePeerLiteTreeMixedEntries) {
 
   ASSERT_EQ(targetGroup_->LiteTree_.begin(), targetGroup_->LiteTree_.end());
 
-  // Empty target -> entries land under the target's group owner key.
-  auto effectiveOwnerKey = targetGroup_->getGroupOwnerKey();
-  sourceGroup_->movePeerLiteTreeEntries(
-      adjRib_, targetGroup_, effectiveOwnerKey);
+  // Moved entries land under the peer's own owner key.
+  sourceGroup_->movePeerMaterializedRibOutLiteEntries({adjRib_}, targetGroup_);
 
   // Source: per-peer entry gone, group entries untouched.
   EXPECT_EQ(
@@ -933,15 +930,15 @@ TEST_F(SinglePeerPolicyReEvaluation, MovePeerLiteTreeMixedEntries) {
   // Target: per-peer + shared copied, unshared not.
   EXPECT_NE(
       targetGroup_->getFromLiteTree(
-          targetGroup_->LiteTree_, prefixPeer, effectiveOwnerKey),
+          targetGroup_->LiteTree_, prefixPeer, peerOwnerKey),
       nullptr);
   EXPECT_NE(
       targetGroup_->getFromLiteTree(
-          targetGroup_->LiteTree_, prefixShared, effectiveOwnerKey),
+          targetGroup_->LiteTree_, prefixShared, peerOwnerKey),
       nullptr);
   EXPECT_EQ(
       targetGroup_->getFromLiteTree(
-          targetGroup_->LiteTree_, prefixUnshared, effectiveOwnerKey),
+          targetGroup_->LiteTree_, prefixUnshared, peerOwnerKey),
       nullptr);
 }
 
@@ -979,7 +976,7 @@ TEST_F(
   ASSERT_NE(existingEntry, nullptr);
 
   // Non-empty target -> peer joins as a per-peer member.
-  sourceGroup_->movePeerLiteTreeEntries(adjRib_, targetGroup_, peerOwnerKey);
+  sourceGroup_->movePeerMaterializedRibOutLiteEntries({adjRib_}, targetGroup_);
 
   // Target's existing entry is untouched.
   EXPECT_EQ(
@@ -1024,8 +1021,7 @@ TEST_F(SinglePeerPolicyReEvaluation, MovePeerTransfersPerPeerEntries) {
   // Target should start empty
   EXPECT_EQ(targetGroup_->LiteTree_.begin(), targetGroup_->LiteTree_.end());
 
-  sourceGroup_->movePeer(
-      adjRib_, targetGroup_, targetGroup_->getGroupOwnerKey());
+  sourceGroup_->movePeers({adjRib_}, targetGroup_);
 
   // Per-peer entries should be deleted from source
   EXPECT_EQ(
@@ -1037,16 +1033,14 @@ TEST_F(SinglePeerPolicyReEvaluation, MovePeerTransfersPerPeerEntries) {
           sourceGroup_->LiteTree_, prefix2, peerOwnerKey),
       nullptr);
 
-  // Entries should exist in target. When the target group is empty,
-  // copyEntryForPeer stores them as group-owned entries.
-  auto targetOwnerKey = targetGroup_->getGroupOwnerKey();
+  // Entries land in the target under the peer's own owner key.
   EXPECT_NE(
       targetGroup_->getFromLiteTree(
-          targetGroup_->LiteTree_, prefix1, targetOwnerKey),
+          targetGroup_->LiteTree_, prefix1, peerOwnerKey),
       nullptr);
   EXPECT_NE(
       targetGroup_->getFromLiteTree(
-          targetGroup_->LiteTree_, prefix2, targetOwnerKey),
+          targetGroup_->LiteTree_, prefix2, peerOwnerKey),
       nullptr);
 
   // detachedRibVersion should be reset after movePeer
@@ -1072,8 +1066,7 @@ TEST_F(SinglePeerPolicyReEvaluation, MovePeerCopiesSharedGroupEntries) {
   // Target should start empty
   EXPECT_EQ(targetGroup_->LiteTree_.begin(), targetGroup_->LiteTree_.end());
 
-  sourceGroup_->movePeer(
-      adjRib_, targetGroup_, targetGroup_->getGroupOwnerKey());
+  sourceGroup_->movePeers({adjRib_}, targetGroup_);
 
   // Shared entry should remain in source (not moved, only copied)
   EXPECT_NE(
@@ -1081,12 +1074,11 @@ TEST_F(SinglePeerPolicyReEvaluation, MovePeerCopiesSharedGroupEntries) {
           sourceGroup_->LiteTree_, prefix, groupOwnerKey),
       nullptr);
 
-  // A copy should exist in target. When the target group is empty,
-  // copyEntryForPeer stores it as a group-owned entry.
-  auto targetOwnerKey = targetGroup_->getGroupOwnerKey();
+  // A copy lands in the target under the peer's own owner key.
+  auto peerOwnerKey = adjRib_->getPeerOwnerKey();
   EXPECT_NE(
       targetGroup_->getFromLiteTree(
-          targetGroup_->LiteTree_, prefix, targetOwnerKey),
+          targetGroup_->LiteTree_, prefix, peerOwnerKey),
       nullptr);
 
   EXPECT_EQ(adjRib_->getDetachedRibVersion(), 0);
@@ -1109,8 +1101,7 @@ TEST_F(SinglePeerPolicyReEvaluation, MovePeerSkipsUnseenGroupEntries) {
   // Target should start empty
   EXPECT_EQ(targetGroup_->LiteTree_.begin(), targetGroup_->LiteTree_.end());
 
-  sourceGroup_->movePeer(
-      adjRib_, targetGroup_, targetGroup_->getGroupOwnerKey());
+  sourceGroup_->movePeers({adjRib_}, targetGroup_);
 
   // Unseen entry should remain in source
   EXPECT_NE(
@@ -1148,8 +1139,7 @@ TEST_F(SinglePeerPolicyReEvaluation, MovePeerPrefersPerPeerOverShared) {
   // Target should start empty
   EXPECT_EQ(targetGroup_->LiteTree_.begin(), targetGroup_->LiteTree_.end());
 
-  sourceGroup_->movePeer(
-      adjRib_, targetGroup_, targetGroup_->getGroupOwnerKey());
+  sourceGroup_->movePeers({adjRib_}, targetGroup_);
 
   // Per-peer entry should be deleted from source
   EXPECT_EQ(
@@ -1163,12 +1153,11 @@ TEST_F(SinglePeerPolicyReEvaluation, MovePeerPrefersPerPeerOverShared) {
           sourceGroup_->LiteTree_, prefix, groupOwnerKey),
       nullptr);
 
-  // Target should have one entry (from per-peer, not from shared).
-  // When target is empty, copyEntryForPeer stores as group-owned.
-  auto targetOwnerKey = targetGroup_->getGroupOwnerKey();
+  // Target should have one entry (from per-peer, not from shared), under the
+  // peer's own owner key.
   EXPECT_NE(
       targetGroup_->getFromLiteTree(
-          targetGroup_->LiteTree_, prefix, targetOwnerKey),
+          targetGroup_->LiteTree_, prefix, peerOwnerKey),
       nullptr);
 
   EXPECT_EQ(adjRib_->getDetachedRibVersion(), 0);
@@ -1178,8 +1167,7 @@ TEST_F(SinglePeerPolicyReEvaluation, MovePeerCleansUpGroupState) {
   adjRib_->setPeerState(PeerUpdateState::DETACHED_RUNNING);
   adjRib_->setDetachedRibVersion(10);
 
-  sourceGroup_->movePeer(
-      adjRib_, targetGroup_, targetGroup_->getGroupOwnerKey());
+  sourceGroup_->movePeers({adjRib_}, targetGroup_);
 
   // Peer should be fully removed from source group
   EXPECT_EQ(sourceGroup_->getMemberCount(), 0);
@@ -1227,7 +1215,7 @@ TEST_F(
 
   EXPECT_EQ(targetGroup_->LiteTree_.begin(), targetGroup_->LiteTree_.end());
 
-  sourceGroup_->movePeer(adjRib_, targetGroup_, adjRib_->getPeerOwnerKey());
+  sourceGroup_->movePeers({adjRib_}, targetGroup_);
 
   // Per-peer entries should be deleted from source
   EXPECT_EQ(
@@ -1286,7 +1274,7 @@ TEST_F(
 
   EXPECT_EQ(targetGroup_->LiteTree_.begin(), targetGroup_->LiteTree_.end());
 
-  sourceGroup_->movePeer(adjRib_, targetGroup_, adjRib_->getPeerOwnerKey());
+  sourceGroup_->movePeers({adjRib_}, targetGroup_);
 
   // Shared entry should remain in source
   EXPECT_NE(
@@ -1337,7 +1325,7 @@ TEST_F(
 
   EXPECT_EQ(targetGroup_->LiteTree_.begin(), targetGroup_->LiteTree_.end());
 
-  sourceGroup_->movePeer(adjRib_, targetGroup_, adjRib_->getPeerOwnerKey());
+  sourceGroup_->movePeers({adjRib_}, targetGroup_);
 
   // Unseen entry should remain in source
   EXPECT_NE(
@@ -1392,7 +1380,7 @@ TEST_F(
 
   EXPECT_EQ(targetGroup_->LiteTree_.begin(), targetGroup_->LiteTree_.end());
 
-  sourceGroup_->movePeer(adjRib_, targetGroup_, adjRib_->getPeerOwnerKey());
+  sourceGroup_->movePeers({adjRib_}, targetGroup_);
 
   // Per-peer entry should be deleted from source
   EXPECT_EQ(
@@ -1472,8 +1460,7 @@ CO_TEST_F(
   evb_->runInEventBaseThreadAndWait([&]() {
     sourceGroup_->detachPeer(adjRib_, AdjRibOutGroup::DetachReason::Blocking);
 
-    sourceGroup_->movePeer(
-        adjRib_, targetGroup_, targetGroup_->getGroupOwnerKey());
+    sourceGroup_->movePeers({adjRib_}, targetGroup_);
 
     // Register a new peer in sourceGroup — it should get the same bit
     auto peerId2 = nettools::bgplib::BgpPeerId(
@@ -1532,6 +1519,201 @@ CO_TEST_F(
 
   evb_->terminateLoopSoon();
   evbThread.join();
+}
+
+/*
+ * movePeers with three peers (LiteTree), each with a different relationship to
+ * the group's shared RIB-OUT:
+ *   peer1 shares nothing (its own per-peer entry for every prefix),
+ *   peer2 shares some (per-peer for the diverged half, shares the stable half),
+ *   peer3 shares everything (no per-peer entries).
+ * Verifies the group's own RIB-OUT is left untouched and each peer lands in the
+ * target under its own owner key.
+ */
+TEST_F(SinglePeerPolicyReEvaluation, MovePeersMultiPeerLiteTree) {
+  auto peer1 = adjRib_; // registered in sourceGroup_ by SetUp
+  auto makePeer = [&](const std::string& ip) {
+    auto pid = nettools::bgplib::BgpPeerId(
+        folly::IPAddress(ip), folly::IPAddressV4("255.0.0.1").toLongHBO());
+    auto p = std::make_shared<AdjRib>(
+        pid,
+        PeeringParams(),
+        *evb_,
+        ribInQ_,
+        observerQ_,
+        std::make_shared<folly::coro::Baton>(),
+        nullptr,
+        std::make_shared<std::atomic<bool>>(false));
+    p->setUpdateGroup(sourceGroup_);
+    sourceGroup_->registerPeer(p);
+    return p;
+  };
+  auto peer2 = makePeer("10.0.0.2");
+  auto peer3 = makePeer("10.0.0.3");
+
+  for (const auto& p : {peer1, peer2, peer3}) {
+    p->setPeerState(PeerUpdateState::DETACHED_RUNNING);
+  }
+  // peer1 shares nothing, peer2 shares the stable half, peer3 shares all.
+  peer1->setDetachedRibVersion(4);
+  peer2->setDetachedRibVersion(10);
+  peer3->setDetachedRibVersion(25);
+
+  auto groupOwnerKey = sourceGroup_->getGroupOwnerKey();
+  auto key1 = peer1->getPeerOwnerKey();
+  auto key2 = peer2->getPeerOwnerKey();
+  auto key3 = peer3->getPeerOwnerKey();
+
+  constexpr int kNumPrefixes = 10;
+  std::vector<folly::CIDRNetwork> prefixes;
+  for (int i = 0; i < kNumPrefixes; i++) {
+    folly::CIDRNetwork prefix{
+        folly::IPAddress("10.0." + std::to_string(i) + ".0"), 24};
+    prefixes.push_back(prefix);
+    // First half "diverged" (high version), second half "stable" (low version).
+    sourceGroup_
+        ->addToLiteTree(sourceGroup_->LiteTree_, prefix, groupOwnerKey, 0)
+        ->setRibVersion(i < kNumPrefixes / 2 ? 20 : 5);
+  }
+
+  // peer1: per-peer entry for every prefix (fully diverged).
+  for (const auto& prefix : prefixes) {
+    sourceGroup_->addToLiteTree(sourceGroup_->LiteTree_, prefix, key1, 0);
+  }
+  // peer2: per-peer entry for the diverged half only; shares the stable half.
+  for (int i = 0; i < kNumPrefixes / 2; i++) {
+    sourceGroup_->addToLiteTree(sourceGroup_->LiteTree_, prefixes[i], key2, 0);
+  }
+  // peer3: no per-peer entries; shares everything.
+
+  sourceGroup_->movePeers({peer1, peer2, peer3}, targetGroup_);
+
+  for (const auto& prefix : prefixes) {
+    // The group's own RIB-OUT is untouched.
+    EXPECT_NE(
+        sourceGroup_->getFromLiteTree(
+            sourceGroup_->LiteTree_, prefix, groupOwnerKey),
+        nullptr);
+    // Per-peer entries are erased from the source.
+    EXPECT_EQ(
+        sourceGroup_->getFromLiteTree(sourceGroup_->LiteTree_, prefix, key1),
+        nullptr);
+    EXPECT_EQ(
+        sourceGroup_->getFromLiteTree(sourceGroup_->LiteTree_, prefix, key2),
+        nullptr);
+    // Every peer lands in the target under its own owner key.
+    EXPECT_NE(
+        targetGroup_->getFromLiteTree(targetGroup_->LiteTree_, prefix, key1),
+        nullptr);
+    EXPECT_NE(
+        targetGroup_->getFromLiteTree(targetGroup_->LiteTree_, prefix, key2),
+        nullptr);
+    EXPECT_NE(
+        targetGroup_->getFromLiteTree(targetGroup_->LiteTree_, prefix, key3),
+        nullptr);
+  }
+
+  // Break peer<->target-group cycles for the locally created peers.
+  peer2->setUpdateGroup(nullptr);
+  peer3->setUpdateGroup(nullptr);
+}
+
+/*
+ * movePeers with three peers (PathTree / add-path): same sharing scenarios as
+ * the LiteTree case. Uses a local add-path source/target group so entries live
+ * in the PathTree.
+ */
+TEST_F(SinglePeerPolicyReEvaluation, MovePeersMultiPeerPathTree) {
+  UpdateGroupKey addPathKey;
+  addPathKey.sendAddPath = true;
+  auto sourceGroup = std::make_shared<AdjRibOutGroup>(
+      *evb_,
+      "source_addpath",
+      /*groupId=*/0,
+      /*enableUpdateGroup=*/false,
+      addPathKey);
+  auto targetGroup = std::make_shared<AdjRibOutGroup>(
+      *evb_,
+      "target_addpath",
+      /*groupId=*/1,
+      /*enableUpdateGroup=*/false,
+      addPathKey);
+
+  auto makePeer = [&](const std::string& ip) {
+    auto pid = nettools::bgplib::BgpPeerId(
+        folly::IPAddress(ip), folly::IPAddressV4("255.0.0.1").toLongHBO());
+    auto p = std::make_shared<AdjRib>(
+        pid,
+        PeeringParams(),
+        *evb_,
+        ribInQ_,
+        observerQ_,
+        std::make_shared<folly::coro::Baton>(),
+        nullptr,
+        std::make_shared<std::atomic<bool>>(false));
+    p->setUpdateGroup(sourceGroup);
+    sourceGroup->registerPeer(p);
+    p->setPeerState(PeerUpdateState::DETACHED_RUNNING);
+    return p;
+  };
+  auto peer1 = makePeer("10.0.0.1");
+  auto peer2 = makePeer("10.0.0.2");
+  auto peer3 = makePeer("10.0.0.3");
+  peer1->setDetachedRibVersion(4);
+  peer2->setDetachedRibVersion(10);
+  peer3->setDetachedRibVersion(25);
+
+  auto groupOwnerKey = sourceGroup->getGroupOwnerKey();
+  auto key1 = peer1->getPeerOwnerKey();
+  auto key2 = peer2->getPeerOwnerKey();
+  auto key3 = peer3->getPeerOwnerKey();
+
+  constexpr int kNumPrefixes = 10;
+  std::vector<folly::CIDRNetwork> prefixes;
+  for (int i = 0; i < kNumPrefixes; i++) {
+    folly::CIDRNetwork prefix{
+        folly::IPAddress("10.0." + std::to_string(i) + ".0"), 24};
+    prefixes.push_back(prefix);
+    sourceGroup->addToPathTree(sourceGroup->PathTree_, prefix, groupOwnerKey, 0)
+        ->setRibVersion(i < kNumPrefixes / 2 ? 20 : 5);
+  }
+
+  for (const auto& prefix : prefixes) {
+    sourceGroup->addToPathTree(sourceGroup->PathTree_, prefix, key1, 0);
+  }
+  for (int i = 0; i < kNumPrefixes / 2; i++) {
+    sourceGroup->addToPathTree(sourceGroup->PathTree_, prefixes[i], key2, 0);
+  }
+
+  sourceGroup->movePeers({peer1, peer2, peer3}, targetGroup);
+
+  for (const auto& prefix : prefixes) {
+    // The group's own RIB-OUT is untouched.
+    EXPECT_NE(
+        sourceGroup->getFromPathTree(
+            sourceGroup->PathTree_, prefix, groupOwnerKey, 0),
+        nullptr);
+    EXPECT_EQ(
+        sourceGroup->getFromPathTree(sourceGroup->PathTree_, prefix, key1, 0),
+        nullptr);
+    EXPECT_EQ(
+        sourceGroup->getFromPathTree(sourceGroup->PathTree_, prefix, key2, 0),
+        nullptr);
+    EXPECT_NE(
+        targetGroup->getFromPathTree(targetGroup->PathTree_, prefix, key1, 0),
+        nullptr);
+    EXPECT_NE(
+        targetGroup->getFromPathTree(targetGroup->PathTree_, prefix, key2, 0),
+        nullptr);
+    EXPECT_NE(
+        targetGroup->getFromPathTree(targetGroup->PathTree_, prefix, key3, 0),
+        nullptr);
+  }
+
+  // Break peer<->group cycles so the locally created groups/peers don't leak.
+  peer1->setUpdateGroup(nullptr);
+  peer2->setUpdateGroup(nullptr);
+  peer3->setUpdateGroup(nullptr);
 }
 
 } // namespace facebook::bgp
