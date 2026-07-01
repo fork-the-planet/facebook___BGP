@@ -744,7 +744,20 @@ AdjRibOutGroup::buildAndScheduleSendInitialDumpFromShadowRib() {
    * Note: sync bitmap bit already set when they registered
    */
   for (const auto& [bitPos, adjRib] : bitToAdjRibs_) {
-    if (adjRib && adjRib->getPeerState() == PeerUpdateState::INIT) {
+    if (!adjRib) {
+      continue;
+    }
+    /*
+     * The group's initial dump (with EoR) is now complete, so members are no
+     * longer in their initial announcement. The non-update-group path clears
+     * this per peer after sending the initial dump's EoR
+     * (PeerManager::distributeRibOutAnnouncementToAdjRibs); do the equivalent
+     * here for the whole group. Leaving it set would suppress later egress
+     * policy re-evaluation (setPendingEgressPolicyUpdate is a no-op while a
+     * peer is in initial announcement).
+     */
+    adjRib->resetInInitialAnnouncement();
+    if (adjRib->getPeerState() == PeerUpdateState::INIT) {
       XLOGF(
           DBG1,
           "Group {}: Peer {} at bit {} State Transition: {} -> {}",

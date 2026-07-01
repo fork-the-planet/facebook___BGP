@@ -1027,4 +1027,69 @@ TEST_F(
   tearDown(ctx);
 }
 
+/*
+ * When an update group completes its initial dump (with EoR), every member peer
+ * must leave initial announcement. Otherwise setPendingEgressPolicyUpdate stays
+ * a no-op (it ignores peers still in initial announcement) and egress policy
+ * re-evaluation is silently suppressed for the group's peers.
+ */
+TEST_F(
+    UpdateGroupPeerGroupAndPolicyReEvalTest,
+    GroupInitialDump_ClearsInInitialAnnouncementForAllMembers) {
+  auto ctx = setUp(2);
+  auto& evb = ctx.peerMgr->getEventBase();
+
+  // Before the group's initial dump, members are in initial announcement.
+  evb.runInEventBaseThreadAndWait([&]() {
+    for (auto& [peerId, adjRib] : ctx.adjRibs) {
+      EXPECT_TRUE(adjRib->inInitialAnnouncement());
+    }
+  });
+
+  sendInitialRibDump(ctx);
+
+  // Completing the initial dump cleared it for every member.
+  evb.runInEventBaseThreadAndWait([&]() {
+    for (auto& [peerId, adjRib] : ctx.adjRibs) {
+      EXPECT_FALSE(adjRib->inInitialAnnouncement());
+    }
+  });
+
+  tearDown(ctx);
+}
+
+/*
+ * End-to-end effect of clearing initial announcement after the dump: while a
+ * member is still in initial announcement setPendingEgressPolicyUpdate is
+ * suppressed; once the group's initial dump clears it, the same call is
+ * honored. This is the behavior that unblocks egress policy re-evaluation.
+ */
+TEST_F(
+    UpdateGroupPeerGroupAndPolicyReEvalTest,
+    GroupInitialDump_EnablesPendingEgressPolicyUpdate) {
+  auto ctx = setUp(2);
+  auto& evb = ctx.peerMgr->getEventBase();
+  auto peerId = makePeerId(0);
+
+  // While in initial announcement, the pending egress flag is suppressed.
+  evb.runInEventBaseThreadAndWait([&]() {
+    auto& adjRib = ctx.adjRibs.at(peerId);
+    ASSERT_TRUE(adjRib->inInitialAnnouncement());
+    adjRib->setPendingEgressPolicyUpdate(true);
+    EXPECT_FALSE(adjRib->isEgressPolicyUpdateRequired());
+  });
+
+  sendInitialRibDump(ctx);
+
+  // After the dump clears initial announcement, the same call is honored.
+  evb.runInEventBaseThreadAndWait([&]() {
+    auto& adjRib = ctx.adjRibs.at(peerId);
+    ASSERT_FALSE(adjRib->inInitialAnnouncement());
+    adjRib->setPendingEgressPolicyUpdate(true);
+    EXPECT_TRUE(adjRib->isEgressPolicyUpdateRequired());
+  });
+
+  tearDown(ctx);
+}
+
 } // namespace facebook::bgp
