@@ -3189,8 +3189,8 @@ bool AdjRibOutGroup::hasBlockedPeers() const noexcept {
 
 /*
  * Core peer detachment logic shared by detachSlowPeer and policy re-evaluation.
- * detachPeer is not responsible for setting the peer state transition.
- * The caller determines the appropriate target state.
+ * detachPeer transitions the peer to its detached state: DETACHED_BLOCKED if it
+ * was blocked (JOINED_BLOCKED), otherwise DETACHED_RUNNING.
  */
 void AdjRibOutGroup::detachPeer(
     const std::shared_ptr<AdjRib>& adjRib,
@@ -3273,6 +3273,27 @@ void AdjRibOutGroup::detachPeer(
       break;
   }
 
+  /*
+   * 10. Transition the peer to a detached state. A blocked peer
+   * (JOINED_BLOCKED) stays blocked (DETACHED_BLOCKED); any other in-sync peer
+   * runs in detached mode (DETACHED_RUNNING). The peer state is still JOINED_*
+   * here (nothing above mutates it), so it is read as the "from" state before
+   * the transition.
+   */
+  const auto fromState = adjRib->getPeerState();
+  const auto targetState = fromState == PeerUpdateState::JOINED_BLOCKED
+      ? PeerUpdateState::DETACHED_BLOCKED
+      : PeerUpdateState::DETACHED_RUNNING;
+  XLOGF(
+      DBG1,
+      "Group {}: Peer {} at bit {} State Transition: {} -> {}",
+      groupDescriptor_,
+      adjRib->getPeerName(),
+      bit,
+      fromState,
+      targetState);
+  adjRib->setPeerState(targetState);
+
   XLOGF(
       INFO,
       "Group {}: Peer {} at bit {} detached successfully "
@@ -3332,17 +3353,6 @@ void AdjRibOutGroup::detachSlowPeer(
    * as it commits, so the peer already carries exactly the AFIs it still owes
    * (see detachPeer step 8).
    */
-
-  // Slow-peer-specific: transition JOINED_BLOCKED -> DETACHED_BLOCKED
-  XLOGF(
-      DBG1,
-      "Group {}: Peer {} at bit {} State Transition: {} -> {}",
-      groupDescriptor_,
-      adjRib->getPeerName(),
-      bit,
-      adjRib->getPeerState(),
-      PeerUpdateState::DETACHED_BLOCKED);
-  adjRib->setPeerState(PeerUpdateState::DETACHED_BLOCKED);
 }
 
 /*

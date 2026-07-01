@@ -832,10 +832,11 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
    * Detach a peer from the group (core detachment logic).
    * Copies egress prefix counts, clones packing list, marks detached,
    * sets version fields, clears blocked bitmap, cancels slow peer timer,
-   * registers detached CL consumer, propagates EoR state, and bumps the
-   * cumulative AdjRibStats detachment counter for `reason`.
-   * Does NOT handle slow-peer-specific logic (stats, last-synced guard,
-   * state transitions).
+   * registers detached CL consumer, propagates EoR state, bumps the
+   * cumulative AdjRibStats detachment counter for `reason`, and transitions the
+   * peer to its detached state (DETACHED_BLOCKED if blocked, else
+   * DETACHED_RUNNING).
+   * Does NOT handle slow-peer-specific logic (stats, last-synced guard).
    */
   void detachPeer(
       const std::shared_ptr<AdjRib>& adjRib,
