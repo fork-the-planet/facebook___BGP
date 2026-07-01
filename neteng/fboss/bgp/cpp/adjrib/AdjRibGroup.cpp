@@ -2471,6 +2471,18 @@ void AdjRibOutGroup::unregisterPeer(
   adjRib->resetPeerBlockInfo();
   removePeer(adjRib);
 
+  /*
+   * If this removal left the group with members but no in-sync peers, recover:
+   * clear the packing list, freeze the consume timer, and try to promote a
+   * detached peer (or stay frozen until one catches up).
+   *
+   * TODO: optimize -- this runs synchronously per removal. Skip it when nothing
+   * is promotable (no DETACHED_READY_TO_JOIN peers).
+   */
+  if (getMemberCount() > 0 && numInSyncPeers_ == 0) {
+    handleNoSyncPeers();
+  }
+
   XLOGF(
       INFO,
       "Group {}: Successfully unregistered peer {} from bit {}",
@@ -2593,8 +2605,7 @@ void AdjRibOutGroup::decrementPeersDetachedAfterJoin() noexcept {
 }
 
 void AdjRibOutGroup::removePeer(
-    const std::shared_ptr<AdjRib>& adjRib,
-    bool shouldHandleNoSyncPeers) noexcept {
+    const std::shared_ptr<AdjRib>& adjRib) noexcept {
   uint64_t bit = adjRib->getGroupBitPosition();
 
   adjRib->resetSlowPeerDurationTimer();
@@ -2605,9 +2616,9 @@ void AdjRibOutGroup::removePeer(
 
   /*
    * A detached-after-join member (detachedRibVersion > 0) is leaving this
-   * group, so drop it from numPeersDetachedAfterJoin_ before handleNoSyncPeers
-   * runs below -- otherwise the stale count keeps the group frozen waiting for
-   * a peer that is gone. This is a no-op for peers that already deactivated
+   * group, so drop it from numPeersDetachedAfterJoin_ -- otherwise the stale
+   * count keeps the group frozen (in the caller's handleNoSyncPeers) waiting
+   * for a peer that is gone. This is a no-op for peers that already deactivated
    * detached mode processing (e.g. unregisterPeer), which cleared the version.
    */
   if (adjRib->getDetachedRibVersion() > 0) {
@@ -2618,20 +2629,6 @@ void AdjRibOutGroup::removePeer(
   bitToAdjRibs_.erase(bit);
   bitManager_.freeConsumerBit(bit);
   adjRib->clearGroupBitPosition();
-
-  /*
-   * Whenever the group still has members but no SYNC peers, recover: clear the
-   * packing list, freeze the consume timer, and try to promote a detached peer
-   * (or stay frozen until one catches up). This is not only the SYNC -> none
-   * transition: the group may already have had no SYNC peers and we just
-   * removed a detached one, which can unblock a different detached peer.
-   *
-   * TODO: optimize -- this runs synchronously per removal. Skip it when nothing
-   * is promotable (no DETACHED_READY_TO_JOIN peers).
-   */
-  if (shouldHandleNoSyncPeers && getMemberCount() > 0 && numInSyncPeers_ == 0) {
-    handleNoSyncPeers();
-  }
 }
 
 void AdjRibOutGroup::movePeerMaterializedRibOutPathEntries(
@@ -2818,6 +2815,14 @@ void AdjRibOutGroup::movePeers(
     adjRib->setAdjRibFlag(AdjRib::DETACHED_INIT_DUMP_PEER);
 
     newGroup->detachedPeers_.insert(adjRib);
+  }
+
+  /*
+   * Recover this group once, after all moved peers are out. Running it per
+   * removePeer would risk promoting a peer that is still pending its own move.
+   */
+  if (getMemberCount() > 0 && numInSyncPeers_ == 0) {
+    handleNoSyncPeers();
   }
 }
 
@@ -3007,13 +3012,12 @@ void AdjRibOutGroup::splitToNewGroup(
     uint64_t detachedRibVersion = peer->getDetachedRibVersion();
 
     /*
-     * Suppress the no-sync-peers recovery here: we only want to promote a
-     * remaining peer once, after every peer in peersToMove has been removed.
-     * Running it mid-loop could promote a peer that is still pending its own
-     * move, and could promote repeatedly as each removal drops the in-sync
-     * count. We call handleNoSyncPeers() once at the end instead.
+     * removePeer does not run handleNoSyncPeers; we call it once at the end so
+     * the recovery only promotes a remaining peer after every peer in
+     * peersToMove has been removed (running it mid-loop could promote a peer
+     * that is still pending its own move).
      */
-    removePeer(peer, /*shouldHandleNoSyncPeers=*/false);
+    removePeer(peer);
 
     /* Faithful register into newGroup. */
     uint64_t newBit = newGroup->bitManager_.getConsumerBit();

@@ -1082,15 +1082,12 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
    * Common cleanup when removing a peer from this group.
    * Resets timers, clears bitmaps, frees bit position, and removes
    * from tracking maps. Does NOT handle per-peer RIB-OUT entries or
-   * peer state transitions — callers handle those separately.
-   * When shouldHandleNoSyncPeers is true (default), runs handleNoSyncPeers()
-   * if this removal leaves the group with members but no in-sync peers. Pass
-   * false to suppress that recovery (e.g. during a bulk group split, where the
-   * caller is re-homing peers and must not promote a not-yet-moved peer).
+   * peer state transitions — callers handle those separately. Does NOT run
+   * handleNoSyncPeers(): callers invoke it (guarded on members-but-no-sync)
+   * after removal, so a bulk caller can remove all peers first and recover
+   * once rather than per-removal.
    */
-  void removePeer(
-      const std::shared_ptr<AdjRib>& adjRib,
-      bool shouldHandleNoSyncPeers = true) noexcept;
+  void removePeer(const std::shared_ptr<AdjRib>& adjRib) noexcept;
 
   /*
    * Move each peer's RIB-OUT entries to the new group. These methods do NOT
