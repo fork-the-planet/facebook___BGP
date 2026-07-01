@@ -3913,8 +3913,7 @@ void PeerManager::schedulePolicyReEvalForPendingGroups() {
         "Scheduling group egress policy re-evaluation for group {}",
         group->getAdjRibGroupName());
 
-    asyncScope_.add(
-        co_withExecutor(&evb_, processGroupEgressPolicyReEvaluation(group)));
+    scheduleGroupEgressPolicyReEvaluation(group);
   }
 }
 
@@ -4032,6 +4031,54 @@ folly::coro::Task<void> PeerManager::processRibDumpReqForEgressPolicyUpdate(
  *
  * Step 3: Clear pendingEgressPolicyUpdate for all IN_SYNC peers.
  */
+folly::coro::Task<void>
+PeerManager::processGroupEgressPolicyReEvaluationWithCancellationCoro(
+    std::shared_ptr<AdjRibOutGroup> group) {
+  auto cancelToken = co_await folly::coro::co_current_cancellation_token;
+
+  /*
+   * If this walk was cancelled -- superseded by a newer walk for the same
+   * group, or cancelled on group teardown -- skip it entirely. Whoever
+   * cancelled us now owns the cancellation source, so we must neither run a
+   * stale walk nor touch the source.
+   */
+  if (cancelToken.isCancellationRequested()) {
+    co_return;
+  }
+
+  /*
+   * On NORMAL completion, clear the group's rib-walk tracking so a subsequent
+   * walk can be scheduled. Guard on our own token: if cancellation was
+   * requested (superseded by a newer walk or group teardown), the source has
+   * already been retired/replaced, so we must not overwrite it.
+   */
+  SCOPE_EXIT {
+    if (!cancelToken.isCancellationRequested()) {
+      group->resetEgressPolicyReEvaluationCancellationSource();
+    }
+  };
+
+  co_await processGroupEgressPolicyReEvaluation(group);
+  co_return;
+}
+
+void PeerManager::scheduleGroupEgressPolicyReEvaluation(
+    const std::shared_ptr<AdjRibOutGroup>& group) {
+  /*
+   * Coalesce: if a rib walk is already scheduled / in flight for this group
+   * (its cancellation source is armed), do not schedule another. The in-flight
+   * walk serves the latest ShadowRib state.
+   */
+  if (group->isEgressPolicyReEvaluationScheduled()) {
+    return;
+  }
+  asyncScope_.add(
+      co_withExecutor(
+          &evb_,
+          processGroupEgressPolicyReEvaluationWithCancellationCoro(group)),
+      group->getCancellationTokenForNewEgressPolicyReEvaluation());
+}
+
 folly::coro::Task<void> PeerManager::processGroupEgressPolicyReEvaluation(
     std::shared_ptr<AdjRibOutGroup> group) {
   [[maybe_unused]] ScopedProfile profile(

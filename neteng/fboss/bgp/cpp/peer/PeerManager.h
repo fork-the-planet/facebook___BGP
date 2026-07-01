@@ -566,6 +566,26 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
   folly::coro::Task<void> processGroupEgressPolicyReEvaluation(
       std::shared_ptr<AdjRibOutGroup> group);
 
+  /*
+   * Cancellable variant of processGroupEgressPolicyReEvaluation used by
+   * scheduleGroupEgressPolicyReEvaluation: the walk is tracked by the group's
+   * cancellation source so it can be superseded by a newer walk or cancelled on
+   * group teardown.
+   */
+  folly::coro::Task<void>
+  processGroupEgressPolicyReEvaluationWithCancellationCoro(
+      std::shared_ptr<AdjRibOutGroup> group);
+
+  /*
+   * Schedule a group's egress-policy re-evaluation on asyncScope_, but only if
+   * one is not already scheduled or in flight (checked via
+   * group->isEgressPolicyReEvaluationScheduled()). The group owns the
+   * cancellation source so teardown can cancel the walk; its token is passed
+   * into asyncScope_.add().
+   */
+  void scheduleGroupEgressPolicyReEvaluation(
+      const std::shared_ptr<AdjRibOutGroup>& group);
+
   /* Helper method to distribute RibOutAnnouncement to all adjRibs */
   void distributeRibOutAnnouncementToAdjRibs(
       const RibOutAnnouncement& announcement);

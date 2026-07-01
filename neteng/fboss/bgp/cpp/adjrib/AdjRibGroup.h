@@ -17,6 +17,7 @@
 #pragma once
 
 #include <fmt/format.h>
+#include <folly/CancellationToken.h>
 #include <folly/Function.h>
 #include <folly/container/F14Map.h>
 #include <folly/container/F14Set.h>
@@ -1053,6 +1054,35 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
       const AdjRibOutOwnerKey& effectiveOwnerKey,
       const AdjRibEntry* entryToCopy) noexcept;
 
+  /*
+   * Cancellation API for this group's egress-policy RIB walk, mirroring
+   * AdjRib's ribDumpCancellationSource_. The walk runs on PeerManager's
+   * asyncScope_; this source lets a newer walk supersede an in-flight one and
+   * lets group teardown cancel it. The source's presence (and not-yet-cancelled
+   * state) is itself the "a walk is scheduled / in flight" signal.
+   */
+  bool isEgressPolicyReEvaluationScheduled() const noexcept {
+    return egressPolicyReEvaluationCancellationSource_.has_value() &&
+        !egressPolicyReEvaluationCancellationSource_->isCancellationRequested();
+  }
+
+  folly::CancellationToken
+  getCancellationTokenForNewEgressPolicyReEvaluation() noexcept {
+    egressPolicyReEvaluationCancellationSource_.emplace();
+    return egressPolicyReEvaluationCancellationSource_->getToken();
+  }
+
+  void cancelEgressPolicyReEvaluation() noexcept {
+    if (egressPolicyReEvaluationCancellationSource_) {
+      egressPolicyReEvaluationCancellationSource_->requestCancellation();
+      egressPolicyReEvaluationCancellationSource_.reset();
+    }
+  }
+
+  void resetEgressPolicyReEvaluationCancellationSource() noexcept {
+    egressPolicyReEvaluationCancellationSource_.reset();
+  }
+
  private:
   /*
    * Promote a peer's RIB-OUT entries to group entries. Walks the
@@ -1452,6 +1482,15 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
    * Used to schedule coroutines that wait for blocked peer queues to unblock
    */
   folly::coro::CancellableAsyncScope asyncScope_;
+
+  /*
+   * Cancellation source for this group's egress-policy RIB walk scheduled on
+   * PeerManager's asyncScope_. Its presence (and not-yet-cancelled state)
+   * indicates a walk is currently scheduled or in flight; cancelled on group
+   * teardown (drainAsyncScope) so teardown supersedes an in-flight walk.
+   */
+  std::optional<folly::CancellationSource>
+      egressPolicyReEvaluationCancellationSource_;
 
   /**
    * Per-AFI flags tracking whether the group still owes that AFI's EoR marker
