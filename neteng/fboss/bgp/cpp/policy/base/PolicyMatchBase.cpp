@@ -72,7 +72,7 @@ nodes*/);
         auto ip = it->ipAddress();
         auto masklen = it->masklen();
         auto item = folly::CIDRNetwork(ip, masklen);
-        if (origOrder_.find(item) != origOrder_.end()) {
+        if (origOrder_.contains(item)) {
           RankedMatch rankedMatch = origOrder_.at(item);
           IPWithRankedMatch ipWithRankedMatch{
               .ip = item, .rankedMatch = rankedMatch};
