@@ -400,8 +400,7 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
   void clearIngressEgressRouteFiltersPolicy() noexcept;
 
   void updateIngressEgressPolicyNames(
-      std::unique_ptr<PeerToPolicyMap> peerToPolicyNames,
-      PolicyChangeScope scope = PolicyChangeScope::PEER_GROUP) noexcept;
+      std::unique_ptr<PeerToPolicyMap> peerToPolicyNames) noexcept;
 
   bool getIsInitialized() const;
   bool getIsSafeModeOn() const;
@@ -542,13 +541,12 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
    */
   folly::coro::Task<void> processIngressAndEgressRouteFilterUpdate(
       size_t ingressAffectedCount,
-      size_t egressAffectedCount,
-      PolicyChangeScope scope);
+      size_t egressAffectedCount);
 
   // Handle an egress route filter/routing policy update: schedule egress
   // policy re-evaluation for affected update groups (or per-peer re-evaluation
   // when update groups are disabled).
-  void handleEgressPolicyUpdate(PolicyChangeScope scope);
+  void handleEgressPolicyUpdate();
 
   // Collect update groups with pending egress policy re-evaluation
   folly::F14NodeSet<std::shared_ptr<AdjRibOutGroup>>

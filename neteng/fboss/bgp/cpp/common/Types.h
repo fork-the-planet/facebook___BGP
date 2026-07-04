@@ -98,16 +98,6 @@ enum class PeerUpdateState {
   DETACHED_RUNNING = 7, // Peer is running independently in detached mode
 };
 
-/**
- * Scope of an egress policy change, used to select the right re-evaluation
- * strategy in the update group path.
- */
-enum class PolicyChangeScope {
-  PEER, // setPeersPolicy / unsetPeersPolicy
-  PEER_GROUP, // setPeerGroupsPolicy
-  RIB, // setRouteAttributePolicy (unused — reserved for future use)
-};
-
 } // namespace facebook::bgp
 
 template <>
@@ -129,28 +119,6 @@ struct fmt::formatter<facebook::bgp::UpdateGroupState>
         break;
       case UpdateGroupState::WAITING:
         name = "WAITING";
-        break;
-    }
-    return fmt::formatter<std::string_view>::format(name, ctx);
-  }
-};
-
-template <>
-struct fmt::formatter<facebook::bgp::PolicyChangeScope>
-    : fmt::formatter<std::string_view> {
-  auto format(facebook::bgp::PolicyChangeScope scope, fmt::format_context& ctx)
-      const {
-    using facebook::bgp::PolicyChangeScope;
-    std::string_view name;
-    switch (scope) {
-      case PolicyChangeScope::PEER:
-        name = "PEER";
-        break;
-      case PolicyChangeScope::PEER_GROUP:
-        name = "PEER_GROUP";
-        break;
-      case PolicyChangeScope::RIB:
-        name = "RIB";
         break;
     }
     return fmt::formatter<std::string_view>::format(name, ctx);

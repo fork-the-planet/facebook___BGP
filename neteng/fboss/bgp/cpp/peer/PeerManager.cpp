@@ -3426,14 +3426,6 @@ void PeerManager::setRouteFilterPolicy(
           routeFilterPolicy_->getVersion());
       return;
     }
-    // Determine scope before overwriting: use the new policy if setting,
-    // or the old policy if clearing, so the scope matches the operation.
-    // When both are null, defaults to PEER_GROUP, but this is a no-op
-    // since no AdjRibs would be affected.
-    auto& scopePolicy = policy ? policy : routeFilterPolicy_;
-    auto scope = (scopePolicy && !scopePolicy->matchAgainstPeerGroupName())
-        ? PolicyChangeScope::PEER
-        : PolicyChangeScope::PEER_GROUP;
 
     routeFilterPolicy_ = std::move(policy);
 
@@ -3494,7 +3486,7 @@ void PeerManager::setRouteFilterPolicy(
     asyncScope_.add(co_withExecutor(
         &evb_,
         processIngressAndEgressRouteFilterUpdate(
-            ingressAffectedCount, egressAffectedCount, scope)));
+            ingressAffectedCount, egressAffectedCount)));
   });
 }
 
@@ -3533,10 +3525,8 @@ void PeerManager::clearGoldenPrefixesPolicy() noexcept {
 }
 
 void PeerManager::updateIngressEgressPolicyNames(
-    std::unique_ptr<PeerToPolicyMap> peerToPolicyNames,
-    PolicyChangeScope scope) noexcept {
+    std::unique_ptr<PeerToPolicyMap> peerToPolicyNames) noexcept {
   evb_.runInEventBaseThread([peerToPolicyNames = std::move(peerToPolicyNames),
-                             scope,
                              this]() mutable {
     // Query current config version when executing (not when posting)
     auto currentVersion = configManager_->getConfigVersion();
@@ -3597,7 +3587,7 @@ void PeerManager::updateIngressEgressPolicyNames(
     asyncScope_.add(co_withExecutor(
         &evb_,
         processIngressAndEgressRouteFilterUpdate(
-            ingressAffectedCount, egressAffectedCount, scope)));
+            ingressAffectedCount, egressAffectedCount)));
   });
 }
 
@@ -4141,8 +4131,8 @@ PeerManager::processUpdateGroupsEgressPolicyReevaluation() {
   co_return;
 }
 
-void PeerManager::handleEgressPolicyUpdate(PolicyChangeScope scope) {
-  XLOGF(INFO, "handleEgressPolicyUpdate called with scope {}", scope);
+void PeerManager::handleEgressPolicyUpdate() {
+  XLOGF(INFO, "handleEgressPolicyUpdate called");
   if (enableUpdateGroup_) {
     /*
      * egressPolicyUpdateForUpdateGroupsScheduled_ stays true while a
@@ -4150,9 +4140,7 @@ void PeerManager::handleEgressPolicyUpdate(PolicyChangeScope scope) {
      * policy updates don't double-schedule. The coro clears the flag on
      * completion.
      */
-    if ((scope == PolicyChangeScope::PEER_GROUP ||
-         scope == PolicyChangeScope::PEER) &&
-        !egressPolicyUpdateForUpdateGroupsScheduled_) {
+    if (!egressPolicyUpdateForUpdateGroupsScheduled_) {
       egressPolicyUpdateForUpdateGroupsScheduled_ = true;
       asyncScope_.add(co_withExecutor(
           &evb_, processUpdateGroupsEgressPolicyReevaluation()));
@@ -4319,8 +4307,7 @@ void PeerManager::processGroupEgressPolicyReEvaluation(
 
 folly::coro::Task<void> PeerManager::processIngressAndEgressRouteFilterUpdate(
     size_t ingressAffectedCount,
-    size_t egressAffectedCount,
-    PolicyChangeScope scope) {
+    size_t egressAffectedCount) {
   // Check if dynamic policy evaluation is enabled and there are adjRibs
   // with ingress policy changes
   if (enableDynamicPolicyEvaluation_ && ingressAffectedCount > 0) {
@@ -4366,7 +4353,7 @@ folly::coro::Task<void> PeerManager::processIngressAndEgressRouteFilterUpdate(
           egressAffectedCount);
     }
 
-    handleEgressPolicyUpdate(scope);
+    handleEgressPolicyUpdate();
   }
 
   co_return;
