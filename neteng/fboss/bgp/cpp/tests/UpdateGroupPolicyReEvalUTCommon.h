@@ -855,6 +855,14 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
     ASSERT_EQ(
         result,
         neteng::fboss::bgp::thrift::BgpPolicyChangeResult::POLICIES_APPLIED);
+    /*
+     * co_setPeersPolicy applies egressPolicyName_ via an async lambda posted by
+     * updateIngressEgressPolicyNames, which is version-gated. Flush the evb so
+     * that apply runs (and bumps the applied version) before the next call --
+     * otherwise back-to-back calls' applies coalesce under the gate and drop
+     * change sets, leaving some peers' egress unapplied (a load-dependent
+     * flake).
+     */
     flushEventBase(ctx);
   }
 
@@ -881,6 +889,10 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
     ASSERT_EQ(
         result,
         neteng::fboss::bgp::thrift::BgpPolicyChangeResult::POLICIES_APPLIED);
+    /*
+     * Flush this call's version-gated apply before the next call; see
+     * updatePeerEgressPolicyOnEvb.
+     */
     flushEventBase(ctx);
   }
 
@@ -902,6 +914,10 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
     ASSERT_EQ(
         result,
         neteng::fboss::bgp::thrift::BgpPolicyChangeResult::POLICIES_APPLIED);
+    /*
+     * Flush this call's version-gated apply before the next call; see
+     * updatePeerEgressPolicyOnEvb.
+     */
     flushEventBase(ctx);
   }
 
@@ -994,9 +1010,21 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
    */
   void runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(TestContext& ctx) {
     auto& evb = ctx.peerMgr->getEventBase();
-    folly::coro::blockingWait(
-        ctx.peerMgr->processUpdateGroupsEgressPolicyReevaluation().scheduleOn(
-            &evb));
+    /*
+     * Run the re-evaluation, then re-arm
+     * egressPolicyUpdateForUpdateGroupsScheduled_ inside the same coroutine,
+     * before the EventBase runs anything else. The re-evaluation's SCOPE_EXIT
+     * clears the flag on completion; left cleared, a still-pending
+     * processIngressAndEgressRouteFilterUpdate coro from an earlier setPolicy
+     * call would observe it cleared and schedule a stray async re-evaluation
+     * that races the test. Re-arming inline keeps the async path suppressed for
+     * the rest of the test (matching disableAsyncEgressReEvalOnEvb).
+     */
+    auto reevalAndReArm = [&ctx]() -> folly::coro::Task<void> {
+      co_await ctx.peerMgr->processUpdateGroupsEgressPolicyReevaluation();
+      ctx.peerMgr->egressPolicyUpdateForUpdateGroupsScheduled_ = true;
+    };
+    folly::coro::blockingWait(reevalAndReArm().scheduleOn(&evb));
   }
 
   // Whether the update group manager still tracks a group for the given key.
@@ -1026,24 +1054,6 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
     evb.runInEventBaseThreadAndWait([&]() {
       for (const auto& id : peers) {
         ctx.adjRibs.at(id)->setPendingEgressPolicyUpdate(true);
-      }
-    });
-  }
-
-  /*
-   * Re-align every peer's stored UpdateGroupKey to its current group's key.
-   * A test that diverges a peer's key from its group (e.g. installs an override
-   * but does not move the peer) must call this before tearDown -- otherwise
-   * shutdown's maybeDestroyUpdateGroup keys off the stale key, never finds the
-   * group, and leaks it (and its AdjRibPolicyCache references).
-   */
-  void realignPeerKeysToGroupsOnEvb(TestContext& ctx) {
-    auto& evb = ctx.peerMgr->getEventBase();
-    evb.runInEventBaseThreadAndWait([&]() {
-      for (auto& [peerId, adjRib] : ctx.adjRibs) {
-        if (auto group = adjRib->getUpdateGroup()) {
-          adjRib->updateGroupKey_ = group->getGroupKey();
-        }
       }
     });
   }
@@ -1322,7 +1332,7 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
    */
   static BgpPeerId makePeerId(int index) {
     auto addr = folly::IPAddress(
-        fmt::format("10.1.{}.{}", index / 256, (index % 256) + 1));
+        fmt::format("10.1.{}.{}", index / 255, index % 255 + 1));
     return BgpPeerId(addr, addr.asV4().toLongHBO());
   }
 

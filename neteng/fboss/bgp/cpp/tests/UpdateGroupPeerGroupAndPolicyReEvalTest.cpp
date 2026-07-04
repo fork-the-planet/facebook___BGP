@@ -29,6 +29,9 @@
   FRIEND_TEST(SplitToGroup, CopiesGroupFields); \
   FRIEND_TEST(SplitToGroup, MovesJoinedRunningPeer);
 
+#include <array>
+#include <tuple>
+
 #include "neteng/fboss/bgp/cpp/tests/UpdateGroupPolicyReEvalUTCommon.h"
 
 namespace facebook::bgp {
@@ -1178,7 +1181,6 @@ TEST_F(
   // All members restored to Policy0's RIB-OUT.
   expectRibOutForPolicy(ctx, peer(0), kPolicy0);
 
-  realignPeerKeysToGroupsOnEvb(ctx);
   tearDown(ctx);
 }
 
@@ -1254,7 +1256,6 @@ TEST_F(
   // All members restored to Policy0's RIB-OUT.
   expectRibOutForPolicy(ctx, peer(0), kPolicy0);
 
-  realignPeerKeysToGroupsOnEvb(ctx);
   tearDown(ctx);
 }
 
@@ -1325,7 +1326,6 @@ TEST_F(
   expectRibOutForPolicy(ctx, untouched(0), kPolicy0);
   expectRibOutForPolicy(ctx, changed(0), kPolicy1);
 
-  realignPeerKeysToGroupsOnEvb(ctx);
   tearDown(ctx);
 }
 
@@ -1420,7 +1420,6 @@ TEST_F(
   expectRibOutForPolicy(ctx, peer(0), kPolicy0);
   expectRibOutForPolicy(ctx, peer(kOverride), kPolicy0);
 
-  realignPeerKeysToGroupsOnEvb(ctx);
   tearDown(ctx);
 }
 
@@ -1507,7 +1506,6 @@ TEST_F(
   expectRibOutForPolicy(ctx, peer(0), kPolicy1);
   expectRibOutForPolicy(ctx, peer(kHalf), kPolicy1);
 
-  realignPeerKeysToGroupsOnEvb(ctx);
   tearDown(ctx);
 }
 
@@ -1585,7 +1583,6 @@ TEST_F(
   expectRibOutForPolicy(ctx, peer(0), kPolicy1);
   expectRibOutForPolicy(ctx, peer(kHalf), kPolicy1);
 
-  realignPeerKeysToGroupsOnEvb(ctx);
   tearDown(ctx);
 }
 
@@ -1659,7 +1656,6 @@ TEST_F(
   expectRibOutForPolicy(ctx, peer(0), kPolicy0);
   expectRibOutForPolicy(ctx, peer(kHalf), kPolicy0);
 
-  realignPeerKeysToGroupsOnEvb(ctx);
   tearDown(ctx);
 }
 
@@ -1739,7 +1735,6 @@ TEST_F(
   expectRibOutForPolicy(ctx, peer(0), kPolicy0);
   expectRibOutForPolicy(ctx, peer(2 * kThird), kPolicy0);
 
-  realignPeerKeysToGroupsOnEvb(ctx);
   tearDown(ctx);
 }
 
@@ -1808,7 +1803,6 @@ TEST_F(
   expectRibOutForPolicy(ctx, peer(0), kPolicy0);
   expectRibOutForPolicy(ctx, peer(kHalf), kPolicy0);
 
-  realignPeerKeysToGroupsOnEvb(ctx);
   tearDown(ctx);
 }
 
@@ -1886,7 +1880,6 @@ TEST_F(
   expectRibOutForPolicy(ctx, peer(kThird), kPolicy0);
   expectRibOutForPolicy(ctx, peer(0), kPolicy1);
 
-  realignPeerKeysToGroupsOnEvb(ctx);
   tearDown(ctx);
 }
 
@@ -1973,7 +1966,6 @@ TEST_F(
   EXPECT_FALSE(keyOf(peer(0)).peerOverride);
   expectRibOutForPolicy(ctx, peer(0), kPolicy2);
 
-  realignPeerKeysToGroupsOnEvb(ctx);
   tearDown(ctx);
 }
 
@@ -2040,7 +2032,6 @@ TEST_F(
   expectRibOutForPolicy(ctx, peer(0), kPolicy0);
   expectRibOutForPolicy(ctx, peer(kHalf), kPolicy0);
 
-  realignPeerKeysToGroupsOnEvb(ctx);
   tearDown(ctx);
 }
 
@@ -2131,8 +2122,168 @@ TEST_F(
   EXPECT_EQ(memberCountOf(d(0)), kN);
   expectRibOutForPolicy(ctx, d(0), kPolicy0);
 
-  realignPeerKeysToGroupsOnEvb(ctx);
   tearDown(ctx);
 }
+
+/*
+ * Drain/undrain sequence matrix. The six bundle/node drain-undrain orderings
+ * from the "Stateful Policy Resolution for BGP++ Drain Workflows" design, each
+ * run under all eight ways processUpdateGroupsEgressPolicyReevaluation can pick
+ * up the intermediate config changes.
+ *
+ * The group starts under a filtering (non-permit-all) egress policy, and the
+ * initial dump is verified to apply that policy (not a permit-all pass-through)
+ * before the sequence runs. The matrix runs at 1000 peers, with the bundle
+ * (per-peer) operations acting on the first 25% of them.
+ *
+ * Each sequence is four operations A B C D with three optional pick-up points
+ * between them (after A, B, C); the coroutine ALWAYS runs once more after D.
+ * That is 2^3 = 8 pick-up configurations (bit i set == re-evaluate after op i),
+ * so 6 sequences x 8 configs = 48 cases. Because the re-evaluation reconciles
+ * group membership from the full current config on every run, all eight configs
+ * of a sequence converge to the same state -- and all six sequences end fully
+ * undrained: one group holding every peer on the undrain policy, with the
+ * matching RIB-OUT.
+ */
+enum class DrainOp { BundleDrain, BundleUndrain, NodeDrain, NodeUndrain };
+
+inline constexpr std::array<std::array<DrainOp, 4>, 6> kDrainSequences = {{
+    // Seq 1: Bundle Drain -> Bundle Undrain -> Node Drain -> Node Undrain
+    {DrainOp::BundleDrain,
+     DrainOp::BundleUndrain,
+     DrainOp::NodeDrain,
+     DrainOp::NodeUndrain},
+    // Seq 2: Bundle Drain -> Node Drain -> Bundle Undrain -> Node Undrain
+    {DrainOp::BundleDrain,
+     DrainOp::NodeDrain,
+     DrainOp::BundleUndrain,
+     DrainOp::NodeUndrain},
+    // Seq 3: Node Drain -> Node Undrain -> Bundle Drain -> Bundle Undrain
+    {DrainOp::NodeDrain,
+     DrainOp::NodeUndrain,
+     DrainOp::BundleDrain,
+     DrainOp::BundleUndrain},
+    // Seq 4: Node Drain -> Bundle Drain -> Bundle Undrain -> Node Undrain
+    {DrainOp::NodeDrain,
+     DrainOp::BundleDrain,
+     DrainOp::BundleUndrain,
+     DrainOp::NodeUndrain},
+    // Seq 5: Bundle Drain -> Node Drain -> Node Undrain -> Bundle Undrain
+    {DrainOp::BundleDrain,
+     DrainOp::NodeDrain,
+     DrainOp::NodeUndrain,
+     DrainOp::BundleUndrain},
+    // Seq 6: Node Drain -> Bundle Drain -> Node Undrain -> Bundle Undrain
+    {DrainOp::NodeDrain,
+     DrainOp::BundleDrain,
+     DrainOp::NodeUndrain,
+     DrainOp::BundleUndrain},
+}};
+
+class DrainSequencePickupTest
+    : public UpdateGroupPolicyReEvalUTBase,
+      public ::testing::WithParamInterface<std::tuple<int, int>> {};
+
+TEST_P(DrainSequencePickupTest, ConvergesRegardlessOfPickupTiming) {
+  const int seqIdx = std::get<0>(GetParam());
+  const int pickupCfg = std::get<1>(GetParam());
+  const std::string kDrain = kPNameMatchNoAdvtDeny;
+  const std::string kUndrain = kPNamePermitAll;
+  const std::string kPg = "PEERGROUP_A";
+  constexpr int kN = 1000;
+  // Bundle (per-peer) drain/undrain acts on the first 25% of the group's peers.
+  const int kBundleCount = kN * 25 / 100;
+
+  // Start under a filtering (non-permit-all) egress policy so the initial dump
+  // exercises real policy application, not a permit-all pass-through.
+  auto ctx = setUpGroups({{kPg, kN}}, /*initialDumpCompleted=*/true, kDrain);
+  auto peer = [](int i) { return makePeerId(i); };
+  sendInitialRibDump(ctx);
+  expectEventualStateOnEvb(ctx, peer(0), PeerUpdateState::JOINED_RUNNING);
+  // Initial dump under the drain policy: 50 routes advertised, 50 denied.
+  expectRibOutForPolicy(ctx, peer(0), kDrain);
+
+  std::vector<BgpPeerId> peers;
+  for (int i = 0; i < kN; ++i) {
+    peers.push_back(peer(i));
+  }
+
+  auto& evb = ctx.peerMgr->getEventBase();
+  auto groupOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroup(); })
+        .get();
+  };
+  auto keyOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroupKey(); })
+        .get();
+  };
+  auto memberCountOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb,
+               [&]() {
+                 return ctx.adjRibs.at(id)->getUpdateGroup()->getMemberCount();
+               })
+        .get();
+  };
+
+  auto applyOp = [&](DrainOp op) {
+    switch (op) {
+      case DrainOp::BundleDrain:
+        for (int i = 0; i < kBundleCount; ++i) {
+          updatePeerEgressPolicyOnEvb(ctx, peer(i), kDrain);
+        }
+        break;
+      case DrainOp::BundleUndrain:
+        for (int i = 0; i < kBundleCount; ++i) {
+          unsetPeerEgressPolicyOnEvb(ctx, peer(i));
+        }
+        break;
+      case DrainOp::NodeDrain:
+        updatePeerGroupEgressPolicyOnEvb(ctx, kPg, kDrain);
+        break;
+      case DrainOp::NodeUndrain:
+        updatePeerGroupEgressPolicyOnEvb(ctx, kPg, kUndrain);
+        break;
+    }
+  };
+
+  const auto& seq = kDrainSequences[seqIdx];
+  for (size_t i = 0; i < seq.size(); ++i) {
+    // Re-arm the async re-eval guard before each API call so only our manual
+    // pickups drive re-evaluation; a manual pickup clears the guard on exit.
+    disableAsyncEgressReEvalOnEvb(ctx);
+    applyOp(seq[i]);
+    // Pick up after earlier ops per the config bitmask; always after the last.
+    if (i == seq.size() - 1 || (pickupCfg & (1 << i)) != 0) {
+      markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+      runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+    }
+  }
+
+  // Every sequence, under every pickup config, ends fully undrained: one group
+  // holding all peers on the undrain policy, no per-peer override, matching
+  // RIB-OUT.
+  for (const auto& p : peers) {
+    EXPECT_EQ(groupOf(peer(0)), groupOf(p));
+    expectRibOutForPolicy(ctx, p, kUndrain);
+  }
+  EXPECT_EQ(memberCountOf(peer(0)), static_cast<size_t>(kN));
+  EXPECT_FALSE(keyOf(peer(0)).peerOverride);
+  ASSERT_TRUE(keyOf(peer(0)).egressPolicyName.has_value());
+  EXPECT_EQ(*keyOf(peer(0)).egressPolicyName, kUndrain);
+
+  tearDown(ctx);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    DrainWorkflows,
+    DrainSequencePickupTest,
+    ::testing::Combine(::testing::Range(0, 6), ::testing::Range(0, 8)),
+    [](const ::testing::TestParamInfo<std::tuple<int, int>>& info) {
+      return "Seq" + std::to_string(std::get<0>(info.param) + 1) + "Cfg" +
+          std::to_string(std::get<1>(info.param));
+    });
 
 } // namespace facebook::bgp
