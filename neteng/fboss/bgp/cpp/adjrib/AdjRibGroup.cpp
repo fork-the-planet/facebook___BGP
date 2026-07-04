@@ -73,17 +73,6 @@ folly::coro::Task<void> AdjRibOutGroup::drainAsyncScope() {
   asyncScope_.requestCancellation();
   co_await asyncScope_.joinAsync();
 
-  /*
-   * Request cancellation of any in-flight egress-policy RIB walk scheduled on
-   * PeerManager's asyncScope_ (its cancellation source lives on this group).
-   * This only signals cancellation -- it does NOT wait for the walk, which runs
-   * on PeerManager's scope, not the group's asyncScope_ joined above. The walk
-   * holds a shared_ptr<AdjRibOutGroup>, so the group stays alive until the walk
-   * observes the cancellation; PeerManager's own asyncScope_ join is what
-   * actually drains it.
-   */
-  cancelEgressPolicyReEvaluation();
-
   XLOGF(
       DBG1,
       "Group {} drainAsyncScope: async cleanup complete",

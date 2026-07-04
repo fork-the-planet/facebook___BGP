@@ -3898,24 +3898,6 @@ PeerManager::getPolicyReEvalPendingGroups() {
   return affectedGroups;
 }
 
-void PeerManager::schedulePolicyReEvalForPendingGroups() {
-  for (const auto& group : getPolicyReEvalPendingGroups()) {
-    XLOGF(
-        INFO,
-        "Scheduling group egress policy re-evaluation for group {}",
-        group->getAdjRibGroupName());
-
-    scheduleGroupEgressPolicyReEvaluation(group);
-  }
-}
-
-void PeerManager::schedulePolicyReEvalForGroupAdjRibs() {
-  // Per-peer: rebuild each affected peer's UpdateGroupKey, compare
-  // against current group. Peers whose key changed must move groups
-  // (Group1 != Group2 reconciliation path).
-  // TODO(6.6): Implement single peer re-evaluation.
-}
-
 void PeerManager::schedulePolicyReEvalForAdjRibs() {
   for (const auto& [peerId, adjRib] : adjRibs_) {
     if (adjRib->isEgressPolicyUpdateRequired() &&
@@ -4203,54 +4185,6 @@ folly::coro::Task<void> PeerManager::processRibDumpReqForEgressPolicyUpdate(
     std::shared_ptr<AdjRib> adjRib) {
   co_await processRibDumpReqCoro(RibDumpReq(peerId, adjRib->sendAddPath()));
   adjRib->clearPendingEgressPolicyUpdate(); // Clear flag after completion
-}
-
-folly::coro::Task<void>
-PeerManager::processGroupEgressPolicyReEvaluationWithCancellationCoro(
-    std::shared_ptr<AdjRibOutGroup> group) {
-  auto cancelToken = co_await folly::coro::co_current_cancellation_token;
-
-  /*
-   * If this walk was cancelled -- superseded by a newer walk for the same
-   * group, or cancelled on group teardown -- skip it entirely. Whoever
-   * cancelled us now owns the cancellation source, so we must neither run a
-   * stale walk nor touch the source.
-   */
-  if (cancelToken.isCancellationRequested()) {
-    co_return;
-  }
-
-  /*
-   * On NORMAL completion, clear the group's rib-walk tracking so a subsequent
-   * walk can be scheduled. Guard on our own token: if cancellation was
-   * requested (superseded by a newer walk or group teardown), the source has
-   * already been retired/replaced, so we must not overwrite it.
-   */
-  SCOPE_EXIT {
-    if (!cancelToken.isCancellationRequested()) {
-      group->resetEgressPolicyReEvaluationCancellationSource();
-    }
-  };
-
-  processGroupEgressPolicyReEvaluation(group);
-  co_return;
-}
-
-void PeerManager::scheduleGroupEgressPolicyReEvaluation(
-    const std::shared_ptr<AdjRibOutGroup>& group) {
-  /*
-   * Coalesce: if a rib walk is already scheduled / in flight for this group
-   * (its cancellation source is armed), do not schedule another. The in-flight
-   * walk serves the latest ShadowRib state.
-   */
-  if (group->isEgressPolicyReEvaluationScheduled()) {
-    return;
-  }
-  asyncScope_.add(
-      co_withExecutor(
-          &evb_,
-          processGroupEgressPolicyReEvaluationWithCancellationCoro(group)),
-      group->getCancellationTokenForNewEgressPolicyReEvaluation());
 }
 
 void PeerManager::processGroupEgressPolicyReEvaluation(
