@@ -2321,6 +2321,120 @@ TEST_P(DrainSequencePickupTest, ConvergesRegardlessOfPickupTiming) {
   tearDown(ctx);
 }
 
+/*
+ * A detached peer rejoins its group with the correct RIB-OUT and WITHOUT any
+ * discrepancy collapse -- a clean, version-gated rejoin -- with no policy
+ * re-evaluation involved.
+ *
+ * One permit-all group of 2 peers. peer(1) is detached via real backpressure
+ * and driven behind the group's changelist (DETACHED_BLOCKED), while blocker
+ * peer(0) freezes the group ahead of it. Draining everyone to the end of the
+ * changelist makes the detached peer catch up to the group's rib version before
+ * rejoining, so the rejoin collapses zero discrepancies -- the assertion that
+ * distinguishes a clean version-gated rejoin from a marker-only rejoin (which
+ * would rejoin with stale entries and queue discrepancy corrections).
+ */
+TEST_F(UpdateGroupsEgressReEvalTest, DetachedPeerRejoinsWithCorrectRibOut) {
+  const std::string kPg = "PEERGROUP_1";
+  const std::string kPolicy = kPNamePermitAll;
+
+  auto ctx = setUpGroups({{kPg, 2}}, /*initialDumpCompleted=*/true, kPolicy);
+  sendInitialRibDump(ctx);
+  auto peer = [](int i) { return makePeerId(i); };
+  for (int i = 0; i < 2; ++i) {
+    expectEventualStateOnEvb(ctx, peer(i), PeerUpdateState::JOINED_RUNNING);
+  }
+  auto& evb = ctx.peerMgr->getEventBase();
+
+  // Baseline: the group serves the permit-all RIB-OUT (all 100 advertised).
+  expectRibOutForPolicy(ctx, peer(0), kPolicy);
+
+  /*
+   * Detach peer(1) via real distribution backpressure and drive the group past
+   * it: peer(1) ends up DETACHED_BLOCKED and behind on the changelist, blocker
+   * peer(0) is JOINED_BLOCKED so the group is frozen ahead of it.
+   */
+  triggerDetachedBlockedFromDetachedOnEvb(ctx, peer(1));
+  expectEventualStateOnEvb(ctx, peer(1), PeerUpdateState::DETACHED_BLOCKED);
+
+  /*
+   * Flap the whole RIB once more (new localPref). The group is frozen (peer(0)
+   * blocked), so these entries pile up on the changelist *beyond* the group's
+   * marker.
+   */
+  publishRouteUpdates(ctx, /*isInitialDump=*/false);
+
+  /*
+   * Unblock the detached peer FIRST, while the group is still frozen: draining
+   * only peer(1) lets it catch up to the group's frozen changelist marker (a
+   * marker-only gate would mark it "ready" here, at the group's
+   * soon-to-be-stale rib version). Best-effort: stop once it stops making
+   * progress or reaches DETACHED_READY_TO_JOIN. peer(0) is left blocked so the
+   * group stays frozen.
+   */
+  for (int round = 0; round < 20; ++round) {
+    drainQueue(ctx, peer(1));
+    auto st = folly::via(&evb, [&]() {
+                return ctx.adjRibs.at(peer(1))->getPeerState();
+              }).get();
+    if (st == PeerUpdateState::DETACHED_READY_TO_JOIN) {
+      break;
+    }
+    drainOne(ctx, peer(1));
+  }
+
+  /*
+   * Now unblock the group: draining peer(0) lets the group consume the flap and
+   * advance PAST the peer's ready position, so the peer is ready at a stale
+   * version. Run everyone to the end of the changelist. A version-gated rejoin
+   * re-checks the peer against the advanced group and makes it catch up (zero
+   * discrepancies); a marker-only rejoin would accept the stale peer and queue
+   * discrepancy corrections.
+   */
+  bool allSync = false;
+  for (int round = 0; round < 300 && !allSync; ++round) {
+    auto states = folly::via(&evb, [&]() {
+                    std::array<PeerUpdateState, 2> s{};
+                    for (int i = 0; i < 2; ++i) {
+                      s[i] = ctx.adjRibs.at(peer(i))->getPeerState();
+                    }
+                    return s;
+                  }).get();
+    allSync = true;
+    for (int i = 0; i < 2; ++i) {
+      if (states[i] != PeerUpdateState::JOINED_RUNNING) {
+        allSync = false;
+        drainQueue(ctx, peer(i));
+        drainOne(ctx, peer(i));
+      }
+    }
+  }
+  for (int i = 0; i < 2; ++i) {
+    expectEventualStateOnEvb(ctx, peer(i), PeerUpdateState::JOINED_RUNNING);
+  }
+
+  /*
+   * Both peers rejoined the same group in sync with the correct RIB-OUT, and
+   * the rejoin was clean: the version-gated rejoin queued zero discrepancy
+   * corrections.
+   */
+  auto result =
+      folly::via(&evb, [&]() {
+        auto group = ctx.adjRibs.at(peer(1))->getUpdateGroup();
+        return std::make_tuple(
+            ctx.adjRibs.at(peer(0))->getUpdateGroup().get() == group.get(),
+            group->getNumInSyncPeers(),
+            group->getTotalDiscrepancies());
+      }).get();
+  EXPECT_TRUE(std::get<0>(result));
+  EXPECT_EQ(std::get<1>(result), 2u);
+  EXPECT_EQ(std::get<2>(result), 0);
+  expectRibOutForPolicy(ctx, peer(1), kPolicy);
+
+  realignPeerKeysToGroupsOnEvb(ctx);
+  tearDown(ctx);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     DrainWorkflows,
     DrainSequencePickupTest,

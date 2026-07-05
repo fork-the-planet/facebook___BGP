@@ -1038,6 +1038,7 @@ void PeerManager::processRibDumpReq(
   RibOutAnnouncement announcement;
   announcement.initialDump = true;
 
+  uint64_t maxRibVersion = ribVersionBeforeWalk;
   for (const auto& [prefix, trackedShadowRibEntry] : shadowRibEntries_) {
     /*
      * If this shadow rib entry is already on a changeList for this
@@ -1054,6 +1055,7 @@ void PeerManager::processRibDumpReq(
      * announcement even if can over the packing limit with add-path enabled.
      */
     auto& shadowRibEntry = trackedShadowRibEntry->get();
+    maxRibVersion = std::max(maxRibVersion, shadowRibEntry.ribVersion);
 
     if (!sendAddPath) {
       // send out bestpath only.
@@ -1115,6 +1117,14 @@ void PeerManager::processRibDumpReq(
    * through shadowRib table
    */
   adjRib->processRibMessage(announcement);
+  /*
+   * processRibMessage version-tracks only successfully-announced entries;
+   * implicitly-withdrawn or AFI-unsupported entries walked in this dump are
+   * skipped. Advance the peer to the max shadow-rib version it was dumped so
+   * its lastSeenRibVersion stays accurate. setLastSeenRibVersion only advances
+   * if greater than the peer's current version.
+   */
+  adjRib->setLastSeenRibVersion(maxRibVersion);
   /*
    * changeList consumers are to be registered to the tracker
    * library only after initial dump with EoR flag is sent to

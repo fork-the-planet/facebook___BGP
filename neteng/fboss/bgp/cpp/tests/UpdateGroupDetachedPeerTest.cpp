@@ -29,13 +29,10 @@
       UpdateGroupDetachedPeerTest, IsDFPReturnsFalseWhenVersionsMismatch);     \
   FRIEND_TEST(                                                                 \
       UpdateGroupDetachedPeerTest,                                             \
-      IsReadyToRejoinGroupReturnsFalseWhenConsumerNotReadyEvenIfPLEmpty);      \
+      IsReadyToRejoinGroupReturnsFalseWhenVersionMismatchEvenIfPLEmpty);       \
   FRIEND_TEST(                                                                 \
       UpdateGroupDetachedPeerTest,                                             \
       IsReadyToRejoinGroupReturnsFalseWhenPLNotEmpty);                         \
-  FRIEND_TEST(                                                                 \
-      UpdateGroupDetachedPeerTest,                                             \
-      IsReadyToRejoinGroupReturnsFalseWhenConsumerNotReady);                   \
   FRIEND_TEST(                                                                 \
       UpdateGroupDetachedPeerTest,                                             \
       IsReadyToRejoinGroupReturnsFalseWhenNoConsumer);                         \
@@ -1134,7 +1131,7 @@ TEST_F(UpdateGroupDetachedPeerTest, IsDFPReturnsFalseWhenNoGroup) {
 
 TEST_F(
     UpdateGroupDetachedPeerTest,
-    IsReadyToRejoinGroupReturnsFalseWhenConsumerNotReadyEvenIfPLEmpty) {
+    IsReadyToRejoinGroupReturnsFalseWhenVersionMismatchEvenIfPLEmpty) {
   auto adjRib = createAndRegisterPeer(0);
 
   // Set up change tracker and consumer
@@ -1153,26 +1150,16 @@ TEST_F(
   groupConsumer->registerWithTracker();
   groupConsumer->setBitmap();
 
-  // Publish an item so group consumer has a pending change
-  ShadowRibEntry entry;
-  entry.prefix = folly::CIDRNetwork{folly::IPAddress("10.0.0.0"), 24};
-  auto trackable =
-      std::make_unique<TrackableObject<ShadowRibEntry>>(std::move(entry));
-  changeTracker->publishChange(trackable.get());
-
-  // Group consumer has pending item — not ready
-  ASSERT_FALSE(groupConsumer->isReady());
-
-  // Register detached consumer — it joins at group's position (before item)
+  // Register detached consumer so the null-consumer guard passes.
   adjRib->registerDetachedConsumerAtGroupPosition(
       changeTracker, groupConsumer, addPathBitmap, nonAddPathBitmap);
-  auto detachedConsumer = adjRib->getDetachedConsumer();
-  ASSERT_NE(detachedConsumer, nullptr);
+  ASSERT_NE(adjRib->getDetachedConsumer(), nullptr);
 
-  // Detached consumer has unconsumed items — not ready
-  ASSERT_FALSE(detachedConsumer->isReady());
+  // Group has materialized a newer RIB version than the peer.
+  group_->setLastSeenRibVersion(5);
+  ASSERT_NE(group_->getLastSeenRibVersion(), adjRib->getLastSeenRibVersion());
 
-  // PL is empty but consumer is not ready — should return false
+  // PL is empty but the versions differ — not ready to rejoin.
   ASSERT_TRUE(adjRib->attrToPrefixMap_.empty());
   EXPECT_FALSE(adjRib->isReadyToRejoinGroup());
 
@@ -1215,55 +1202,6 @@ TEST_F(
       std::make_pair(prefix, kPlaceholderPathID), nullptr, constAttrs);
   group_->clonePackingListForPeer(adjRib);
   ASSERT_FALSE(adjRib->attrToPrefixMap_.empty());
-
-  EXPECT_FALSE(adjRib->isReadyToRejoinGroup());
-
-  // Clean up
-  adjRib->deactivateDetachedModeProcessing();
-  groupConsumer->resetBitmap();
-  groupConsumer->terminate();
-  groupConsumer->deregisterFromTracker();
-}
-
-TEST_F(
-    UpdateGroupDetachedPeerTest,
-    IsReadyToRejoinGroupReturnsFalseWhenConsumerNotReady) {
-  auto adjRib = createAndRegisterPeer(0);
-
-  // Set up change tracker with pending items
-  auto changeTracker =
-      std::make_shared<ChangeTracker<ShadowRibEntry>>("test_tracker");
-  ConsumerBitmap addPathBitmap;
-  ConsumerBitmap nonAddPathBitmap;
-
-  auto groupConsumer = std::make_shared<AdjRibOutGroupConsumer>(
-      changeTracker,
-      group_,
-      "test_group_consumer",
-      *evb_,
-      addPathBitmap,
-      nonAddPathBitmap);
-  groupConsumer->registerWithTracker();
-  groupConsumer->setBitmap();
-
-  // Publish items AFTER group consumer registers, so group consumer
-  // has pending items
-  ShadowRibEntry entry;
-  entry.prefix = folly::CIDRNetwork{folly::IPAddress("10.0.0.0"), 24};
-  auto trackable =
-      std::make_unique<TrackableObject<ShadowRibEntry>>(std::move(entry));
-  changeTracker->publishChange(trackable.get());
-
-  // Register detached consumer — it joins at group's position (before the
-  // published item), so it has unconsumed items
-  adjRib->registerDetachedConsumerAtGroupPosition(
-      changeTracker, groupConsumer, addPathBitmap, nonAddPathBitmap);
-  auto detachedConsumer = adjRib->getDetachedConsumer();
-  ASSERT_NE(detachedConsumer, nullptr);
-  ASSERT_FALSE(detachedConsumer->isReady());
-
-  // Detached PL is empty
-  ASSERT_TRUE(adjRib->attrToPrefixMap_.empty());
 
   EXPECT_FALSE(adjRib->isReadyToRejoinGroup());
 
@@ -3096,7 +3034,9 @@ class UpdateGroupDetachLifecycleTest : public ::testing::Test {
   /*
    * Set up a peer's CL consumer in ready state so isReadyToRejoinGroup()
    * returns true. Required for DSP peers going through
-   * checkAndAcceptReadyToJoinPeers.
+   * checkAndAcceptReadyToJoinPeers. isReadyToRejoinGroup() gates on the peer's
+   * lastSeenRibVersion matching the group's, so bring the peer up to the
+   * group's version to reflect a caught-up peer.
    */
   void setUpReadyPeerConsumer(const std::shared_ptr<AdjRib>& adjRib) {
     auto peerConsumer = std::make_shared<AdjRibOutConsumer>(
@@ -3108,6 +3048,7 @@ class UpdateGroupDetachLifecycleTest : public ::testing::Test {
         nonAddPathBitmap_);
     adjRib->setChangeListConsumer(peerConsumer);
     peerConsumer->setMarker(nullptr);
+    adjRib->setLastSeenRibVersion(group_->getLastSeenRibVersion());
   }
 
   /*

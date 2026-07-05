@@ -54,6 +54,16 @@ void AdjRib::processShadowRibEntryChange(ShadowRibEntry& srEntry) noexcept {
     return;
   }
 
+  /*
+   * Track how caught up this peer is on the change list. Every consumed entry
+   * -- announcement or withdrawal -- advances the peer's RIB version, so set it
+   * once here (mirroring AdjRibOutGroup::processShadowRibEntryChange) rather
+   * than per-branch. The version-gated rejoin check relies on this being
+   * accurate; handleRibAnnouncedEntry additionally sets it on the direct
+   * RIB-dump path (processRibMessage).
+   */
+  setLastSeenRibVersion(srEntry.ribVersion);
+
   if (sendAddPath_) {
     for (const auto& [_, multipath] : srEntry.multipaths) {
       if (!multipath) {
@@ -1640,13 +1650,13 @@ bool AdjRib::isDFP() const {
 
 /*
  * DSP (Detached Slow Peer) readiness check.
- * Returns true if the peer has drained its packing list and its change list
- * marker has caught up to the group's marker (same position on the change
- * list). We compare markers rather than requiring both consumers to be at the
- * end of the change list: when the group is frozen mid-list (e.g. after the
- * last sync peer went down), its consumer marker is non-null, and a DSP that
- * catches up to that frozen marker must be able to rejoin without waiting for
- * the group to reach the end.
+ * Returns true if the peer has drained its packing list and its RIB-OUT is at
+ * the same version as the group's. We compare lastSeenRibVersion rather than
+ * change list markers: a marker can be advanced (or aliased to a freed node)
+ * independently of what the peer has actually materialized, so it can falsely
+ * report "caught up" while the peer's entries still diverge. Version equality
+ * is the reliable signal that the peer and group share the same materialized
+ * RIB-OUT before the peer rejoins.
  */
 bool AdjRib::isReadyToRejoinGroup() const {
   if (!attrToPrefixMap_.empty()) {
@@ -1670,19 +1680,14 @@ bool AdjRib::isReadyToRejoinGroup() const {
         getPeerName());
     return false;
   }
-  if (!adjRibOutGroup_->getChangeListConsumer()) {
+  if (adjRibOutGroup_->getLastSeenRibVersion() != lastSeenRibVersion_) {
     XLOGF(
         DBG2,
-        "Peer {} not ready to rejoin group: group changeListConsumer is null",
-        getPeerName());
-    return false;
-  }
-  if (changeListConsumer_->getMarker() !=
-      adjRibOutGroup_->getChangeListConsumer()->getMarker()) {
-    XLOGF(
-        DBG2,
-        "Peer {} not ready to rejoin group: marker not at group's marker",
-        getPeerName());
+        "Peer {} not ready to rejoin group: peer lastSeenRibVersion {} != "
+        "group lastSeenRibVersion {}",
+        getPeerName(),
+        lastSeenRibVersion_,
+        adjRibOutGroup_->getLastSeenRibVersion());
     return false;
   }
   return true;
