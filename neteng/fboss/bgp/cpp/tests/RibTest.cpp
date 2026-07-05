@@ -229,6 +229,9 @@ TEST_F(RibFixture, GetRibSummarySourceBreakdown) {
   EXPECT_EQ(1, summary.ibgp_prefixes().value());
   EXPECT_EQ(0, summary.confed_ebgp_prefixes().value());
   EXPECT_EQ(0, summary.local_prefixes().value());
+  EXPECT_EQ(0, summary.unresolvable_nexthops_count().value());
+  // Both announced routes have resolvable next-hops, so none are unresolved.
+  EXPECT_EQ(0, summary.routes_with_unresolved_nexthops().value());
   EXPECT_EQ(2, summary.prefix_length_counts().value()[64]);
 
   // The other address family is empty.

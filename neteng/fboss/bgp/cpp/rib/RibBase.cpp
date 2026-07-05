@@ -2232,6 +2232,10 @@ TRibSummary RibBase::getRibSummary(TBgpAfi afi) {
     summary.ibgp_prefixes() = ribCounters_.ibgpPrefixes(isV4);
     summary.confed_ebgp_prefixes() = ribCounters_.confedEbgpPrefixes(isV4);
     summary.local_prefixes() = ribCounters_.localPrefixes(isV4);
+    // RIB-wide (not per-AFI); identical in both responses.
+    summary.unresolvable_nexthops_count() = ribCounters_.unresolvableNexthops();
+    summary.routes_with_unresolved_nexthops() =
+        ribCounters_.routesWithUnresolvedNexthops(isV4);
   });
   return summary;
 }

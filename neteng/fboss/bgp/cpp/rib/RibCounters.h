@@ -148,6 +148,22 @@ class RibCounters {
     return afiOf(isV4).unknown;
   }
 
+  /**
+   * Routes (prefixes) in one address family that have no best path because all
+   * their next-hops are unresolvable. Derived: total prefixes minus the
+   * prefixes counted in the best-path source buckets (eBGP / iBGP / confed-eBGP
+   * / local / unknown). A prefix with a best path is always counted in exactly
+   * one of those buckets, so the remainder is precisely the prefixes left with
+   * no best path. Clamped at 0 defensively.
+   */
+  int64_t routesWithUnresolvedNexthops(bool isV4) const {
+    const auto& a = afiOf(isV4);
+    const int64_t withBestpath =
+        a.ebgp + a.ibgp + a.confedEbgp + a.local + a.unknown;
+    const int64_t total = static_cast<int64_t>(a.totalPrefixes);
+    return total > withBestpath ? total - withBestpath : 0;
+  }
+
   /** Prefix count across both address families. */
   uint64_t totalPrefixes() const {
     return afis_[0].totalPrefixes + afis_[1].totalPrefixes;

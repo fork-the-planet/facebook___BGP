@@ -151,6 +151,35 @@ TEST(RibCountersTest, BestpathSourceBreakdown) {
   EXPECT_EQ(1, c.localPrefixes(/*isV4=*/true));
 }
 
+// routesWithUnresolvedNexthops = total prefixes minus the prefixes counted in
+// the four best-path source buckets, i.e. prefixes left with no best path
+// because all their next-hops are unresolvable.
+TEST(RibCountersTest, RoutesWithUnresolvedNexthops) {
+  RibStats::initCounters();
+  RibCounters c;
+
+  // Two v6 prefixes are in the RIB; only one wins a best path (iBGP). The other
+  // has no best path (all next-hops unresolvable) -> in no source bucket.
+  c.onPrefixAdded(/*isV4=*/false, 64);
+  c.onPrefixAdded(/*isV4=*/false, 64);
+  c.onBestpathSourceChanged(/*isV4=*/false, std::nullopt, BgpRouteType::IBGP);
+  EXPECT_EQ(1, c.routesWithUnresolvedNexthops(/*isV4=*/false));
+  // v4 has no prefixes, so none are unresolved.
+  EXPECT_EQ(0, c.routesWithUnresolvedNexthops(/*isV4=*/true));
+
+  // Once the second prefix also resolves to a best path, none remain
+  // unresolved.
+  c.onBestpathSourceChanged(/*isV4=*/false, std::nullopt, BgpRouteType::EBGP);
+  EXPECT_EQ(0, c.routesWithUnresolvedNexthops(/*isV4=*/false));
+
+  // An UNKNOWN-classified winner still has a best path, so the prefix is not
+  // counted as unresolved (the unknown bucket is excluded from the remainder).
+  c.onPrefixAdded(/*isV4=*/false, 64);
+  c.onBestpathSourceChanged(
+      /*isV4=*/false, std::nullopt, BgpRouteType::UNKNOWN);
+  EXPECT_EQ(0, c.routesWithUnresolvedNexthops(/*isV4=*/false));
+}
+
 // reset() zeroes the in-memory fields (used on the shutdown bulk-clear path).
 TEST(RibCountersTest, ResetZeroesInMemoryFields) {
   RibStats::initCounters();
