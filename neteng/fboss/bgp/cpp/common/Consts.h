@@ -355,4 +355,12 @@ constexpr auto kConsumerStalenessThreshold = std::chrono::minutes(10);
 // BGP++ platform tag for ODS counters
 constexpr auto kBgpcppTag = "bgpcpp";
 
+/*
+ * Multiplier on `eor_time_s` for BGP++ convergence max-cap timers. Used as the
+ * last-resort `initializedSignalTimer_` window, and (BB) as the boot-time
+ * `eorTimer_` max cap that bounds startup before the first session arms the
+ * real EoR wait.
+ */
+constexpr uint32_t kStartupConvergenceMaxWaitMultiplier = 5;
+
 } // namespace facebook::bgp

@@ -2389,7 +2389,7 @@ void PeerManager::notifyRibInitialPathComputation(bool timerFired) noexcept {
   // NOTE: this is the last line of defense to publish INITIALIZED signal in
   // case there are bad peers can't send egressEoR towards.
   initializedSignalTimer_->scheduleTimeout(
-      5 *
+      kStartupConvergenceMaxWaitMultiplier *
       std::chrono::seconds(
           *configManager_->getConfig()->getConfig().eor_time_s()));
 }
