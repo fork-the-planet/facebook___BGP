@@ -25,7 +25,7 @@
 
 #include "neteng/fboss/bgp/cpp/BgpServiceBase.h"
 #include "neteng/fboss/bgp/cpp/config/ConfigManager.h"
-#include "neteng/fboss/bgp/cpp/peer/PeerManager.h"
+#include "neteng/fboss/bgp/cpp/peer/PeerManagerBase.h"
 #include "neteng/fboss/bgp/cpp/stats/Stats.h"
 #include "neteng/fboss/bgp/cpp/tests/PolicyUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/RibUtils.h"
@@ -58,9 +58,9 @@ class BgpServiceBaseTestFixture : public ::testing::Test {
         "dev" /* platform */,
         nullptr /* fsdbSyncer*/);
 
-    // Create PeerManager with PolicyManager
+    // Create PeerManagerBase with PolicyManager
     policyManager_ = createPolicyManager();
-    peerManager_ = std::make_shared<PeerManager>(
+    peerManager_ = std::make_shared<PeerManagerBase>(
         configManager_, policyManager_, ribInQ_, ribOutQ_, neighborEventQ_);
 
     // Create watchdog
@@ -149,7 +149,7 @@ class BgpServiceBaseTestFixture : public ::testing::Test {
   }
 
   std::unique_ptr<MockRib> rib_;
-  std::shared_ptr<PeerManager> peerManager_;
+  std::shared_ptr<PeerManagerBase> peerManager_;
   std::shared_ptr<PolicyManager> policyManager_;
   std::unique_ptr<BgpServiceBase> service_;
   std::shared_ptr<Config> config_;

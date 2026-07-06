@@ -36,7 +36,7 @@
 namespace facebook::bgp {
 
 /**
- * Type alias for peer-to-policy map used by PeerManager.
+ * Type alias for peer-to-policy map used by PeerManagerBase.
  * Maps peer address string -> direction -> optional policy name.
  * - std::nullopt means "clear/unset this policy"
  * - A value means "set to this policy name"

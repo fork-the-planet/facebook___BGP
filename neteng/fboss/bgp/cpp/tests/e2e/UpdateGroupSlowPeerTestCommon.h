@@ -94,7 +94,7 @@ class SlowPeerTestBase : public UpdateGroupDistributionTestBase {
   /*
    * Get peer update state. Returns DOWN if peer not found.
    *
-   * Hops to the PeerManager event base before reading adjRib state so
+   * Hops to the PeerManagerBase event base before reading adjRib state so
    * the read is serialized with evb writers (e.g. markPeerUnblocked in the
    * deferredPushToPeer SCOPE_EXIT). Without this hop, a test-thread read
    * races those writes under TSan.
@@ -244,7 +244,7 @@ class SlowPeerTestBase : public UpdateGroupDistributionTestBase {
   /*
    * Check if a peer is detached from its update group.
    *
-   * Hops to the PeerManager event base before walking detachedPeers — the
+   * Hops to the PeerManagerBase event base before walking detachedPeers — the
    * collection is mutated on the evb by detach/accept paths, so an
    * off-evb walk races those mutations.
    */
@@ -278,7 +278,7 @@ class SlowPeerTestBase : public UpdateGroupDistributionTestBase {
   /*
    * Check if a peer is in sync with its update group.
    *
-   * Hops to the PeerManager event base before reading the sync bitmap —
+   * Hops to the PeerManagerBase event base before reading the sync bitmap —
    * the bitmap is mutated on the evb by detach/accept/group-state paths.
    */
   bool isPeerInSync(const folly::IPAddress& peerAddr) {

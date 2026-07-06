@@ -416,7 +416,7 @@ struct ShadowRibOutWithdrawal {
 using ShadowRibEntry = ShadowRibOutAnnouncementEntry;
 
 /*
- * EoR marker message which is consumed only by PeerManager during
+ * EoR marker message which is consumed only by PeerManagerBase during
  * BGP initialization.
  * This message is expected to come after the
  * last announcement enqueued to ribOutQ_ of the Fib programmed
@@ -425,10 +425,10 @@ using ShadowRibEntry = ShadowRibOutAnnouncementEntry;
 struct RibInitialAnnouncementStart {};
 
 /*
- * One-shot control signal pushed by RIB to PeerManager once the first
+ * One-shot control signal pushed by RIB to PeerManagerBase once the first
  * NeighborWatcher NexthopResolutionUpdate has been observed AND any
  * resulting conditional-route advertisements / withdrawals have been applied
- * to ribEntries_. PeerManager uses this signal as one of two preconditions
+ * to ribEntries_. PeerManagerBase uses this signal as one of two preconditions
  * (the other being all peer EORs received) before notifying RIB to start
  * initial path computation. This ordering guarantees that conditional
  * routes are present in RIB before the initial syncFib runs, preventing

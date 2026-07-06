@@ -1865,8 +1865,8 @@ FiberBgpPeerManager::getNotifyCoroQueue() noexcept {
 }
 
 /**
- * Determines whether peer's version client (PeerManager) is querying, is the
- * same as FiberPeerManager's version of the peer.
+ * Determines whether peer's version client (PeerManagerBase) is querying, is
+ * the same as FiberPeerManager's version of the peer.
  *
  * Args:
  *  peerId: BGP peer's address and identifier.

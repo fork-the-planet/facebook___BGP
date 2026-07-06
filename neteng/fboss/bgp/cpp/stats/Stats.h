@@ -59,7 +59,7 @@ constexpr auto kUcmpAlbwInitialized =
 // whether ucmp is active on at least 1 route
 constexpr auto kUcmpActive = "bgpd.ucmp.active"_fs;
 
-// whether PeerManager reaches the initialized_ timeout or not
+// whether PeerManagerBase reaches the initialized_ timeout or not
 constexpr auto kInitializedTimeout = "bgpd.initialized.timeout"_fs;
 
 // Counter for how many times fast tear down is triggered on current node.

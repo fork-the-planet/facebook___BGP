@@ -20,7 +20,7 @@
  * E2E tests for RIB route operations including route flapping scenarios.
  * Converted from RibTest.cpp unit tests.
  * Mocked: FIB (TestFib), SessionManager (MockSessionManager)
- * Real: RIB, PeerManager, AdjRib
+ * Real: RIB, PeerManagerBase, AdjRib
  */
 
 #include <gtest/gtest.h>

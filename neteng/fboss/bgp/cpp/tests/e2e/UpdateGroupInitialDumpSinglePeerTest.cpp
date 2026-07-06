@@ -16,7 +16,7 @@
 
 /*
  * E2E tests for BGP Update Group MVP functionality - Single Peer Initial Dump
- * Tests complete flow: RIB → PeerManager → UpdateGroup → Peers
+ * Tests complete flow: RIB → PeerManagerBase → UpdateGroup → Peers
  * Requires: Change List Tracker + Update Group + Egress Backpressure
  */
 
@@ -42,7 +42,7 @@ TEST_P(UpdateGroupInitialDumpTest, DebugOnePeerInitialDump) {
   addLocalRoute("10.0.0.0/8", {"100:1", "100:2"}, 100);
 
   /* Setup components - RIB will announce the local route */
-  XLOG(INFO, "Creating RIB and PeerManager");
+  XLOG(INFO, "Creating RIB and PeerManagerBase");
   setupComponents();
 
   /* Bring up peer and send EoR IMMEDIATELY to avoid 45s EoR timer wait */
@@ -100,7 +100,7 @@ TEST_P(UpdateGroupInitialDumpTest, DebugIbgpSinglePeer) {
   addLocalRoute("20.0.0.0/8", {"200:1"}, 100);
 
   /* Setup components */
-  XLOG(INFO, "Creating RIB and PeerManager");
+  XLOG(INFO, "Creating RIB and PeerManagerBase");
   setupComponents();
 
   /* Bring up peer and send EoR IMMEDIATELY to avoid 45s EoR timer wait */
@@ -150,8 +150,8 @@ TEST_P(UpdateGroupInitialDumpTest, OnePeerNoRoutes) {
   XLOG(INFO, "Adding peer config for 127.3.0.1");
   addPeer(kDefaultPeerSpec3);
 
-  /* Create RIB and PeerManager with update groups */
-  XLOG(INFO, "Creating RIB and PeerManager");
+  /* Create RIB and PeerManagerBase with update groups */
+  XLOG(INFO, "Creating RIB and PeerManagerBase");
   setupComponents();
 
   /* Bring up peer */
@@ -184,8 +184,8 @@ TEST_P(UpdateGroupInitialDumpTest, SimpleBgpInitialDumpWithUpdateGroup) {
 
   XLOG(INFO, "=== TEST START: SimpleBgpInitialDumpWithUpdateGroup ===");
 
-  /* Step 3: Create RIB and PeerManager infrastructure */
-  XLOG(INFO, "Step 3: Creating RIB and PeerManager with update groups");
+  /* Step 3: Create RIB and PeerManagerBase infrastructure */
+  XLOG(INFO, "Step 3: Creating RIB and PeerManagerBase with update groups");
   setupComponents();
 
   /* Step 4: Bring up peers and send EoR immediately to avoid EoR timer wait */

@@ -22,7 +22,7 @@
  *
  * Derived from: AdjRibInTest.cpp
  * Mocked: FIB (TestFib), SessionManager (MockSessionManager)
- * Real: RIB, PeerManager, AdjRib
+ * Real: RIB, PeerManagerBase, AdjRib
  */
 
 #include <gtest/gtest.h>
@@ -314,7 +314,7 @@ class E2EAdjRibInGrTimerCleanupTest : public E2ETestFixture {
                       /*enableEgressBackpressure=*/true);
   }
 
-  // Read isPeerGracefulRestarting on PeerManager's evb_ thread to avoid
+  // Read isPeerGracefulRestarting on PeerManagerBase's evb_ thread to avoid
   // a TSAN data race against remoteGrRestartTimer_.reset() inside the
   // GR-restart timer callback (also on evb_).
   bool isPeerGrOnEvb(const std::shared_ptr<AdjRib>& adjRib) {

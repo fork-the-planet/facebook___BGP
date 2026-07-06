@@ -36,7 +36,7 @@ namespace facebook::bgp {
  *
  * Session events flow through:
  *   simulateSessionEstablished() → getNotifyCoroQueue().push()
- *     → notifyCoroQueue_ → PeerManager::processPeerEventLoop()
+ *     → notifyCoroQueue_ → PeerManagerBase::processPeerEventLoop()
  *     → sessionEstablished() / sessionTerminated()
  */
 class E2ETestSessionManager : public SessionManager {
@@ -67,7 +67,7 @@ class E2ETestSessionManager : public SessionManager {
    * Simulate a session becoming ESTABLISHED.
    * Creates per-peer queues, VersionNumber, ObservableSessionInfo.
    * Pushes ObservableStateT through notifyCoroQueue so
-   * PeerManager::processPeerEventLoop() processes it.
+   * PeerManagerBase::processPeerEventLoop() processes it.
    *
    * Returns the version number assigned to this session incarnation.
    */

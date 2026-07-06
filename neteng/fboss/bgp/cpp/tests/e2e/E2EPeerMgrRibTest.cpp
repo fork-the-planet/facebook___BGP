@@ -15,13 +15,13 @@
  */
 
 /*
- * E2E tests for PeerManager RIB integration.
+ * E2E tests for PeerManagerBase RIB integration.
  *
- * These tests verify the integration between PeerManager and RIB,
+ * These tests verify the integration between PeerManagerBase and RIB,
  * including initial announcement, shadow RIB, and RIB dump requests.
  *
  * Mocked: FIB (TestFib), SessionManager (MockSessionManager)
- * Real: RIB, PeerManager, AdjRib
+ * Real: RIB, PeerManagerBase, AdjRib
  */
 
 #include <gtest/gtest.h>

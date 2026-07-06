@@ -28,7 +28,7 @@
 #include "neteng/fboss/bgp/cpp/config/Config.h"
 #include "neteng/fboss/bgp/cpp/config/ConfigManager.h"
 #include "neteng/fboss/bgp/cpp/health/HealthValidator.h"
-#include "neteng/fboss/bgp/cpp/peer/PeerManager.h"
+#include "neteng/fboss/bgp/cpp/peer/PeerManagerBase.h"
 #include "neteng/fboss/bgp/cpp/peer/SessionManager.h"
 #include "neteng/fboss/bgp/cpp/rib/RibBase.h"
 #include "neteng/fboss/bgp/cpp/watchdog/Watchdog.h"
@@ -46,7 +46,7 @@ class BgpServiceBase
     : public facebook::neteng::fboss::bgp::thrift::TBgpServiceSvIf {
  public:
   BgpServiceBase(
-      PeerManager& peerMgr,
+      PeerManagerBase& peerMgr,
       std::shared_ptr<ConfigManager> configManager,
       RibBase& rib,
       Watchdog& watchdog,
@@ -536,7 +536,7 @@ class BgpServiceBase
       facebook::neteng::fboss::bgp::thrift::TEntryStats& /* stats */) {}
 
   std::atomic<bool> exitInitiated_{false};
-  PeerManager& peerMgr_;
+  PeerManagerBase& peerMgr_;
   const std::shared_ptr<SessionManager>& sessionMgr_;
   std::shared_ptr<ConfigManager> configManager_;
   RibBase& rib_;

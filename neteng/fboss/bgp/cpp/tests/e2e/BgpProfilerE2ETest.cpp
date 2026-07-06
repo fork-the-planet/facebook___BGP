@@ -19,7 +19,7 @@
  * and produces example profiler output.
  *
  * These tests inject many routes through the BGP flow to exercise
- * the profiled functions (PeerManager loops, AdjRib packing, etc.)
+ * the profiled functions (PeerManagerBase loops, AdjRib packing, etc.)
  * and verify that the profiler captures meaningful statistics.
  */
 
@@ -187,7 +187,7 @@ TEST_F(BgpProfilerE2ETest, ProfilePeerUpAndEoRExchange) {
  *
  * Injects 1K routes through the BGP flow and verifies that
  * the profiler captures meaningful statistics for:
- * - PeerManager message loops
+ * - PeerManagerBase message loops
  * - AdjRib packing functions
  * - RIB processing
  */
@@ -228,10 +228,10 @@ TEST_F(BgpProfilerE2ETest, ProfileLargeScaleRouteProcessing) {
   }
 
   /*
-   * Wait for the LAST injected route to land in PeerManager's shadowRib.
+   * Wait for the LAST injected route to land in PeerManagerBase's shadowRib.
    * This is the synchronization point: shadowRibEntries_ is only populated
    * from inside processAdjRibEvent (which runs under a ScopedProfile
-   * "PeerManager::processAdjRibMsg"), so by the time the last prefix is
+   * "PeerManagerBase::processAdjRibMsg"), so by the time the last prefix is
    * visible the per-message ScopedProfile has destructed and recorded.
    *
    * Without this barrier, in @mode/opt the test thread races ahead of the
@@ -274,7 +274,7 @@ TEST_F(BgpProfilerE2ETest, ProfileLargeScaleRouteProcessing) {
    * Verify we captured stats for the processing functions
    */
   std::set<std::string> expectedFunctions = {
-      "PeerManager::processAdjRibMsgLoop",
+      "PeerManagerBase::processAdjRibMsgLoop",
   };
 
   std::set<std::string> foundFunctions;
@@ -303,9 +303,9 @@ TEST_F(BgpProfilerE2ETest, ProfileLargeScaleRouteProcessing) {
  */
 TEST_F(BgpProfilerE2ETest, ProfilerFilterTest) {
   /*
-   * Set filter to only profile PeerManager functions
+   * Set filter to only profile PeerManagerBase functions
    */
-  BgpProfiler::getInstance()->setFilterRegex("PeerManager::.*");
+  BgpProfiler::getInstance()->setFilterRegex("PeerManagerBase::.*");
   BgpProfiler::getInstance()->clearStats();
 
   setupComponents();
@@ -327,8 +327,8 @@ TEST_F(BgpProfilerE2ETest, ProfilerFilterTest) {
    * All captured functions should match the filter
    */
   for (const auto& s : stats) {
-    EXPECT_TRUE(s.name.find("PeerManager::") == 0)
-        << "Function " << s.name << " should match filter PeerManager::.*";
+    EXPECT_TRUE(s.name.find("PeerManagerBase::") == 0)
+        << "Function " << s.name << " should match filter PeerManagerBase::.*";
   }
 
   /*

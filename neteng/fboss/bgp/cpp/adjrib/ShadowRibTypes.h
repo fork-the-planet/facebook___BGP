@@ -26,8 +26,8 @@ namespace facebook::bgp {
 
 /*
  * Type alias for the shadow RIB entries map.
- * This is the canonical definition used across PeerManager, UpdateGroupManager,
- * and AdjRibGroup to ensure type consistency.
+ * This is the canonical definition used across PeerManagerBase,
+ * UpdateGroupManager, and AdjRibGroup to ensure type consistency.
  *
  * The map stores shadow RIB entries wrapped in TrackableObject for change
  * tracking via the changeListTracker publish/subscribe pattern.

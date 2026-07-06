@@ -15,7 +15,7 @@
  */
 
 /*
- * E2E test for PeerManager: Tests PeerManager BGP flow end-to-end
+ * E2E test for PeerManagerBase: Tests PeerManagerBase BGP flow end-to-end
  */
 
 #include <gtest/gtest.h>

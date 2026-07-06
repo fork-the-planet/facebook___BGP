@@ -717,9 +717,9 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
   folly::coro::Task<void> processLocalRoutesRoutine() noexcept;
 
   /*
-   * [Rib <-> PeerManager]
+   * [Rib <-> PeerManagerBase]
    *
-   * The loop to process incoming messages from PeerManager(AdjRib).
+   * The loop to process incoming messages from PeerManagerBase(AdjRib).
    *
    * This coro task deals with the following message types:
    *  - RibInAnnoucement
@@ -764,7 +764,7 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
    * NexthopResolutionUpdate arrives. Default is a no-op; subclasses that
    * originate conditional routes override to advertise/withdraw prefixes
    * from conditionalLocalRoutes_ and emit the one-shot
-   * RibOutNexthopResolutionReceived signal to PeerManager.
+   * RibOutNexthopResolutionReceived signal to PeerManagerBase.
    * @param nexthopResolutionUpdate The update message containing both resolved
    * and unresolved nexthop ips
    */
@@ -999,7 +999,7 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
   // Flag to indicate if route churn is detected.
   std::atomic<bool> routeChurnDetected_{false};
 
-  // ---------------- PeerManager <-> Rib ----------------
+  // ---------------- PeerManagerBase <-> Rib ----------------
 
   // rib in and out message queue
   nettools::bgplib::MonitoredBackPressuredQueue<RibInMessage>& ribInQ_;
@@ -1030,7 +1030,7 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
    *  - initialEorSent_: the flag indicates Rib has successfully programed
    *          initial FULL_SYNC to fib and EoR has been sent out from RIB;
    *  - ribEoRReceived_: the flag indicates Rib has received the notification
-   *                    from PeerManager to unblock initial RIB computation;
+   *                    from PeerManagerBase to unblock initial RIB computation;
    */
   bool initialEorSent_{false};
   bool ribEoRReceived_{false};

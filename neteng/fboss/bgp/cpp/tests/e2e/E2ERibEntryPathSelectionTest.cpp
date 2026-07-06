@@ -18,7 +18,7 @@
  * E2E tests for RibEntry path selection and ADD-PATH handling.
  *
  * Mocked: FIB (TestFib), SessionManager (MockSessionManager)
- * Real: RIB, PeerManager, AdjRib, RibEntry
+ * Real: RIB, PeerManagerBase, AdjRib, RibEntry
  */
 
 #include <gtest/gtest.h>

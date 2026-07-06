@@ -54,7 +54,7 @@ TEST_P(UpdateGroupSlowPeerDetectionTest, PeerInit_SlowDur) {
   bringUpPeer(kPeerAddr3);
 
   /* Set aggressive duration threshold AFTER bringUpPeer.
-   * Run on PeerManager's EventBase to avoid TSAN race with
+   * Run on PeerManagerBase's EventBase to avoid TSAN race with
    * distributeMessageToInSyncPeers reading the config. */
   {
     auto group = getUpdateGroupForPeer(kPeerAddr3);

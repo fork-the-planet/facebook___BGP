@@ -29,7 +29,7 @@
  * processPeerUpdate(update));
  *
  * // For sync functions - RAII at top
- * ScopedProfile p("PeerManager::processPeerEvent");
+ * ScopedProfile p("PeerManagerBase::processPeerEvent");
  */
 
 #pragma once
@@ -56,7 +56,7 @@ namespace facebook::bgp {
 
 /*
  * Thread identifier for lock-free profiling
- * BGP++ has 2 main threads: RIB and PeerManager
+ * BGP++ has 2 main threads: RIB and PeerManagerBase
  */
 enum class ProfilerThread {
   RIB,

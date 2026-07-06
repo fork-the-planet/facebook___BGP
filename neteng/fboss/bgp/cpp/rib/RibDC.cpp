@@ -239,8 +239,8 @@ void RibDC::processNexthopResolutionUpdate(
   /*
    * Process conditional-route advertisements/withdrawals first (if any),
    * THEN push the one-shot RibOutNexthopResolutionReceived signal to
-   * PeerManager. The post-processing push ordering is what guarantees that
-   * conditional routes are in ribEntries_ before PeerManager triggers the
+   * PeerManagerBase. The post-processing push ordering is what guarantees that
+   * conditional routes are in ribEntries_ before PeerManagerBase triggers the
    * initial path computation — preventing the initial syncFib from wiping
    * GR-retained conditional routes in FibAgent on BGP daemon restart.
    */
@@ -271,7 +271,7 @@ void RibDC::processNexthopResolutionUpdate(
     XLOG(
         INFO,
         "First NexthopResolutionUpdate processed; "
-        "signaling PeerManager via RibOutNexthopResolutionReceived");
+        "signaling PeerManagerBase via RibOutNexthopResolutionReceived");
     ribOutQ_.push(RibOutNexthopResolutionReceived{});
   }
 }

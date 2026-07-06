@@ -385,7 +385,7 @@ TEST_P(UpdateGroupCoroutineRaceTest, GWaiting_BackpressureThenSinglePeerFlap) {
  * 1. 3 peers joined, block peer3
  * 2. Inject routes so the packing list has entries to iterate
  * 3. Wait for peer3 queue to block (coroutine suspended mid-PL)
- * 4. Directly clear the packing list on the PeerManager EVB
+ * 4. Directly clear the packing list on the PeerManagerBase EVB
  * 5. Unblock peer3 — coroutine resumes
  * 6. Assert: no crash (iterator was consumed before co_await)
  */

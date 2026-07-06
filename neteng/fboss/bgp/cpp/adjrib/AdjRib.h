@@ -216,20 +216,20 @@ class AdjRib : boost::noncopyable,
   struct Shutdown {};
   struct EoR {};
   struct EgressEoR {};
-  // Used to notify PeerManager to trigger safe mode, See
+  // Used to notify PeerManagerBase to trigger safe mode, See
   // http://fburl.com/bgp_safe_mode for more details
   struct TriggerSafeMode {};
-  // Message to PeerManager
+  // Message to PeerManagerBase
   // 1. can be EoR : indicate peer EoR receipt for all negotiated
   // address families
-  // 2. can be Shutdown : notify PeerManager to shut this peer down
+  // 2. can be Shutdown : notify PeerManagerBase to shut this peer down
   // 3. can be EgressEoR : indicate egress EoR sent to peers after
   // initialization
   // 4. can be TriggerSafeMode : indicates that the condition for entering safe
   // mode is met(either total path scale or unique prefix limit is reached)
   using MessageToPeerManager =
       std::variant<Shutdown, EoR, EgressEoR, TriggerSafeMode>;
-  // Used to pass message from adjRib to PeerManager
+  // Used to pass message from adjRib to PeerManagerBase
   struct ObservableMessageT {
     nettools::bgplib::BgpPeerId peerId;
     MessageToPeerManager message;
@@ -320,8 +320,8 @@ class AdjRib : boost::noncopyable,
 
   /*
    * Create a fresh cancellation source for a newly scheduled rib dump and
-   * return its token to pass into PeerManager's asyncScope_ when scheduling the
-   * dump.
+   * return its token to pass into PeerManagerBase's asyncScope_ when scheduling
+   * the dump.
    */
   folly::CancellationToken getCancellationTokenForNewRibDump() noexcept {
     ribDumpCancellationSource_.emplace();
@@ -369,7 +369,7 @@ class AdjRib : boost::noncopyable,
       bool as4ByteCapable = true,
       bool extNhEncodingCapable = false) noexcept;
 
-  // Called when session established with a peer (in PeerManager)
+  // Called when session established with a peer (in PeerManagerBase)
   // to start fibers processing peer messages and Rib messages
   void startMessageProcessingLoop() noexcept;
 
@@ -837,7 +837,7 @@ class AdjRib : boost::noncopyable,
    *
    * @details When set, expensive O(n) cleanup operations in
    * sessionTerminated() are skipped to prevent systemd timeout during shutdown.
-   * Called by PeerManager::stop() before initiating shutdown sequence.
+   * Called by PeerManagerBase::stop() before initiating shutdown sequence.
    * This is a one-time flag that is not expected to be reset to false.
    */
   void setDaemonShutdown() noexcept {
@@ -1324,7 +1324,7 @@ class AdjRib : boost::noncopyable,
   void reschedulePackingTimers() noexcept;
 
   /*
-   * Test-only: when true, PeerManager::processRibDumpReq re-buffers the
+   * Test-only: when true, PeerManagerBase::processRibDumpReq re-buffers the
    * request for this peer instead of walking the shadow RIB, keeping the
    * peer in DETACHED_INIT_DUMP. Read/written on the EventBase thread.
    */
@@ -2195,7 +2195,7 @@ class AdjRib : boost::noncopyable,
   std::optional<folly::coro::CancellableAsyncScope> asyncScope_{std::in_place};
 
   /*
-   * Cancellation source for the rib-dump task scheduled on PeerManager's
+   * Cancellation source for the rib-dump task scheduled on PeerManagerBase's
    * asyncScope_. Its presence (and not-yet-cancelled state) indicates a rib
    * dump is currently scheduled or in flight for this peer; cancelled in stop()
    * so teardown cancels an in-flight dump.
@@ -2577,7 +2577,7 @@ class AdjRib : boost::noncopyable,
    * Flag indicating BGP daemon shutdown is in progress.
    * When true, BGP goes through fast exit-path skipping expensive O(n) cleanup
    * operations prevent systemd timeout during shutdown. Set by
-   * PeerManager::stop() before initiating shutdown sequence.
+   * PeerManagerBase::stop() before initiating shutdown sequence.
    */
   bool isDaemonShutdown_{false};
 

@@ -30,7 +30,8 @@ namespace facebook::bgp {
 
 /**
  * Thread-safe configuration manager that provides atomic config updates
- * and consistent reads across multiple components (BgpServiceBase, PeerManager)
+ * and consistent reads across multiple components (BgpServiceBase,
+ * PeerManagerBase)
  */
 class ConfigManager {
  public:
@@ -46,7 +47,7 @@ class ConfigManager {
     return config_.rlock()->first;
   }
 
-  // Get current config version (for race avoidance in PeerManager)
+  // Get current config version (for race avoidance in PeerManagerBase)
   uint64_t getConfigVersion() const {
     return config_.rlock()->second;
   }

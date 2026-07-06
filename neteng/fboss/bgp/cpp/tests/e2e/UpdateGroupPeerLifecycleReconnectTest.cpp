@@ -16,7 +16,7 @@
 
 /*
  * E2E tests for BGP Update Group MVP functionality - Peer Lifecycle scenarios
- * Tests complete flow: RIB → PeerManager → UpdateGroup → Peers
+ * Tests complete flow: RIB → PeerManagerBase → UpdateGroup → Peers
  * Requires: Change List Tracker + Update Group + Egress Backpressure
  */
 
@@ -268,7 +268,7 @@ TEST_P(UpdateGroupPeerLifecycleTest, SimplePeerReconnect) {
   addLocalRoute("50.0.0.0/8", {"500:1"}, 100);
 
   /* Setup - RIB will announce the local route */
-  XLOG(INFO, "Creating RIB and PeerManager");
+  XLOG(INFO, "Creating RIB and PeerManagerBase");
   setupComponents();
 
   /* Wait for route to reach shadowRIB */

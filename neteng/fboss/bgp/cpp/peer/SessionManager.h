@@ -40,9 +40,9 @@ class SessionManager : public nettools::bgplib::FiberBgpPeerManager {
   void stop() noexcept override;
 
  private:
-  friend class PeerManager;
+  friend class PeerManagerBase;
 
-  // called by PeerManager
+  // called by PeerManagerBase
   void shutdownWithGR(bool gracefulRestart) noexcept {
     FiberBgpPeerManager::shutdownWithGR(gracefulRestart);
   }

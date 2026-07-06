@@ -30,7 +30,7 @@
 DEFINE_bool(
     enable_egress_backpressure_in_peer_mgr_tests,
     false,
-    "Parameterize egress backpressure enabled/disabled in PeerManager tests.");
+    "Parameterize egress backpressure enabled/disabled in PeerManagerBase tests.");
 
 // The fiber default is 16KB. We are increasing the default due to nested
 // recursion with large stack due to installed exception handlers.
@@ -810,7 +810,7 @@ PeerManagerTestFixture::setupMockSessionManager(
       iQueue,
       biQueue,
       oQueue,
-      true /* enableCoroNotifyQueue - required for PeerManager's
+      true /* enableCoroNotifyQueue - required for PeerManagerBase's
               processPeerEventLoop */
   );
   mockPeerMgr->setSessionManager(mockSessionMgr);
@@ -840,7 +840,7 @@ void PeerManagerTestFixture::runEoRTest(
   std::chrono::seconds const eor_time{config->getConfig().eor_time_s().value()};
 
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager,
       nullptr,
       ribInQ_, /* write to the queue */
@@ -849,7 +849,7 @@ void PeerManagerTestFixture::runEoRTest(
   auto localSessionMgr = std::make_shared<SessionManager>(
       *config->getBgpGlobalConfig(),
       false, /* enableMessagesOverNotifyQueue */
-      true); /* enableCoroNotifyQueue - required for PeerManager's
+      true); /* enableCoroNotifyQueue - required for PeerManagerBase's
                 processPeerEventLoop */
   peerMgr->setSessionManager(localSessionMgr);
 
@@ -1067,7 +1067,7 @@ void PeerManagerTestFixture::runEoRTest(
       stopPeerBaton, "stopPeerBaton", facebook::bgp::test::kDefaultPopTimeout);
 
   /*
-   * Step2: stop sessions by shutting down PeerManager to save GR state.
+   * Step2: stop sessions by shutting down PeerManagerBase to save GR state.
    * Mirrors Main.cpp shutdown: markDaemonShutdown → saveGrState → stop.
    */
   peerMgr->markDaemonShutdown();
@@ -1076,7 +1076,7 @@ void PeerManagerTestFixture::runEoRTest(
   peerMgr->stop();
 
   /*
-   * Step3: signal waiting tasks that PeerManager teardown is complete.
+   * Step3: signal waiting tasks that PeerManagerBase teardown is complete.
    */
   peerStoppedBaton.post();
 
@@ -1216,7 +1216,7 @@ void StreamSubscriberFixture::SetUp(
 
   // Instantiate peerManager object
   auto configManager = std::make_shared<ConfigManager>(config_);
-  peerMgr = std::make_shared<PeerManager>(
+  peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   sessionMgr =

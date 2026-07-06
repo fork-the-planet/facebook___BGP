@@ -1183,7 +1183,8 @@ TEST_F(BgpServiceTestFixture, GetEntryStatsTest) {
   ribThread.join();
 }
 
-// Test co_getPolicyStats dispatches to PeerManager evb and returns empty stats
+// Test co_getPolicyStats dispatches to PeerManagerBase evb and returns empty
+// stats
 TEST_F(BgpServiceTestFixture, GetPolicyStatsTest) {
   auto peerMgrThread = peerManager_->runInThread();
 

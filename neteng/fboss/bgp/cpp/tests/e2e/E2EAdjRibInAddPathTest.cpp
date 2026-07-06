@@ -26,7 +26,7 @@
  * Derived from: AdjRibInTest.cpp (V4UpdateProcessingMultipleWithAddPath,
  *               V6UpdateProcessingMultipleWithAddPath,
  * ReceivedPathIdReachesRib) Mocked: FIB (TestFib), SessionManager
- * (MockSessionManager) Real: RIB, PeerManager, AdjRib
+ * (MockSessionManager) Real: RIB, PeerManagerBase, AdjRib
  */
 
 #include <gtest/gtest.h>

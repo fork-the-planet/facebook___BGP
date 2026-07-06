@@ -17,7 +17,7 @@
 /**
  * E2ETestFixture.h
  *
- * Test fixture for E2E testing of RIB and PeerManager.
+ * Test fixture for E2E testing of RIB and PeerManagerBase.
  * Tests complete BGP flows without mocking core components.
  */
 
@@ -37,7 +37,7 @@
 #include "neteng/fboss/bgp/cpp/config/Config.h"
 #include "neteng/fboss/bgp/cpp/config/ConfigManager.h"
 #include "neteng/fboss/bgp/cpp/nexthopTracker/NexthopStatus.h"
-#include "neteng/fboss/bgp/cpp/peer/PeerManager.h"
+#include "neteng/fboss/bgp/cpp/peer/PeerManagerBase.h"
 #include "neteng/fboss/bgp/cpp/tests/MockSessionManager.h"
 #include "neteng/fboss/bgp/cpp/tests/PeerManagerTestUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/PolicyUtils.h"
@@ -240,7 +240,7 @@ inline const BgpPeerSpec kDefaultPeerSpec5_AddPath = {
 
 /*
  * E2ETestFixture
- * Base fixture for RIB + PeerManager E2E tests.
+ * Base fixture for RIB + PeerManagerBase E2E tests.
  * Manages component lifecycle and provides helpers for BGP operations.
  *
  * ============================ Where does my test go? ======================
@@ -303,7 +303,7 @@ class E2ETestFixture : public ::testing::Test {
   void deletePeer(const folly::IPAddress& peerAddr);
 
   /*
-   * Drive PeerManager::delPeers at runtime.
+   * Drive PeerManagerBase::delPeers at runtime.
    */
   folly::Expected<folly::Unit, nettools::bgplib::FiberBgpPeerManager::ErrorCode>
   delPeerAtRuntime(const folly::IPAddress& peerAddr);
@@ -356,7 +356,7 @@ class E2ETestFixture : public ::testing::Test {
   void bringDownPeerWithGr(const folly::IPAddress& peerAddr);
 
   /*
-   * Run AdjRib::stop() synchronously on the PeerManager event base. Tests
+   * Run AdjRib::stop() synchronously on the PeerManagerBase event base. Tests
    * that exercise AdjRib teardown (e.g. the pendingRibInPushes_ drain)
    * call this directly instead of going through cleanupPeerState().
    */
@@ -374,9 +374,9 @@ class E2ETestFixture : public ::testing::Test {
    * carries versionNumber=X but the underlying VersionNumber is bumped to a
    * higher value before dispatch. This simulates FiberBgpPeer creating the
    * event, then the session flapping and FiberBgpPeer bumping the version for
-   * a new incarnation before PeerManager processes the old event.
+   * a new incarnation before PeerManagerBase processes the old event.
    *
-   * PeerManager::sessionEstablished() will:
+   * PeerManagerBase::sessionEstablished() will:
    *  1. Wait on the terminate baton (passes if already posted)
    *  2. Detect the version mismatch -> early return
    *  3. Leave the baton posted (no reset on early return)
@@ -465,8 +465,8 @@ class E2ETestFixture : public ::testing::Test {
   void addAcceptAllEgressPolicy(const std::string& name);
 
   /*
-   * Wait for a route to appear in PeerManager's shadowRIB
-   * Thread-safe: runs check on PeerManager's event base
+   * Wait for a route to appear in PeerManagerBase's shadowRIB
+   * Thread-safe: runs check on PeerManagerBase's event base
    * Returns true if route found within retries, false otherwise
    *
    * If fromPeer is specified, waits for a route from that specific peer
@@ -479,8 +479,8 @@ class E2ETestFixture : public ::testing::Test {
       int maxRetries = 50);
 
   /*
-   * Verify a route does NOT appear in PeerManager's shadowRIB after waiting
-   * Thread-safe: runs check on PeerManager's event base
+   * Verify a route does NOT appear in PeerManagerBase's shadowRIB after waiting
+   * Thread-safe: runs check on PeerManagerBase's event base
    * Returns true if route is NOT found after waiting, false if route exists
    * Unlike waitForRouteInShadowRib, this does NOT record test failures
    */
@@ -574,7 +574,7 @@ class E2ETestFixture : public ::testing::Test {
     perPeerQueueSizes_[peerAddr] = {capacity, highWm, lowWm};
   }
 
-  /* Create and start PeerManager with MockSessionManager
+  /* Create and start PeerManagerBase with MockSessionManager
    * enableUpdateGroup: Enable update group optimization
    * enableEgressBackpressure: Enable egress queue backpressure
    * enableSerializeGroupPdu: Enable group PDU serialization for zero-copy
@@ -638,8 +638,8 @@ class E2ETestFixture : public ::testing::Test {
   /*
    * Wait until the peer's egress AdjRib change-list consumer is ready, i.e. it
    * has reached the end of the change list (all published updates consumed into
-   * the packing list). Polls PeerManager for the peer's AdjRib. Returns true
-   * once the consumer is ready, false on timeout. Pair with
+   * the packing list). Polls PeerManagerBase for the peer's AdjRib. Returns
+   * true once the consumer is ready, false on timeout. Pair with
    * waitForRouteInShadowRib (which confirms the update was published) to gate
    * on "the update has been consumed into the packing list".
    */
@@ -663,7 +663,7 @@ class E2ETestFixture : public ::testing::Test {
   /*
    * Read the egress (RIB-OUT) AdjRibEntry's isNexthopSetByPolicy() flag for a
    * prefix on the peer. Returns std::nullopt if no egress entry exists. Runs on
-   * PeerManager's event base.
+   * PeerManagerBase's event base.
    */
   std::optional<bool> checkRibOutNexthopSetByPolicy(
       const folly::IPAddress& peerAddr,
@@ -697,7 +697,7 @@ class E2ETestFixture : public ::testing::Test {
    *
    * maxRetries: Number of times to retry checking the queue when it's empty.
    *             This allows time for in-flight messages to arrive.
-   *             Each retry pumps the RIB and PeerManager event loops.
+   *             Each retry pumps the RIB and PeerManagerBase event loops.
    *             Default is 5 retries.
    *
    * maxMessages: Maximum number of messages to drain before stopping.
@@ -823,7 +823,7 @@ class E2ETestFixture : public ::testing::Test {
 
   /*
    * Get an AdjRibEntry from a peer's AdjRib.
-   * Wraps private PeerManager::adjRibs_ access (requires friend access).
+   * Wraps private PeerManagerBase::adjRibs_ access (requires friend access).
    */
 
   AdjRibEntry* getAdjRibEntry(
@@ -833,7 +833,7 @@ class E2ETestFixture : public ::testing::Test {
 
   /*
    * Get AdjRib for a peer by IP address.
-   * Iterates PeerManager::adjRibs_ to find the matching entry.
+   * Iterates PeerManagerBase::adjRibs_ to find the matching entry.
    */
   std::shared_ptr<AdjRib> getAdjRibByAddr(const folly::IPAddress& peerAddr);
 
@@ -952,7 +952,7 @@ class E2ETestFixture : public ::testing::Test {
 
   /*
    * Get the cached RIB version for a peer.
-   * Thread-safe: runs check on PeerManager's event base.
+   * Thread-safe: runs check on PeerManagerBase's event base.
    *
    * @param peerAddr The peer's IP address
    * @return The peer's cached RIB version, or 0 if peer not found
@@ -1110,7 +1110,7 @@ class E2ETestFixture : public ::testing::Test {
       bool enableUpdateGroup = false,
       bool enableSerializeGroupPdu = false);
 
-  // Message queues for RIB/PeerManager communication
+  // Message queues for RIB/PeerManagerBase communication
   nettools::bgplib::MonitoredBackPressuredQueue<RibInMessage> ribInQ_{
       nettools::bgplib::kMaxIngressQueueSize};
   MonitoredMPMCQueue<RibOutMessage> ribOutQ_;
@@ -1121,7 +1121,7 @@ class E2ETestFixture : public ::testing::Test {
   std::shared_ptr<Config> config_;
   std::shared_ptr<ConfigManager> configManager_;
 
-  // Nexthop tracking configuration (shared between RIB and PeerManager)
+  // Nexthop tracking configuration (shared between RIB and PeerManagerBase)
   bool enableNexthopTracking_ = false;
 
   // UCMP configuration: compute UCMP weights from LBW extended community
@@ -1176,7 +1176,7 @@ class E2ETestFixture : public ::testing::Test {
   std::unique_ptr<RibBase> rib_;
   std::thread ribThread_;
 
-  std::unique_ptr<PeerManager> peerManager_;
+  std::unique_ptr<PeerManagerBase> peerManager_;
   std::thread peerMgrThread_;
 
   std::shared_ptr<MockSessionManager> sessionManager_;

@@ -135,7 +135,7 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
   using BgpPeerId = nettools::bgplib::BgpPeerId;
 
   struct TestContext {
-    std::shared_ptr<PeerManager> peerMgr;
+    std::shared_ptr<PeerManagerBase> peerMgr;
     std::shared_ptr<SessionManager> sessionMgr;
     std::shared_ptr<ConfigManager> configMgr;
     folly::F14FastMap<BgpPeerId, std::shared_ptr<AdjRib>> adjRibs;
@@ -1603,7 +1603,7 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
     auto globalConfig = config->getBgpGlobalConfig();
     auto policyManager =
         std::make_shared<PolicyManager>(policies, globalConfig.get());
-    auto peerMgr = std::make_shared<PeerManager>(
+    auto peerMgr = std::make_shared<PeerManagerBase>(
         configManager, policyManager, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
     auto sessionMgr = std::make_shared<SessionManager>(*globalConfig, false);

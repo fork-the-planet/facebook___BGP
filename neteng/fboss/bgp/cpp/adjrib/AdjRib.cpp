@@ -538,7 +538,7 @@ void AdjRib::logPeerEvent(const std::string& phase, const std::string& src) {
       src);
 }
 
-// Called when session established with a peer (in PeerManager)
+// Called when session established with a peer (in PeerManagerBase)
 void AdjRib::sessionEstablished(
     const std::optional<uint16_t>& remoteGrRestartTime,
     std::shared_ptr<AdjRibInQueueT> adjRibInQueue,
@@ -666,7 +666,7 @@ bool AdjRib::hasPeerEgressPolicyOverride() const noexcept {
   return peerConfig && peerConfig->hasEgressPolicyOverride;
 }
 
-// Called when session established with a peer (in PeerManager)
+// Called when session established with a peer (in PeerManagerBase)
 // to start processing peer messages
 void AdjRib::startMessageProcessingLoop() noexcept {
   XLOGF(INFO, "Starting AdjRib message processing loop for {}", getPeerName());
@@ -729,8 +729,9 @@ folly::coro::Task<void> AdjRib::sessionTerminated(
   }
 
   /*
-   * Cancel any in-flight rib dump scheduled on PeerManager's asyncScope_ (its
-   * cancellation source lives on this AdjRib), tying it to session teardown.
+   * Cancel any in-flight rib dump scheduled on PeerManagerBase's asyncScope_
+   * (its cancellation source lives on this AdjRib), tying it to session
+   * teardown.
    */
   cancelRibDump();
 
@@ -759,7 +760,7 @@ folly::coro::Task<void> AdjRib::sessionTerminated(
     adjRibInStale_.clear();
 
     // Note: adjRibOutGroup_ trees are NOT cleared here because they are
-    // shared with other peers. They will be cleared from PeerManager
+    // shared with other peers. They will be cleared from PeerManagerBase
     // destructor.
 
     deactivateChangeListConsumer();
@@ -978,7 +979,7 @@ folly::coro::Task<void> AdjRib::stop() noexcept {
   /*
    * Cancel and join all AdjRib coroutines (processRibMessageLoop,
    * processPeerMessageLoop, postTerminateBaton, sendBgpUpdates) while
-   * evb_ is still alive. This is called from PeerManager::stop()'s task
+   * evb_ is still alive. This is called from PeerManagerBase::stop()'s task
    * running on the evb_. If deferred to the destructor, the evb_ is already
    * dead (terminateLoopSoon), and blockingWait hangs forever because the
    * coroutines can't run on the dead event loop.

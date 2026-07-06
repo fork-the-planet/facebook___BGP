@@ -297,7 +297,7 @@ class StreamSubscriberFixture : public PeerManagerTestFixture {
    */
   void TearDown() override;
 
-  std::shared_ptr<PeerManager> peerMgr;
+  std::shared_ptr<PeerManagerBase> peerMgr;
   std::shared_ptr<SessionManager> sessionMgr;
   std::shared_ptr<std::thread> peerMgrThread;
   std::shared_ptr<std::thread> sessionMgrThread;

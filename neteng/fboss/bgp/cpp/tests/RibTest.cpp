@@ -7522,7 +7522,7 @@ TEST_F(RibFixture, FsdbRibPublisherRestartGrHoldExpiry) {
  * With conditional routes configured, when EOR arrives followed by the
  * first NexthopResolutionUpdate, FsdbSyncer starts and the subscriber
  * eventually sees the conditional route. Note: under the new design the
- * "wait for NDP" precondition is enforced in PeerManager (it defers
+ * "wait for NDP" precondition is enforced in PeerManagerBase (it defers
  * RibInInitialPathComputation), not in Rib — so when this test calls
  * sendInitialPathComputation() directly, Rib starts FsdbSyncer
  * immediately. The end-to-end correctness (conditional route reaches
@@ -7764,7 +7764,7 @@ TEST_F(RibWithLocalRouteFixture, FsdbRibPublishConditionalRoutesVerifySync) {
 }
 
 // Without conditional routes, FsdbSyncer starts on EOR alone (no NDP
-// dependency in Rib — the NDP precondition lives in PeerManager).
+// dependency in Rib — the NDP precondition lives in PeerManagerBase).
 TEST_F(RibFixture, FsdbRibPublishInitialSyncNoDelayWithoutConditionalRoutes) {
   FLAGS_publish_rib_to_fsdb = true;
   setUpFsdb();
@@ -7858,8 +7858,8 @@ TEST_F(
  * Verify that RibBase::processNexthopResolutionUpdate pushes the one-shot
  * RibOutNexthopResolutionReceived signal to ribOutQ_ on the first NDP, and
  * that subsequent NDPs do not re-push it. The signal is what unblocks
- * PeerManager's deferred RibInInitialPathComputation under the new
- * two-precondition gating (see PeerManager tests for the PM-side coverage).
+ * PeerManagerBase's deferred RibInInitialPathComputation under the new
+ * two-precondition gating (see PeerManagerBase tests for the PM-side coverage).
  */
 TEST_F(RibFixture, FirstNdpSignalPushedOnceWithoutConditionalRoutes) {
   // No conditional routes: signal still fires on first NDP so PM can proceed.

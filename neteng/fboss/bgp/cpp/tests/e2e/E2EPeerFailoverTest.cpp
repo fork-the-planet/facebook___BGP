@@ -21,7 +21,7 @@
  * and route convergence after peer recovery through the complete BGP pipeline.
  *
  * Mocked: FIB (TestFib), SessionManager (MockSessionManager)
- * Real: RIB, PeerManager, AdjRib
+ * Real: RIB, PeerManagerBase, AdjRib
  */
 
 #include <gtest/gtest.h>

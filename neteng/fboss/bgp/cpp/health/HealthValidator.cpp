@@ -35,7 +35,7 @@
 #include "neteng/fboss/bgp/cpp/common/EvbUtils.h"
 #include "neteng/fboss/bgp/cpp/config/ConfigManager.h"
 #include "neteng/fboss/bgp/cpp/lib/BgpStructs.h"
-#include "neteng/fboss/bgp/cpp/peer/PeerManager.h"
+#include "neteng/fboss/bgp/cpp/peer/PeerManagerBase.h"
 #include "neteng/fboss/bgp/cpp/peer/SessionManager.h"
 #include "neteng/fboss/bgp/cpp/rib/RibBase.h"
 #include "neteng/fboss/bgp/cpp/stats/Stats.h"
@@ -53,7 +53,7 @@ using neteng::fboss::bgp::thrift::TModuleHealthReport;
 /* Thresholds are defined in HealthValidator.h for test visibility */
 
 HealthValidator::HealthValidator(
-    PeerManager* peerMgr,
+    PeerManagerBase* peerMgr,
     RibBase* rib,
     Watchdog* watchdog,
     NexthopHandler* nexthopHandler,
@@ -241,7 +241,7 @@ TModuleHealthReport HealthValidator::checkGlobalSystem() {
           HealthCheckId::GLOBAL_SYSTEM_ATTR_DEDUP,
           HealthCheckCategory::GLOBAL_SYSTEM,
           HealthCheckStatus::FAIL,
-          "PeerManager not available"));
+          "PeerManagerBase not available"));
     } else {
       auto stats = peerMgr_->getAttributeStats();
       int64_t totalAttrs = *stats.total_num_of_attributes();
@@ -483,7 +483,7 @@ TModuleHealthReport HealthValidator::checkGlobalConvergence() {
   }
 
   /* 1.3.4 EoR received from all peers
-   * TODO: Expose a PeerManager API to list unconverged
+   * TODO: Expose a PeerManagerBase API to list unconverged
    * peers (those that haven't sent EoR) for richer diagnostics. */
   {
     auto eorReceived = getCounter(
@@ -575,7 +575,7 @@ TModuleHealthReport HealthValidator::checkGlobalConvergence() {
           HealthCheckId::GLOBAL_CONVERGENCE_SAFE_MODE,
           HealthCheckCategory::GLOBAL_CONVERGENCE,
           HealthCheckStatus::FAIL,
-          "PeerManager not available"));
+          "PeerManagerBase not available"));
     } else {
       bool safeModeOn = peerMgr_->getIsSafeModeOn();
       checks.emplace_back(makeResult(
@@ -1057,7 +1057,7 @@ folly::coro::Task<TModuleHealthReport> HealthValidator::checkPeerManager() {
    * Reports which peers are actively dropping received (PR) routes because they
    * reached their configured per-peer prefix limit, with exact per-peer counts
    * (reused from TBgpSession). Peer enumeration runs on the SessionManager evb
-   * and the session lookup on the PeerManager evb; both are bounded by
+   * and the session lookup on the PeerManagerBase evb; both are bounded by
    * co_runOnEvbWithTimeout so a stuck evb fails the check instead of hanging
    * generateReport(). */
   {
@@ -1066,7 +1066,7 @@ folly::coro::Task<TModuleHealthReport> HealthValidator::checkPeerManager() {
           HealthCheckId::PEER_PREFIX_LIMIT_DROPS,
           HealthCheckCategory::PEER_MANAGER,
           HealthCheckStatus::SKIPPED,
-          "PeerManager not available"));
+          "PeerManagerBase not available"));
     } else {
       /* co_getAllPeerDisplayInfos() hops onto the SessionManager evb without a
        * timeout, so call the synchronous accessor under the same bounded wait
@@ -1104,7 +1104,7 @@ folly::coro::Task<TModuleHealthReport> HealthValidator::checkPeerManager() {
               HealthCheckCategory::PEER_MANAGER,
               HealthCheckStatus::FAIL,
               fmt::format(
-                  "PeerManager evb unresponsive (timeout after {}s)",
+                  "PeerManagerBase evb unresponsive (timeout after {}s)",
                   kHealthCheckModuleTimeout.count())));
         } else {
           checks.emplace_back(makeResult(

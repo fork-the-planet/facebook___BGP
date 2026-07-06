@@ -129,7 +129,7 @@ class FiberBgpPeer : public std::enable_shared_from_this<FiberBgpPeer>,
 
   /*
    * Signal of BGP session state(ESTABLISHED/IDLE) to upstream
-   * (e.g. PeerManager)
+   * (e.g. PeerManagerBase)
    */
 
   struct ObservableSessionInfo {

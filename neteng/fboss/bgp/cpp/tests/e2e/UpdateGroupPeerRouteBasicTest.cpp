@@ -184,7 +184,7 @@ TEST_P(UpdateGroupPeerRouteTest, SimplePeerRouteAdd) {
   addPeer(kEbgpPeerSpec2);
   addPeer(kEbgpPeerSpec3);
 
-  /* Create RIB and PeerManager */
+  /* Create RIB and PeerManagerBase */
   setupComponents();
 
   /* Bring up all 3 peers */

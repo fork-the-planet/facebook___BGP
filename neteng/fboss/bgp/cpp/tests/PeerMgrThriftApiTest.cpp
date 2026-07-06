@@ -50,9 +50,9 @@ using namespace facebook::neteng::fboss::bgp_attr;
 namespace facebook::bgp {
 
 namespace {
-// Helper to replicate getBgpSummary() via the split sessionMgr + PeerManager
-// pattern
-std::vector<TBgpSession> getSessionsViaSessionMgr(PeerManager& peerMgr) {
+// Helper to replicate getBgpSummary() via the split sessionMgr +
+// PeerManagerBase pattern
+std::vector<TBgpSession> getSessionsViaSessionMgr(PeerManagerBase& peerMgr) {
   auto allPeers = folly::coro::blockingWait(
       peerMgr.getSessionManager()->co_getAllPeerDisplayInfos());
   return peerMgr.getSessionInfos(allPeers);
@@ -130,7 +130,7 @@ TEST_F(PeerManagerTestFixture, StartSessionTest) {
     sessions = getSessionsViaSessionMgr(*mockPeerMgr);
     EXPECT_EQ(4, sessions.size());
 
-    // stop PeerManager
+    // stop PeerManagerBase
     mockPeerMgr->stop();
     sessionMgr->stop();
   });
@@ -266,7 +266,7 @@ TEST_F(PeerManagerTestFixture, ShutdownSessionTest) {
     sessions = getSessionsViaSessionMgr(*mockPeerMgr);
     EXPECT_EQ(4, sessions.size());
 
-    // stop PeerManager
+    // stop PeerManagerBase
     mockPeerMgr->stop();
     sessionMgr->stop();
   });
@@ -335,7 +335,7 @@ TEST_F(PeerManagerTestFixture, RestartSessionTest) {
     sessions = getSessionsViaSessionMgr(*mockPeerMgr);
     EXPECT_EQ(4, sessions.size());
 
-    // stop PeerManager
+    // stop PeerManagerBase
     mockPeerMgr->stop();
     sessionMgr->stop();
   });
@@ -547,7 +547,7 @@ TEST_F(PeerManagerTestFixture, GetBgpSummaryTest) {
   EXPECT_EQ(*peer.remote_as_4_byte(), *staticPeer1_.remote_as_4_byte());
   EXPECT_EQ(*peer.hold_time(), *config->getConfig().hold_time());
 
-  // stop PeerManager gracefully
+  // stop PeerManagerBase gracefully
   mockPeerMgr->stop();
   sessionMgr->stop();
 
@@ -558,8 +558,8 @@ TEST_F(PeerManagerTestFixture, GetBgpSummaryTest) {
 }
 
 // This testlet verify the session detail information retrieve from
-// PeerManager::getDetailSessionInfos via the split sessionMgr + PeerManager
-// coro pattern for each neighbor.
+// PeerManagerBase::getDetailSessionInfos via the split sessionMgr +
+// PeerManagerBase coro pattern for each neighbor.
 CO_TEST_F(PeerManagerTestFixture, GetBgpNeighborsTest) {
   auto config = getConfig(
       true /* includeStaticPeer */,
@@ -689,7 +689,7 @@ CO_TEST_F(PeerManagerTestFixture, GetBgpNeighborsTest) {
   // empty string should not yield anything since it's not a valid IP address
   EXPECT_FALSE(folly::IPAddress::validate(""));
 
-  // stop PeerManager gracefully
+  // stop PeerManagerBase gracefully
   mockPeerMgr->stop();
   sessionMgr->stop();
 
@@ -725,7 +725,7 @@ CO_TEST_F(PeerManagerTestFixture, GetAllBgpNeighborsTest) {
   auto sessions = mockPeerMgr->getDetailSessionInfos(allPeers);
   EXPECT_EQ(sessions.size(), 4);
 
-  // stop PeerManager gracefully
+  // stop PeerManagerBase gracefully
   mockPeerMgr->stop();
   sessionMgr->stop();
 
@@ -736,7 +736,7 @@ CO_TEST_F(PeerManagerTestFixture, GetAllBgpNeighborsTest) {
 }
 
 // Test getDetailSessionInfos() with specific peer addresses via the split
-// sessionMgr + PeerManager coro pattern (mirrors GetBgpNeighborsTest)
+// sessionMgr + PeerManagerBase coro pattern (mirrors GetBgpNeighborsTest)
 CO_TEST_F(PeerManagerTestFixture, GetDetailSessionInfosTest) {
   auto config = getConfig(
       true /* includeStaticPeer */,
@@ -830,7 +830,7 @@ CO_TEST_F(PeerManagerTestFixture, GetDetailSessionInfosTest) {
 }
 
 // Test getDetailSessionInfos() with all peers via the split sessionMgr +
-// PeerManager coro pattern (mirrors GetAllBgpNeighborsTest)
+// PeerManagerBase coro pattern (mirrors GetAllBgpNeighborsTest)
 CO_TEST_F(PeerManagerTestFixture, GetAllDetailSessionInfosTest) {
   auto config = getConfig(
       true /* includeStaticPeer */, true /* includeDynamicShivPeer */);
@@ -867,7 +867,7 @@ CO_TEST_F(PeerManagerTestFixture, GetAllDetailSessionInfosTest) {
 }
 
 // This test verifies getBgpNeighborsFromSession via the split sessionMgr +
-// PeerManager coro pattern: co_await sessionMgr->co_getPeerDisplayInfo(
+// PeerManagerBase coro pattern: co_await sessionMgr->co_getPeerDisplayInfo(
 // BgpPeerId), then call getDetailSessionInfos.
 CO_TEST_F(PeerManagerTestFixture, GetBgpNeighborsFromSessionTest) {
   auto config = getConfig(
@@ -950,7 +950,7 @@ CO_TEST_F(PeerManagerTestFixture, GetBgpNeighborsFromSessionTest) {
   EXPECT_FALSE(folly::IPAddress::validate("hello"));
   EXPECT_FALSE(folly::IPAddress::validate("invalid"));
 
-  // stop PeerManager gracefully
+  // stop PeerManagerBase gracefully
   mockPeerMgr->stop();
   sessionMgr->stop();
 
@@ -1492,7 +1492,7 @@ TEST_F(PeerManagerTestFixture, GetBgpStreamSessionsTest) {
   subscription1.cancel();
   std::move(subscription1).detach();
 
-  // stop PeerManager gracefully
+  // stop PeerManagerBase gracefully
   mockPeerMgr->stop();
 
   // stop the thread

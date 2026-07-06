@@ -36,7 +36,7 @@
  * 5.0.0.0/8 with nexthop 10.0.0.1 and no communities.
  *
  * Mocked: FIB (TestFib), SessionManager (MockSessionManager)
- * Real: RIB, PeerManager, AdjRib, PolicyManager
+ * Real: RIB, PeerManagerBase, AdjRib, PolicyManager
  */
 
 #include <gtest/gtest.h>

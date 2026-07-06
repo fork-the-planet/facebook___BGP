@@ -15,7 +15,7 @@
  */
 
 // E2E test utilities: TestFib, TestRib, and helper functions
-// Minimal mocking (FIB only), real RIB/PeerManager/AdjRib components
+// Minimal mocking (FIB only), real RIB/PeerManagerBase/AdjRib components
 
 #pragma once
 

@@ -22,7 +22,7 @@
  *
  * Derived from: AdjRibInTest.cpp
  * Mocked: FIB (TestFib), SessionManager (MockSessionManager)
- * Real: RIB, PeerManager, AdjRib
+ * Real: RIB, PeerManagerBase, AdjRib
  */
 
 #include <gtest/gtest.h>
@@ -286,7 +286,7 @@ TEST_F(E2EAdjRibInPolicyTest, MultipleCommunities) {
 TEST_F(E2EAdjRibInPolicyTest, TotalVipPrefixesCountMultiPeer) {
   totalVipPrefixesCount = 0;
 
-  /* SetUp already created Rib + PeerManager with peers 3, 4, 5 */
+  /* SetUp already created Rib + PeerManagerBase with peers 3, 4, 5 */
   bringUpPeer(kPeerAddr3);
   bringUpPeer(kPeerAddr4);
 

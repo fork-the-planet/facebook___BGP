@@ -760,7 +760,7 @@ void AdjRibInboundFixture::reEstablishSession(
     const std::optional<std::chrono::seconds>& remoteGrRestartTime,
     const AfiIpv4Negotiated& isAfiIpv4Negotiated,
     const AfiIpv6Negotiated& isAfiIpv6Negotiated) {
-  // Mimic PeerManager::sessionEstablished by ensuring the async scope is
+  // Mimic PeerManagerBase::sessionEstablished by ensuring the async scope is
   // re-initialized before re-establishing the session. This joins the
   // cancelled scope from the previous session and creates a fresh one.
   // Must be called from fiber context (within fm_->addTask).

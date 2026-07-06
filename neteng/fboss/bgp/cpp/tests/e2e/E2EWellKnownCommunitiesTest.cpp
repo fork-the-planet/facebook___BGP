@@ -36,7 +36,7 @@
  *      queue or is suppressed there, depending on RFC 1997 rules.
  *
  * Mocked: FIB (TestFib), SessionManager (MockSessionManager)
- * Real:   RIB, PeerManager, AdjRib / AdjRibOutGroup
+ * Real:   RIB, PeerManagerBase, AdjRib / AdjRibOutGroup
  */
 
 #include <gtest/gtest.h>

@@ -223,7 +223,7 @@ CO_TEST_F(PeerManagerTestFixture, DelPeersNonExistentSkipsTest) {
 
 /*
  * This test verifies the behavior of sessionEstablished()/sessionTerminated()
- * call inside PeerManager when the peer is not configured.
+ * call inside PeerManagerBase when the peer is not configured.
  *  - If sessionEstablished is called without peer configured, peerMgr will
  *    return early and ignore the transition.
  *  - If sessionTerminated is called when no sesion established, peerMgr will
@@ -284,7 +284,7 @@ TEST_F(
 }
 
 /*
- * This test verifies that PeerManager::waitForSessionTerminateBaton()
+ * This test verifies that PeerManagerBase::waitForSessionTerminateBaton()
  * blocks until the semaphore is signaled. This mimics the case where a
  * session re-establishes while a previous incarnation is still shutting down.
  *
@@ -297,7 +297,7 @@ TEST_F(PeerManagerTestFixture, WaitForSessionTerminateBatonTest) {
   auto config = getConfig(
       true /* includeStaticPeer */, true /* includeDynamicShivPeer */);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
   auto& evb = peerMgr->getEventBase();
 
@@ -396,7 +396,7 @@ CO_TEST_F(PeerManagerTestFixture, RapidSessionFlapWithVersionCompressionTest) {
   auto config = getConfig(
       true /* includeStaticPeer */, true /* includeDynamicShivPeer */);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   // Create baton (starts un-posted)
@@ -410,7 +410,7 @@ CO_TEST_F(PeerManagerTestFixture, RapidSessionFlapWithVersionCompressionTest) {
   // local semaphore. Here we directly post() to simulate that.
   terminateBaton->post();
 
-  // Step 2: Session UP (stale version) -- PeerManager waits for the
+  // Step 2: Session UP (stale version) -- PeerManagerBase waits for the
   // previous session's loops to terminate. With latch semantics, this
   // passes through immediately because the baton is still posted.
   co_await peerMgr->waitForSessionTerminateBaton(kPeerId3);
@@ -422,7 +422,7 @@ CO_TEST_F(PeerManagerTestFixture, RapidSessionFlapWithVersionCompressionTest) {
   // an early return, leaving the baton posted.
 
   // Step 3: Session UP (valid version) -- Another session established
-  // event arrives. PeerManager again waits for termination.
+  // event arrives. PeerManagerBase again waits for termination.
   // With latch semantics, co_await *baton passes through immediately
   // because the baton is STILL posted (no reset on early return).
   // With the old BatchSemaphore, wait(2) in step 2 consumed the tokens,
@@ -442,7 +442,7 @@ CO_TEST_F(PeerManagerTestFixture, CleanupPeerState_NeverEstablished) {
   auto config = getConfig(
       true /* includeStaticPeer */, false /* includeDynamicShivPeer */);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   // No AdjRib in adjRibs_ for kPeerId3 — peer was never established.
@@ -463,7 +463,7 @@ CO_TEST_F(PeerManagerTestFixture, CleanupPeerState_BatonWaitCompletes) {
   auto config = getConfig(
       true /* includeStaticPeer */, false /* includeDynamicShivPeer */);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   // Set up a mock AdjRib so findAdjRib returns non-null
@@ -497,7 +497,7 @@ TEST_F(PeerManagerTestFixture, CleanupPeerState_GenerationCheck) {
   auto config = getConfig(
       true /* includeStaticPeer */, false /* includeDynamicShivPeer */);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
   auto& evb = peerMgr->getEventBase();
 
@@ -589,7 +589,7 @@ TEST_F(PeerManagerTestFixture, CleanupPeerState_GenerationCheckDuringStop) {
   auto config = getConfig(
       true /* includeStaticPeer */, false /* includeDynamicShivPeer */);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
   auto& evb = peerMgr->getEventBase();
 
@@ -650,7 +650,7 @@ CO_TEST_F(PeerManagerTestFixture, CleanupPeerState_NormalErase) {
   auto config = getConfig(
       true /* includeStaticPeer */, false /* includeDynamicShivPeer */);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto terminateBaton = std::make_shared<folly::coro::Baton>();
@@ -747,7 +747,7 @@ CO_TEST_F(PeerManagerTestFixture, CleanupPeerState_ResetsChangeListConsumer) {
   auto config = getConfig(
       true /* includeStaticPeer */, false /* includeDynamicShivPeer */);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
   auto& evb = peerMgr->getEventBase();
 
@@ -756,7 +756,7 @@ CO_TEST_F(PeerManagerTestFixture, CleanupPeerState_ResetsChangeListConsumer) {
       setupMockAdjRib(evb, kPeerId3, AsNum(kPeerAsn3), terminateBaton);
 
   // Wire a real AdjRibOutConsumer back to the AdjRib — the same shape
-  // PeerManager::createAdjRib produces in the UG-disabled path. This is
+  // PeerManagerBase::createAdjRib produces in the UG-disabled path. This is
   // the cycle cleanupPeerState must break.
   std::shared_ptr<ChangeTracker<ShadowRibEntry>> changeListTracker =
       peerMgr->getChangeListTracker();
@@ -798,7 +798,7 @@ CO_TEST_F(
   auto config = getConfig(
       true /* includeStaticPeer */, false /* includeDynamicShivPeer */);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
   auto& evb = peerMgr->getEventBase();
 
@@ -836,7 +836,7 @@ CO_TEST_F(PeerManagerTestFixture, SessionTerminated_NoPeerDeleteKeepsAdjRib) {
   auto config = getConfig(
       true /* includeStaticPeer */, false /* includeDynamicShivPeer */);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
   auto& evb = peerMgr->getEventBase();
 

@@ -257,7 +257,7 @@ void E2ETestFixture::bringDownPeer(
    *
    * This is critical for test correctness: without waiting, the next
    * bringUpPeer() call would block in waitForSessionTerminateBaton()
-   * on PeerManager's EVB, but the work to signal the baton (processing
+   * on PeerManagerBase's EVB, but the work to signal the baton (processing
    * BgpSessionStop in processPeerMessageLoop) also runs on the same EVB,
    * causing a deadlock.
    *
@@ -283,15 +283,15 @@ void E2ETestFixture::bringDownPeer(
   }
 
   /*
-   * Now notify PeerManager about the session termination.
+   * Now notify PeerManagerBase about the session termination.
    *
    * With MockSessionManager, pushing BgpSessionStop to adjRibInQ only triggers
    * AdjRib::sessionTerminated(). We also need to trigger
-   * PeerManager::sessionTerminated() to update PeerManager state (e.g.,
+   * PeerManagerBase::sessionTerminated() to update PeerManagerBase state (e.g.,
    * markStateTerminated on AdjRib, cleanup update groups, etc.).
    *
    * This must be done AFTER waiting for the semaphore, because
-   * PeerManager::sessionTerminated() accesses AdjRib state that may be
+   * PeerManagerBase::sessionTerminated() accesses AdjRib state that may be
    * modified during AdjRib::sessionTerminated().
    */
   FiberBgpPeer::ObservableStateT terminateEvent{
@@ -302,8 +302,9 @@ void E2ETestFixture::bringDownPeer(
       .peerDelete = peerDelete};
 
   /*
-   * Drive sessionTerminated on the PeerManager EVB while blocking the *test*
-   * thread (not the EVB thread) for completion, mirroring delPeerAtRuntime().
+   * Drive sessionTerminated on the PeerManagerBase EVB while blocking the
+   * *test* thread (not the EVB thread) for completion, mirroring
+   * delPeerAtRuntime().
    *
    * The earlier folly::via(&evb, [...]{ blockingWait(...); }).wait() ran
    * blockingWait *on* the EVB thread, occupying the EVB loop for the whole
@@ -616,7 +617,7 @@ bool E2ETestFixture::waitForRouteInShadowRib(
   if (!peerManager_) {
     XLOG(
         ERR,
-        "PeerManager must be created before calling waitForRouteInShadowRib");
+        "PeerManagerBase must be created before calling waitForRouteInShadowRib");
     return false;
   }
 
@@ -629,9 +630,9 @@ bool E2ETestFixture::waitForRouteInShadowRib(
    */
   WITH_RETRIES_N(maxRetries, {
     /*
-     * Run the check on PeerManager's event base thread
+     * Run the check on PeerManagerBase's event base thread
      * This is thread-safe because shadowRibEntries_ is only accessed
-     * from PeerManager's event base
+     * from PeerManagerBase's event base
      */
     found = folly::via(
                 &evb,
@@ -698,7 +699,7 @@ bool E2ETestFixture::verifyRouteNotInShadowRib(
   if (!peerManager_) {
     XLOG(
         ERR,
-        "PeerManager must be created before calling verifyRouteNotInShadowRib");
+        "PeerManagerBase must be created before calling verifyRouteNotInShadowRib");
     return false;
   }
 
@@ -707,7 +708,7 @@ bool E2ETestFixture::verifyRouteNotInShadowRib(
   /*
    * Wait for the route to NOT be present in shadowRib. With change list
    * tracker and backpressure enabled, there can be a delay between the
-   * RIB processing a withdrawal and PeerManager updating shadowRib.
+   * RIB processing a withdrawal and PeerManagerBase updating shadowRib.
    * Retry until the route disappears or retries are exhausted.
    */
   for (int i = 0; i < waitRetries; ++i) {
@@ -919,7 +920,7 @@ void E2ETestFixture::TearDown() {
   XLOG(INFO, "=== TearDown starting ===");
 
   /*
-   * Flush the PeerManager event base before inspecting any peer/queue
+   * Flush the PeerManagerBase event base before inspecting any peer/queue
    * state from the test thread. Without this, in-flight evb writes
    * (e.g. markPeerUnblocked in the deferredPushToPeer SCOPE_EXIT) can race
    * the test-thread reads of queue size / isBlocked a few lines below,
@@ -979,15 +980,15 @@ void E2ETestFixture::TearDown() {
     queues.adjRibInQ->fiberPush(FiberBgpPeer::BgpSessionStop{});
   }
 
-  /* Stop PeerManager */
-  XLOG(INFO, "TearDown: Stopping PeerManager");
+  /* Stop PeerManagerBase */
+  XLOG(INFO, "TearDown: Stopping PeerManagerBase");
   if (peerManager_) {
     peerManager_->stop();
-    XLOG(INFO, "TearDown: PeerManager stop() returned, joining thread");
+    XLOG(INFO, "TearDown: PeerManagerBase stop() returned, joining thread");
     if (peerMgrThread_.joinable()) {
       peerMgrThread_.join();
     }
-    XLOG(INFO, "TearDown: PeerManager thread joined");
+    XLOG(INFO, "TearDown: PeerManagerBase thread joined");
   }
 
   /* Stop SessionManager */
@@ -1233,7 +1234,7 @@ void E2ETestFixture::createPeerManager(
     bool enableUpdateGroup,
     bool enableEgressBackpressure,
     bool enableSerializeGroupPdu) {
-  XLOG(INFO, "=== Creating PeerManager... ===");
+  XLOG(INFO, "=== Creating PeerManagerBase... ===");
 
   FLAGS_enable_egress_backpressure_in_peer_mgr_tests = enableEgressBackpressure;
 
@@ -1247,7 +1248,7 @@ void E2ETestFixture::createPeerManager(
   sessionMgrThread_ =
       std::make_shared<std::thread>(sessionManager_->runInThread());
 
-  /* Create PeerManager */
+  /* Create PeerManagerBase */
   configManager_ = std::make_shared<ConfigManager>(config_);
 
   /*
@@ -1261,20 +1262,20 @@ void E2ETestFixture::createPeerManager(
     XLOG(INFO, "Created PolicyManager for E2E policy tests");
   }
 
-  peerManager_ = std::make_unique<PeerManager>(
+  peerManager_ = std::make_unique<PeerManagerBase>(
       configManager_, policyManager, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   peerManager_->setSessionManager(sessionManager_);
 
-  /* Start PeerManager thread */
+  /* Start PeerManagerBase thread */
   peerMgrThread_ = std::thread([this]() {
-    XLOG(INFO, "PeerManager thread started");
+    XLOG(INFO, "PeerManagerBase thread started");
     peerManager_->run();
-    XLOG(INFO, "PeerManager thread exiting");
+    XLOG(INFO, "PeerManagerBase thread exiting");
   });
 
   peerManager_->getEventBase().waitUntilRunning();
-  XLOG(INFO, "PeerManager running");
+  XLOG(INFO, "PeerManagerBase running");
 }
 
 void E2ETestFixture::establishSession(
@@ -2363,15 +2364,15 @@ bool E2ETestFixture::waitForChangeListConsumerReady(
   if (!peerManager_) {
     XLOG(
         ERR,
-        "PeerManager must be created before calling waitForChangeListConsumerReady");
+        "PeerManagerBase must be created before calling waitForChangeListConsumerReady");
     return false;
   }
 
   bool ready = false;
   WITH_RETRIES_N(maxRetries, {
     /*
-     * Run on PeerManager's event base: adjRibs_ and the change-list consumer
-     * state are only accessed from that thread.
+     * Run on PeerManagerBase's event base: adjRibs_ and the change-list
+     * consumer state are only accessed from that thread.
      */
     peerManager_->getEventBase().runInEventBaseThreadAndWait([&]() {
       auto adjRib = getAdjRibByAddr(peerAddr);
@@ -2394,15 +2395,15 @@ bool E2ETestFixture::waitForChangeListConsumerPended(
   if (!peerManager_) {
     XLOG(
         ERR,
-        "PeerManager must be created before calling waitForChangeListConsumerPended");
+        "PeerManagerBase must be created before calling waitForChangeListConsumerPended");
     return false;
   }
 
   bool pended = false;
   WITH_RETRIES_N(maxRetries, {
     /*
-     * Run on PeerManager's event base: adjRibs_ and the change-list consumer
-     * state are only accessed from that thread.
+     * Run on PeerManagerBase's event base: adjRibs_ and the change-list
+     * consumer state are only accessed from that thread.
      */
     peerManager_->getEventBase().runInEventBaseThreadAndWait([&]() {
       auto adjRib = getAdjRibByAddr(peerAddr);
@@ -2479,7 +2480,7 @@ E2ETestFixture::drainAllOutboundMessagesToOrderedVec(
      * Wait for a message to become available. Popping unblocks the queue so
      * sendBgpUpdates / the change-list timer can emit the next message; allow
      * idleRetries quiet checks before concluding the queue is fully drained.
-     * Between checks we pump the RIB and PeerManager event bases. When
+     * Between checks we pump the RIB and PeerManagerBase event bases. When
      * sleepMsBetweenRetries > 0 we also sleep that long to wait out
      * timer-driven emits (e.g. the MRAI timer); sleepMsBetweenRetries == 0
      * means pump-only (used by drainPeerQueueCompletely).
@@ -3112,7 +3113,7 @@ E2ETestFixture::getFibWeightedNexthops(const std::string& prefixStr) {
 uint64_t E2ETestFixture::getPeerCachedRibVersion(
     const folly::IPAddress& peerAddr) {
   if (!peerManager_) {
-    XLOG(ERR, "PeerManager is not initialized");
+    XLOG(ERR, "PeerManagerBase is not initialized");
     return 0;
   }
 

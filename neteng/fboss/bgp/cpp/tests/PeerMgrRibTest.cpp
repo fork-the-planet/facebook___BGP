@@ -146,7 +146,7 @@ class RibInitialAnnouncementTestFixture : public PeerManagerTestFixture {
         false /* applyGoldenPrefixPolicy */,
         {} /* bgpFeatures */);
     auto configManager = std::make_shared<ConfigManager>(config);
-    peerMgr_ = std::make_shared<PeerManager>(
+    peerMgr_ = std::make_shared<PeerManagerBase>(
         configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
     auto versionNumber = std::make_shared<VersionNumber>(version_);
@@ -204,7 +204,7 @@ class RibInitialAnnouncementTestFixture : public PeerManagerTestFixture {
     EXPECT_EQ(2, numAnnouncements);
   }
 
-  std::shared_ptr<PeerManager> peerMgr_;
+  std::shared_ptr<PeerManagerBase> peerMgr_;
 
   uint64_t version_ = 0x100;
   std::shared_ptr<FiberBgpPeer::ObservableSessionInfo> sessionInfo_;
@@ -231,7 +231,7 @@ TEST_F(PeerManagerTestFixture, UpdateShadowRibEntryUtil) {
   auto config = getConfig(
       true /* includeStaticPeer */, true /* includeDynamicShivPeer */);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   ShadowRibEntry srEntry;
@@ -276,7 +276,7 @@ TEST_F(PeerManagerTestFixture, ShadowRibEntryBestpathTest) {
 
   auto config = getConfig(
       true /* includeStaticPeer */, true /* includeDynamicShivPeer */);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       std::make_shared<ConfigManager>(config),
       nullptr,
       ribInQ_,
@@ -385,7 +385,7 @@ TEST_P(RibAllocatedPathIdTestFixture, ShadowRibEntryMultipathTest) {
   bool ribAllocatedPathId = GetParam();
   auto config = getConfig(
       true /* includeStaticPeer */, true /* includeDynamicShivPeer */);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       std::make_shared<ConfigManager>(config),
       nullptr,
       ribInQ_,
@@ -508,7 +508,7 @@ TEST_P(RibAllocatedPathIdTestFixture, ShadowRibEntryMultipathTest) {
 TEST_F(PeerManagerTestFixture, ShadowRibEntryEmptyAttrTest) {
   auto config = getConfig(
       true /* includeStaticPeer */, true /* includeDynamicShivPeer */);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       std::make_shared<ConfigManager>(config),
       nullptr,
       ribInQ_,
@@ -562,7 +562,7 @@ TEST_P(RibAllocatedPathIdTestFixture, ShadowRibEntryMixpathTest) {
 
   auto config = getConfig(
       true /* includeStaticPeer */, true /* includeDynamicShivPeer */);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       std::make_shared<ConfigManager>(config),
       nullptr,
       ribInQ_,
@@ -640,11 +640,11 @@ TEST_P(RibAllocatedPathIdTestFixture, ShadowRibEntryMixpathTest) {
 
 TEST_F(PeerManagerTestFixture, RibDumpReqNegativeTest) {
   //
-  // Step 0: test setup with PeerManager and 1 adjRib
+  // Step 0: test setup with PeerManagerBase and 1 adjRib
   //
   auto config = getConfig(
       true /* includeStaticPeer */, true /* includeDynamicShivPeer */);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       std::make_shared<ConfigManager>(config),
       nullptr,
       ribInQ_,
@@ -706,11 +706,11 @@ TEST_F(PeerManagerTestFixture, RibDumpReqNegativeTest) {
  */
 CO_TEST_F(PeerManagerTestFixture, ShadowRibEntryMultiUpdateTest) {
   /*
-   * Step 0.0: test setup with PeerManager and adjRib:
+   * Step 0.0: test setup with PeerManagerBase and adjRib:
    */
   auto config = getConfig(
       true /* includeStaticPeer */, true /* includeDynamicShivPeer */);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       std::make_shared<ConfigManager>(config),
       nullptr,
       ribInQ_,
@@ -821,13 +821,13 @@ CO_TEST_F(PeerManagerTestFixture, ShadowRibEntryMultiUpdateTest) {
 
 CO_TEST_F(PeerManagerTestFixture, RibDumpReqPositiveTest) {
   //
-  // Step 0.0: test setup with PeerManager and 2 adjRibs:
+  // Step 0.0: test setup with PeerManagerBase and 2 adjRibs:
   //  - adjrib1: add-path disabled peer(by default)
   //  - adirib2: add-path enabled peer
   //
   auto config = getConfig(
       true /* includeStaticPeer */, true /* includeDynamicShivPeer */);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       std::make_shared<ConfigManager>(config),
       nullptr,
       ribInQ_,
@@ -1297,8 +1297,8 @@ TEST_F(RibInitialAnnouncementTestFixture, HandleBufferedRibDumpReqsTest) {
 
 /*
  * The RibDumpCancellationSource_* tests below unit-test the per-AdjRib rib dump
- * cancellation source APIs that back PeerManager's coalescing and cancellation
- * of scheduled rib dumps, one API per test:
+ * cancellation source APIs that back PeerManagerBase's coalescing and
+ * cancellation of scheduled rib dumps, one API per test:
  *   - isRibDumpScheduled
  *   - getCancellationTokenForNewRibDump
  *   - cancelRibDump
@@ -2040,7 +2040,7 @@ CO_TEST_F(
   // Wait for ribOutQ_ to drain, then synchronize with the EVB thread to
   // ensure processRibOutMsgLoop has finished processing and is suspended.
   // runInEventBaseThreadAndWait provides a happens-before guarantee,
-  // preventing data races when sessionEstablished accesses PeerManager
+  // preventing data races when sessionEstablished accesses PeerManagerBase
   // state (adjRibs_, pendingRibDumpReqs_, etc.) from this thread.
   while (!ribOutQ_.empty()) {
     co_await folly::coro::sleep(std::chrono::milliseconds(1));
@@ -2282,7 +2282,7 @@ TEST_F(PeerManagerTestFixture, ReplicateRibMessageInitialadjRibsTest) {
 
   auto config = getConfig(
       true /* includeStaticPeer */, true /* includeDynamicShivPeer */);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       std::make_shared<ConfigManager>(config),
       nullptr,
       ribInQ_,
@@ -2412,7 +2412,7 @@ CO_TEST_F(PeerManagerTestFixture, SelectiveMultipathNotificationBestpathTest) {
       true /* includeStaticPeer */, true /* includeDynamicShivPeer */);
 
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto& evb = peerMgr->getEventBase();
@@ -2721,7 +2721,7 @@ CO_TEST_F(PeerManagerTestFixture, SelectiveMultipathNotificationAddPathTest) {
       true /* includeStaticPeer */, false /* includeDynamicShivPeer */);
 
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto& evb = peerMgr->getEventBase();
@@ -2816,7 +2816,7 @@ CO_TEST_F(PeerManagerTestFixture, SelectiveMultipathNotificationMixTest) {
       true /* includeStaticPeer */, false /* includeDynamicShivPeer */);
 
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto& evb = peerMgr->getEventBase();

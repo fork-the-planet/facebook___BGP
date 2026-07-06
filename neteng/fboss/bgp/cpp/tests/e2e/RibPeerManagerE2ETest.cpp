@@ -15,9 +15,9 @@
  */
 
 /*
- * E2E test for RIB + PeerManager: Tests complete BGP flow end-to-end
+ * E2E test for RIB + PeerManagerBase: Tests complete BGP flow end-to-end
  * Mocked: FIB (TestFib), SessionManager (MockSessionManager)
- * Real: RIB, PeerManager, AdjRib
+ * Real: RIB, PeerManagerBase, AdjRib
  */
 
 #include <gtest/gtest.h>

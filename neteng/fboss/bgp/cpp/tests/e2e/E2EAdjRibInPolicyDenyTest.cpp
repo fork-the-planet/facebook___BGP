@@ -21,7 +21,7 @@
  * to peers. This is E2E observable behavior (route in -> no route out).
  *
  * Mocked: FIB (TestFib), SessionManager (MockSessionManager)
- * Real: RIB, PeerManager, AdjRib, PolicyManager
+ * Real: RIB, PeerManagerBase, AdjRib, PolicyManager
  */
 
 #include <gtest/gtest.h>
@@ -66,7 +66,7 @@ class E2EAdjRibInPolicyDenyTest : public E2ETestFixture {
  */
 TEST_F(E2EAdjRibInPolicyDenyTest, DenyByPrefixNotPropagated) {
   /*
-   * Configure policy BEFORE creating RIB and PeerManager
+   * Configure policy BEFORE creating RIB and PeerManagerBase
    * Policy denies 10.0.0.0/8
    */
   addPrefixDenyPolicy({"10.0.0.0/8"});

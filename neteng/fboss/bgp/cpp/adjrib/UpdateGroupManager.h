@@ -107,7 +107,7 @@ class UpdateGroupManager {
 
   /*
    * Get a read-only reference to all update groups.
-   * Used by PeerManager to build TUpdateGroupInfo for CLI/thrift.
+   * Used by PeerManagerBase to build TUpdateGroupInfo for CLI/thrift.
    */
   const folly::F14NodeMap<
       UpdateGroupKey,
@@ -165,12 +165,12 @@ class UpdateGroupManager {
   /*
    * Update group configuration: serialization mode, slow peer detection
    * thresholds, and detachment behavior.
-   * Passed from PeerManager and applied to all update groups on creation.
+   * Passed from PeerManagerBase and applied to all update groups on creation.
    */
   UpdateGroupConfig updateGroupConfig_;
 
   /*
-   * Reference to PeerManager's shadow RIB entries.
+   * Reference to PeerManagerBase's shadow RIB entries.
    * Passed to update groups for initial dumps and change tracking.
    */
   const ShadowRibEntriesMap* shadowRibEntries_{nullptr};

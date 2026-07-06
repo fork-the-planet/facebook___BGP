@@ -540,7 +540,7 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
 
   /*
    * Set the change list tracker and consumer bitmaps for detached peer
-   * support. Called by PeerManager when setting up the group's change list
+   * support. Called by PeerManagerBase when setting up the group's change list
    * consumer.
    */
   void setChangeListTracker(
@@ -1392,12 +1392,12 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
   /*
    * Shared pointer to the global change list tracker.
    * Cached here so detached peers can register their own consumer.
-   * Set by PeerManager when configuring the group's change list consumer.
+   * Set by PeerManagerBase when configuring the group's change list consumer.
    */
   std::shared_ptr<ChangeTracker<ShadowRibEntry>> changeListTracker_{nullptr};
 
   /*
-   * References to the global consumer bitmaps managed by PeerManager.
+   * References to the global consumer bitmaps managed by PeerManagerBase.
    * Cached here so detached peers can register their own consumer with
    * the correct bitmaps.
    */
@@ -1417,7 +1417,7 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
 
   /*
    * Pointer to shadow RIB entries for initial dump.
-   * Owned by PeerManager. nullptr if not set.
+   * Owned by PeerManagerBase. nullptr if not set.
    * TODO: instead of maintaing shadowRibEntry map, maintaining a ptr to the
    * entity which can retrieve the reference to shadowRibEntries.
    */

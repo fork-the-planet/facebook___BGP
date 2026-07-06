@@ -16,7 +16,7 @@
 
 /*
  * E2E tests for BGP Update Group MVP functionality - Runtime Route scenarios
- * Tests complete flow: RIB → PeerManager → UpdateGroup → Peers
+ * Tests complete flow: RIB → PeerManagerBase → UpdateGroup → Peers
  * Requires: Change List Tracker + Update Group + Egress Backpressure
  *
  * This file contains batch route operation tests.
@@ -220,7 +220,7 @@ TEST_P(UpdateGroupRuntimeRouteTest, OptionalParameterBehavior) {
  * Runtime Local Route Injection with Update Group
  *
  * Tests injecting local routes at runtime after BGP is already initialized.
- * Routes should flow: RIB → PeerManager → ShadowRIB → UpdateGroup → Peers
+ * Routes should flow: RIB → PeerManagerBase → ShadowRIB → UpdateGroup → Peers
  */
 TEST_P(UpdateGroupRuntimeRouteTest, RuntimeLocalRoutesWithUpdateGroup) {
   /* Add peers to configuration */

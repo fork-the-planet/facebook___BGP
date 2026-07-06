@@ -16,7 +16,7 @@
 
 /*
  * E2E tests for BGP Update Group MVP functionality - Multi-Group Initial Dump
- * Tests complete flow: RIB → PeerManager → UpdateGroup → Peers
+ * Tests complete flow: RIB → PeerManagerBase → UpdateGroup → Peers
  * Requires: Change List Tracker + Update Group + Egress Backpressure
  */
 
@@ -70,7 +70,7 @@ TEST_P(UpdateGroupInitialDumpTest, FivePeersTwoGroups) {
   /* Step 3: Add local route to config */
   addLocalRoute("22.0.0.0/8", {"302:1"}, 100);
 
-  /* Step 4: Create RIB and PeerManager */
+  /* Step 4: Create RIB and PeerManagerBase */
   setupComponents();
 
   /* Step 5: Wait for route to reach shadowRIB */
@@ -323,7 +323,7 @@ TEST_P(UpdateGroupInitialDumpTest, TenPeersEachOwnGroup) {
   /* Step 3: Add local route to config */
   addLocalRoute("23.0.0.0/8", {"303:1"}, 100);
 
-  /* Step 4: Create RIB and PeerManager */
+  /* Step 4: Create RIB and PeerManagerBase */
   setupComponents();
 
   /* Step 5: Wait for route to reach shadowRIB */

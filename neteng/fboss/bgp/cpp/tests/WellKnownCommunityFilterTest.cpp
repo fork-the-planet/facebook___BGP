@@ -24,7 +24,7 @@
  *
  * E2E coverage exists in
  * fbcode/neteng/fboss/bgp/cpp/tests/e2e/E2EWellKnownCommunitiesTest.cpp,
- * but the E2E path relies on the AdjRib + PeerManager fixtures and only
+ * but the E2E path relies on the AdjRib + PeerManagerBase fixtures and only
  * exercises the filter via canAnnounceEntry / canAnnounceForGroup. These
  * unit tests verify the predicate in isolation so production semantics
  * remain verifiable even when the fixture has gaps.

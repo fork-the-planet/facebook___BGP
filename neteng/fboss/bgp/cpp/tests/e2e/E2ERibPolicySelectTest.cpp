@@ -21,7 +21,7 @@
  * complete BGP pipeline.
  *
  * Mocked: FIB (TestFib), SessionManager (MockSessionManager)
- * Real: RIB, PeerManager, AdjRib, RibPolicy
+ * Real: RIB, PeerManagerBase, AdjRib, RibPolicy
  */
 
 #include <gtest/gtest.h>

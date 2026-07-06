@@ -25,7 +25,7 @@
 #include "neteng/fboss/bgp/cpp/adjrib/AdjRibGroup.h"
 #include "neteng/fboss/bgp/cpp/common/Consts.h"
 #include "neteng/fboss/bgp/cpp/config/ConfigManager.h"
-#include "neteng/fboss/bgp/cpp/peer/PeerManager.h"
+#include "neteng/fboss/bgp/cpp/peer/PeerManagerBase.h"
 #include "neteng/fboss/bgp/cpp/stats/Stats.h"
 #include "neteng/fboss/bgp/if/gen-cpp2/bgp_thrift_types.h"
 
@@ -37,7 +37,7 @@ using namespace facebook::bgp::BgpStats;
 namespace facebook::bgp {
 
 /* Get egress statistics on all peers. */
-std::vector<TPeerEgressStats> PeerManager::getPeerEgressStats(
+std::vector<TPeerEgressStats> PeerManagerBase::getPeerEgressStats(
     std::unordered_multimap<
         folly::IPAddress,
         std::shared_ptr<BgpPeerDisplayInfo>> allPeers) {
@@ -88,7 +88,7 @@ std::vector<TPeerEgressStats> PeerManager::getPeerEgressStats(
 }
 
 /* Get detailed update group information for CLI/thrift. */
-std::vector<TUpdateGroupInfo> PeerManager::getUpdateGroupInfo(
+std::vector<TUpdateGroupInfo> PeerManagerBase::getUpdateGroupInfo(
     std::optional<int64_t> groupIdFilter) {
   std::vector<TUpdateGroupInfo> result;
 
@@ -266,7 +266,7 @@ std::vector<TUpdateGroupInfo> PeerManager::getUpdateGroupInfo(
  *                    caller. It includes both bestpath and multipaths
  */
 std::optional<neteng::fboss::bgp::thrift::TRibEntry>
-PeerManager::createTRibEntryWithFilter(
+PeerManagerBase::createTRibEntryWithFilter(
     const std::pair<const folly::CIDRNetwork, facebook::bgp::ShadowRibEntry>&
         entry,
     const std::function<bool(const RouteInfo&)>& /* pathFilter */) {
@@ -325,7 +325,7 @@ PeerManager::createTRibEntryWithFilter(
   return tRibEntry;
 }
 
-TRibEntry PeerManager::createTRibEntry(
+TRibEntry PeerManagerBase::createTRibEntry(
     const std::pair<const folly::CIDRNetwork, facebook::bgp::ShadowRibEntry>&
         entry) {
   return *(
@@ -340,7 +340,7 @@ TRibEntry PeerManager::createTRibEntry(
  * @return vector<TRibEntry>  return a full list of entries for a given
  *                            AFI
  */
-std::vector<TRibEntry> PeerManager::getShadowRibEntries(TBgpAfi afi) {
+std::vector<TRibEntry> PeerManagerBase::getShadowRibEntries(TBgpAfi afi) {
   std::vector<TRibEntry> tRibEntries;
 
   if (afi != TBgpAfi::AFI_IPV4 && afi != TBgpAfi::AFI_IPV6) {
@@ -370,7 +370,7 @@ std::vector<TRibEntry> PeerManager::getShadowRibEntries(TBgpAfi afi) {
  * @return vector<TRibEntry>  return a full list of entries for a given
  *                            AFI
  */
-std::vector<TRibEntry> PeerManager::getChangeListEntries(TBgpAfi afi) {
+std::vector<TRibEntry> PeerManagerBase::getChangeListEntries(TBgpAfi afi) {
   std::vector<TRibEntry> tRibEntries;
 
   if (afi != TBgpAfi::AFI_IPV4 && afi != TBgpAfi::AFI_IPV6) {
@@ -400,7 +400,7 @@ std::vector<TRibEntry> PeerManager::getChangeListEntries(TBgpAfi afi) {
   return tRibEntries;
 }
 
-std::vector<TBgpSession> PeerManager::getSessionInfos(
+std::vector<TBgpSession> PeerManagerBase::getSessionInfos(
     const std::unordered_multimap<
         folly::IPAddress,
         std::shared_ptr<BgpPeerDisplayInfo>>& allPeers) noexcept {
@@ -415,7 +415,7 @@ std::vector<TBgpSession> PeerManager::getSessionInfos(
 
 // TODO: Unused: peer_id, next_hop4, next_hop6 are not being currently used in
 //       display
-std::vector<TBgpStreamSession> PeerManager::getBgpStreamSummary() noexcept {
+std::vector<TBgpStreamSession> PeerManagerBase::getBgpStreamSummary() noexcept {
   std::vector<TBgpStreamSession> stream_sessions;
   evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
     for (const auto& [subscriberName, subscriber] : streamSubscribers_) {
@@ -447,7 +447,7 @@ std::vector<TBgpStreamSession> PeerManager::getBgpStreamSummary() noexcept {
   return stream_sessions;
 }
 
-std::vector<TBgpSession> PeerManager::getDetailSessionInfos(
+std::vector<TBgpSession> PeerManagerBase::getDetailSessionInfos(
     const std::unordered_multimap<
         folly::IPAddress,
         std::shared_ptr<BgpPeerDisplayInfo>>& allPeers) noexcept {
@@ -462,7 +462,7 @@ std::vector<TBgpSession> PeerManager::getDetailSessionInfos(
   return sessionInfos;
 }
 
-std::vector<THoldTimerInfo> PeerManager::getHoldTimerInfos(
+std::vector<THoldTimerInfo> PeerManagerBase::getHoldTimerInfos(
     const std::unordered_multimap<
         folly::IPAddress,
         std::shared_ptr<BgpPeerDisplayInfo>>& allPeers) noexcept {
@@ -518,7 +518,7 @@ std::vector<THoldTimerInfo> PeerManager::getHoldTimerInfos(
  *
  * @return TBgpSession structs containing information on the queried peers.
  */
-TBgpSession PeerManager::getDetailSessionInfo(
+TBgpSession PeerManagerBase::getDetailSessionInfo(
     const folly::IPAddress& peerAddr,
     const std::shared_ptr<BgpPeerDisplayInfo>& peerInfo,
     const std::shared_ptr<BgpGlobalConfig>& bgpGlobalConfig) noexcept {
@@ -636,7 +636,7 @@ TBgpSession PeerManager::getDetailSessionInfo(
  *
  * @return TBgpSession structs containing information on the queried peers.
  */
-TBgpSession PeerManager::getSessionInfo(
+TBgpSession PeerManagerBase::getSessionInfo(
     const folly::IPAddress& peerAddr,
     const std::shared_ptr<BgpPeerDisplayInfo>& peerInfo) noexcept {
   const auto currentTime = std::chrono::steady_clock::now();
@@ -817,7 +817,7 @@ TBgpSession PeerManager::getSessionInfo(
   return tBgpSession;
 }
 
-void PeerManager::getNetworks(
+void PeerManagerBase::getNetworks(
     std::map<TIpPrefix, TBgpPath>& prefixToPath,
     const std::unique_ptr<std::string>& peer,
     const RouteFilterType& type,
@@ -855,7 +855,7 @@ void PeerManager::getNetworks(
   });
 }
 
-void PeerManager::getNetworks(
+void PeerManagerBase::getNetworks(
     std::map<TIpPrefix, TBgpPath>& prefixToPath,
     const std::unique_ptr<std::string>& peer,
     const std::unique_ptr<std::string>& sessionBgpId,
@@ -890,7 +890,7 @@ void PeerManager::getNetworks(
   });
 }
 
-void PeerManager::getNetworks2(
+void PeerManagerBase::getNetworks2(
     std::map<TIpPrefix, std::vector<TBgpPath>>& prefixToPath,
     const std::unique_ptr<std::string>& peer,
     const RouteFilterType& type,
@@ -921,7 +921,7 @@ void PeerManager::getNetworks2(
   });
 }
 
-void PeerManager::getNetworks2(
+void PeerManagerBase::getNetworks2(
     std::map<TIpPrefix, std::vector<TBgpPath>>& prefixToPath,
     const std::unique_ptr<std::string>& peer,
     const std::unique_ptr<std::string>& sessionBgpId,
@@ -952,7 +952,7 @@ void PeerManager::getNetworks2(
   });
 }
 
-void PeerManager::getSubscriberNetworks(
+void PeerManagerBase::getSubscriberNetworks(
     std::map<TIpPrefix, std::vector<TBgpPath>>& prefixToPath,
     const int32_t peerID,
     const RouteFilterType& type) noexcept {
@@ -970,7 +970,7 @@ void PeerManager::getSubscriberNetworks(
   });
 }
 
-void PeerManager::getAttributeStatsHelper(
+void PeerManagerBase::getAttributeStatsHelper(
     const std::shared_ptr<const BgpPath>& attr,
     std::unordered_set<std::shared_ptr<const BgpPath>>& allAttributes,
     std::unordered_set<
@@ -1010,7 +1010,7 @@ void PeerManager::getAttributeStatsHelper(
       attr->getTopologyInfo() ? attr->getTopologyInfo()->size() : 0;
 }
 
-TAttributeStats PeerManager::getAttributeStats() noexcept {
+TAttributeStats PeerManagerBase::getAttributeStats() noexcept {
   // TODO: For now we are yielding for each peer. Based on tests for RSW
   // and FSW it takes less than 200ms for completing this command (all peers).
   // For minipack scale yielding per peer should be sufficient to avoid any
@@ -1134,7 +1134,7 @@ TAttributeStats PeerManager::getAttributeStats() noexcept {
   return tStats;
 }
 
-TAttributeStats PeerManager::getAttributeStatsFiltered(
+TAttributeStats PeerManagerBase::getAttributeStatsFiltered(
     const std::unique_ptr<TAttributeStatsFilter>& filter) noexcept {
   XLOG(DBG1, "Start getAttributeStats");
   std::vector<BgpPeerId> adjRibPeers;

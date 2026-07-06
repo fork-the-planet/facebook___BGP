@@ -22,7 +22,7 @@
 #include <folly/logging/xlog.h>
 #include <neteng/fboss/bgp/cpp/BgpServiceDC.h>
 #include <neteng/fboss/bgp/cpp/BgpServiceUtil.h>
-#include <neteng/fboss/bgp/cpp/peer/PeerManager.h>
+#include <neteng/fboss/bgp/cpp/peer/PeerManagerBase.h>
 #include <neteng/fboss/bgp/cpp/rib/RibDC.h>
 #include <neteng/fboss/bgp/cpp/rib/RibFileUtils.h>
 #include <neteng/fboss/bgp/cpp/stats/Stats.h>
@@ -44,7 +44,7 @@ DEFINE_int32(
 static const std::string kExitNullPtrLogPrefix = "BgpServiceDCExitOrNullPtr";
 
 BgpServiceDC::BgpServiceDC(
-    PeerManager& peerMgr,
+    PeerManagerBase& peerMgr,
     std::shared_ptr<ConfigManager> configManager,
     RibDC& rib,
     std::shared_ptr<NeighborWatcher> neighborWatcher,
@@ -786,7 +786,7 @@ BgpServiceDC::co_setCrfPolicyFromFile() {
   if (!fileMode) {
     /*
      * Transition to THRIFT_MODE. The previously-applied CRF policy (if any)
-     * remains active in PeerManager and RIB — only the gating flag changes.
+     * remains active in PeerManagerBase and RIB — only the gating flag changes.
      * Clearing the policy here would cause unnecessary traffic disruption.
      */
     ribDC_.setCrfFileModeEnabled(false);

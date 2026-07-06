@@ -21,7 +21,7 @@
  * and propagated through the RIB for nexthop tracking scenarios.
  *
  * Mocked: FIB (TestFib), SessionManager (MockSessionManager)
- * Real: RIB, PeerManager, AdjRib, NexthopCache
+ * Real: RIB, PeerManagerBase, AdjRib, NexthopCache
  */
 
 #include <gtest/gtest.h>

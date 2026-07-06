@@ -222,7 +222,7 @@ class AdjRibInboundFixture : public ::testing::Test {
       const AfiIpv6Negotiated& isAfiIpv6Negotiated = AfiIpv6Negotiated(true));
 
   // Re-establish session from fiber context, mimicking
-  // PeerManager::sessionEstablished flow by properly awaiting
+  // PeerManagerBase::sessionEstablished flow by properly awaiting
   // ensureAsyncScopeInitialized() before calling sessionEstablished()
   // and startMessageProcessingLoop().
   void reEstablishSession(

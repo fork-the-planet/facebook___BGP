@@ -34,7 +34,7 @@
 #include "neteng/fboss/bgp/cpp/config/ConfigManager.h"
 #include "neteng/fboss/bgp/cpp/lib/coro/BackPressuredQueue.h"
 #include "neteng/fboss/bgp/cpp/peer/NeighborWatcher.h"
-#include "neteng/fboss/bgp/cpp/peer/PeerManager.h"
+#include "neteng/fboss/bgp/cpp/peer/PeerManagerBase.h"
 #include "neteng/fboss/bgp/cpp/peer/SessionManager.h"
 #include "neteng/fboss/bgp/cpp/policy/PolicyManager.h"
 #include "neteng/fboss/bgp/cpp/rib/RibDC.h"
@@ -276,8 +276,8 @@ int main(int argc, char** argv) {
       false, /* enableMessagesOverNotifyQueue */
       true); /* enableCoroNotifyQueue */
 
-  // Start peer thread (plain PeerManager, not PeerManagerVipManager)
-  PeerManager peerMgr(
+  // Start peer thread (plain PeerManagerBase, not PeerManagerVipManager)
+  PeerManagerBase peerMgr(
       configManager,
       policyManager,
       ribInQ, /* write to ribInQ */
@@ -287,7 +287,7 @@ int main(int argc, char** argv) {
   watchdog.monitorModule(peerMgr.getModuleName(), peerMgr);
 
   // now that RIB Policy is loaded in RIB, we pass the route filter policy to
-  // PeerManager before AdjRibs are created
+  // PeerManagerBase before AdjRibs are created
   auto tRouteFilterPolicy = rib.getRouteFilterPolicy();
 
   // Validate peer group configuration in route filter policy

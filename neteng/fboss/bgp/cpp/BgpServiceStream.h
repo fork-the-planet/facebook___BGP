@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "neteng/fboss/bgp/cpp/peer/PeerManager.h"
+#include "neteng/fboss/bgp/cpp/peer/PeerManagerBase.h"
 #include "neteng/fboss/bgp/if/gen-cpp2/TBgpServiceStream.h"
 
 namespace facebook::bgp {
@@ -24,7 +24,7 @@ namespace facebook::bgp {
 class BgpServiceStream
     : public facebook::neteng::fboss::bgp::thrift::TBgpServiceStreamSvIf {
  public:
-  explicit BgpServiceStream(PeerManager* peerMgr) : peerMgr_(peerMgr) {}
+  explicit BgpServiceStream(PeerManagerBase* peerMgr) : peerMgr_(peerMgr) {}
   ~BgpServiceStream() override = default;
 
   // Stream API
@@ -32,6 +32,6 @@ class BgpServiceStream
   subscribe(std::unique_ptr<std::string> subscriberName) override;
 
  private:
-  PeerManager* peerMgr_{nullptr};
+  PeerManagerBase* peerMgr_{nullptr};
 };
 } // namespace facebook::bgp

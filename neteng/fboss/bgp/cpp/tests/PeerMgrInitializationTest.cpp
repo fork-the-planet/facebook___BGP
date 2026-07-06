@@ -94,7 +94,7 @@ TEST_F(PeerManagerInitializationTestFixture, DuplicateRibEoRNotificationTest) {
       false /* enableVipServer */,
       eorTimeS);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto sessionMgr =
@@ -160,7 +160,7 @@ TEST_F(PeerManagerInitializationTestFixture, InitializedSignalTimeoutTest) {
       false /* enableVipServer */,
       eorTimeS);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto sessionMgr =

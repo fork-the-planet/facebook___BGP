@@ -502,7 +502,7 @@ void FiberBgpPeer::run() noexcept {
   peeringState_.sendQueueTotalBlockDurationMs = 0;
   peeringState_.lastSendQueueBlockTimeMs = 0;
 
-  // notify PeerManager for session DOWN
+  // notify PeerManagerBase for session DOWN
   peeringState_.state = BgpSessionState::IDLE;
   observerStateQueue_.put(
       {getRemoteBgpPeerId(),

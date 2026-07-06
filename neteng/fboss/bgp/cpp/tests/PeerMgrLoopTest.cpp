@@ -28,7 +28,7 @@
 
 #include "neteng/fboss/bgp/cpp/config/Config.h"
 #include "neteng/fboss/bgp/cpp/config/ConfigManager.h"
-#include "neteng/fboss/bgp/cpp/peer/PeerManager.h"
+#include "neteng/fboss/bgp/cpp/peer/PeerManagerBase.h"
 #include "neteng/fboss/bgp/cpp/tests/Utils.h"
 
 namespace facebook::bgp {
@@ -53,7 +53,7 @@ std::string getString(const NeighborEventMsg& evt) {
   return ss.str();
 }
 
-class MockLoopPeerManager : public PeerManager {
+class MockLoopPeerManager : public PeerManagerBase {
  public:
   MockLoopPeerManager(
       std::shared_ptr<Config> config,
@@ -61,7 +61,7 @@ class MockLoopPeerManager : public PeerManager {
       MonitoredMPMCQueue<RibOutMessage>& ribOutQ,
       std::optional<MonitoredMPMCQueue<NeighborWatcherMessage>>&
           nbrRouteChangeQ)
-      : PeerManager(
+      : PeerManagerBase(
             std::make_shared<ConfigManager>(config),
             nullptr,
             ribInQ,

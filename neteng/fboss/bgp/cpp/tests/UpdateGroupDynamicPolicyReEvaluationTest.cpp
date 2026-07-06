@@ -83,7 +83,7 @@ namespace facebook::bgp {
 class UpdateGroupDynamicPolicyReEvaluationTest : public PeerManagerTestFixture {
  protected:
   struct TestContext {
-    std::shared_ptr<PeerManager> peerMgr;
+    std::shared_ptr<PeerManagerBase> peerMgr;
     std::shared_ptr<SessionManager> sessionMgr;
     std::shared_ptr<AdjRib> adjRib1;
     std::shared_ptr<AdjRib> adjRib2;
@@ -171,7 +171,7 @@ class UpdateGroupDynamicPolicyReEvaluationTest : public PeerManagerTestFixture {
         enableUpdateGroup);
 
     auto configManager = std::make_shared<ConfigManager>(config);
-    auto peerMgr = std::make_shared<PeerManager>(
+    auto peerMgr = std::make_shared<PeerManagerBase>(
         configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
     auto globalConfig = config->getBgpGlobalConfig();
@@ -459,7 +459,8 @@ TEST_F(
   });
 
   // Phase 2: Register the group consumer on adjRib1's group.
-  // Use PeerManager's bitmaps so publishChange stamps consumer bits correctly.
+  // Use PeerManagerBase's bitmaps so publishChange stamps consumer bits
+  // correctly.
   auto& addPathBitmap = ctx.peerMgr->addPathConsumerBitmap_;
   auto& nonAddPathBitmap = ctx.peerMgr->nonAddPathConsumerBitmap_;
   std::shared_ptr<AdjRibOutGroupConsumer> groupConsumer;

@@ -41,7 +41,7 @@
 #include "neteng/fboss/bgp/cpp/common/RibMessage.h"
 #include "neteng/fboss/bgp/cpp/config/ConfigManager.h"
 #include "neteng/fboss/bgp/cpp/config/ConfigStructs.h"
-#include "neteng/fboss/bgp/cpp/peer/PeerManager.h"
+#include "neteng/fboss/bgp/cpp/peer/PeerManagerBase.h"
 #include "neteng/fboss/bgp/cpp/policy/PolicyManager.h"
 #include "neteng/fboss/bgp/cpp/rib/Utils.h"
 #include "neteng/fboss/bgp/cpp/stats/Stats.h"
@@ -116,7 +116,7 @@ namespace bgp {
 
 using nettools::bgplib::DeDuplicatedBgpPath;
 
-PeerManager::PeerManager(
+PeerManagerBase::PeerManagerBase(
     std::shared_ptr<ConfigManager> configManager,
     const std::shared_ptr<PolicyManager> policyManager,
     MonitoredBackPressuredQueue<RibInMessage>& ribInQ,
@@ -284,7 +284,7 @@ PeerManager::PeerManager(
   }
 }
 
-PeerManager::~PeerManager() {
+PeerManagerBase::~PeerManagerBase() {
   /**
    * Invoke destructor to cleanly stop all of the adjRib fibers and trees
    *
@@ -327,27 +327,27 @@ PeerManager::~PeerManager() {
   }
   adjRibOutGroups_.clear();
 
-  // terminate evb to deterministically shutdown PeerManager evb
+  // terminate evb to deterministically shutdown PeerManagerBase evb
   evb_.terminateLoopSoon();
 
   changeListTracker_.reset();
-  XLOG(INFO, "[Exit] Successfully destructed PeerManager object");
+  XLOG(INFO, "[Exit] Successfully destructed PeerManagerBase object");
 }
 
-void PeerManager::run() noexcept {
-  XLOG(DBG1, "Start running PeerManager...");
+void PeerManagerBase::run() noexcept {
+  XLOG(DBG1, "Start running PeerManagerBase...");
   CHECK(sessionMgr_) << "setSessionManager() must be called before run()";
 
   addPeersToSessionMgr();
   scheduleCoroTasks();
   scheduleTimers();
 
-  XLOG(INFO, "Start PeerManager event-base loop");
+  XLOG(INFO, "Start PeerManagerBase event-base loop");
   evb_.loop();
-  XLOG(INFO, "[Exit] Successfully terminated PeerManager event-base.");
+  XLOG(INFO, "[Exit] Successfully terminated PeerManagerBase event-base.");
 }
 
-void PeerManager::scheduleCoroTasks() noexcept {
+void PeerManagerBase::scheduleCoroTasks() noexcept {
   asyncScope_.add(co_withExecutor(&evb_, processPeerEventLoop()));
   asyncScope_.add(co_withExecutor(&evb_, processAdjRibMsgLoop()));
   asyncScope_.add(co_withExecutor(&evb_, processRibOutMsgLoop()));
@@ -362,14 +362,14 @@ void PeerManager::scheduleCoroTasks() noexcept {
   asyncScope_.add(co_withExecutor(&evb_, periodicEvictFromDeduplicatorLoop()));
 }
 
-void PeerManager::scheduleTimers() noexcept {
+void PeerManagerBase::scheduleTimers() noexcept {
   XLOG(DBG1, "Start EoR Timer.");
   eorTimer_->scheduleTimeout(
       std::chrono::seconds(
           *configManager_->getConfig()->getConfig().eor_time_s()));
 }
 
-void PeerManager::addPeersToSessionMgr() {
+void PeerManagerBase::addPeersToSessionMgr() {
   /*
    * [GR State]
    *
@@ -504,7 +504,7 @@ void PeerManager::addPeersToSessionMgr() {
 }
 
 folly::coro::Task<folly::Expected<folly::Unit, FiberBgpPeerManager::ErrorCode>>
-PeerManager::addPeers(
+PeerManagerBase::addPeers(
     const std::vector<std::shared_ptr<BgpPeerConfig>>& peerConfigs) {
   std::chrono::milliseconds startDelay{0};
   for (const auto& peerConfigPtr : peerConfigs) {
@@ -531,7 +531,7 @@ PeerManager::addPeers(
 }
 
 folly::coro::Task<folly::Expected<folly::Unit, FiberBgpPeerManager::ErrorCode>>
-PeerManager::delPeers(const std::vector<folly::IPAddress>& peerAddrs) {
+PeerManagerBase::delPeers(const std::vector<folly::IPAddress>& peerAddrs) {
   for (const auto& peerAddr : peerAddrs) {
     co_await folly::coro::co_safe_point;
     auto result =
@@ -567,7 +567,7 @@ PeerManager::delPeers(const std::vector<folly::IPAddress>& peerAddrs) {
   co_return folly::unit;
 }
 
-void PeerManager::stop() noexcept {
+void PeerManagerBase::stop() noexcept {
   auto task = [&]() -> folly::coro::Task<void> {
     XLOG(INFO, "Signaling all peer manager fibers to stop ...");
 
@@ -626,7 +626,7 @@ void PeerManager::stop() noexcept {
   XLOGF(INFO, "[Exit] All coro tasks finished.");
 }
 
-void PeerManager::markDaemonShutdown() {
+void PeerManagerBase::markDaemonShutdown() {
   evb_.runImmediatelyOrRunInEventBaseThreadAndWait([this] {
     XLOGF(INFO, "Marking BGP daemon shutdown for all AdjRibs...");
     daemonShutdown_ = true;
@@ -639,7 +639,7 @@ void PeerManager::markDaemonShutdown() {
   });
 }
 
-folly::coro::Task<void> PeerManager::processPeerEventLoop() noexcept {
+folly::coro::Task<void> PeerManagerBase::processPeerEventLoop() noexcept {
   XLOG(INFO, "Starting peer event processing coro task...");
 
   auto& notifyQueue = sessionMgr_->getNotifyCoroQueue();
@@ -666,7 +666,7 @@ folly::coro::Task<void> PeerManager::processPeerEventLoop() noexcept {
   }
 }
 
-folly::coro::Task<void> PeerManager::processAdjRibEvent(
+folly::coro::Task<void> PeerManagerBase::processAdjRibEvent(
     AdjRib::ObservableMessageT&& evt) noexcept {
   const auto& peerId = evt.peerId;
 
@@ -717,7 +717,7 @@ folly::coro::Task<void> PeerManager::processAdjRibEvent(
   co_await std::visit(overload, evt.message);
 }
 
-folly::coro::Task<void> PeerManager::publishUpdatesRoutine() {
+folly::coro::Task<void> PeerManagerBase::publishUpdatesRoutine() {
   XLOG(DBG1, "Start periodic stream updates coro task...");
 
   while (true) {
@@ -729,11 +729,11 @@ folly::coro::Task<void> PeerManager::publishUpdatesRoutine() {
     co_await publishUpdates();
   }
 
-  XLOG(INFO, "[Exit] PeerManager stream updates coroutine stopped");
+  XLOG(INFO, "[Exit] PeerManagerBase stream updates coroutine stopped");
   co_return;
 }
 
-folly::coro::Task<void> PeerManager::publishUpdates() {
+folly::coro::Task<void> PeerManagerBase::publishUpdates() {
   for (auto& [subscriberName, subscriber] : streamSubscribers_) {
     while (!subscriber.peerInputQ->empty()) {
       auto maybeMsg = co_await co_awaitTry(subscriber.peerInputQ->pop());
@@ -788,7 +788,7 @@ folly::coro::Task<void> PeerManager::publishUpdates() {
   }
 }
 
-void PeerManager::markRibInitialAnnouncementDone() noexcept {
+void PeerManagerBase::markRibInitialAnnouncementDone() noexcept {
   if (ribInitialAnnouncementDone_) {
     return;
   }
@@ -818,7 +818,7 @@ void PeerManager::markRibInitialAnnouncementDone() noexcept {
   }
 }
 
-folly::coro::Task<void> PeerManager::processAdjRibMsgLoop() noexcept {
+folly::coro::Task<void> PeerManagerBase::processAdjRibMsgLoop() noexcept {
   XLOG(INFO, "Starting adjRib msg processing coro task...");
 
   while (true) {
@@ -831,12 +831,12 @@ folly::coro::Task<void> PeerManager::processAdjRibMsgLoop() noexcept {
           INFO, "[Exit] Coro task cancelled. Terminating processAdjRibMsgLoop");
       break;
     }
-    ScopedProfile profile("PeerManager::processAdjRibMsg");
+    ScopedProfile profile("PeerManagerBase::processAdjRibMsg");
     co_await processAdjRibEvent(std::move(*msg));
   }
 }
 
-folly::coro::Task<void> PeerManager::processRibOutMsgLoop() noexcept {
+folly::coro::Task<void> PeerManagerBase::processRibOutMsgLoop() noexcept {
   XLOG(INFO, "Starting ribOutMsg processing coro task...");
   auto msgsProcessed = 0;
 
@@ -849,8 +849,8 @@ folly::coro::Task<void> PeerManager::processRibOutMsgLoop() noexcept {
      *
      * co_await will automatically yield the execution of coro tasks without
      * explicit sleep call. However, the current consumption rate from adjrib
-     * can't match up with PeerManager production rate. This speed mismatch can
-     * cause severe queue build-up situation to accumulate memory.
+     * can't match up with PeerManagerBase production rate. This speed mismatch
+     * can cause severe queue build-up situation to accumulate memory.
      *
      * In case of changeList enabled, process more messages from the egress rib
      * queue before yielding
@@ -871,7 +871,7 @@ folly::coro::Task<void> PeerManager::processRibOutMsgLoop() noexcept {
           INFO, "[Exit] Coro task cancelled. Terminating processRibOutMsgLoop");
       break;
     }
-    ScopedProfile profile("PeerManager::processRibOutMsg");
+    ScopedProfile profile("PeerManagerBase::processRibOutMsg");
     msgsProcessed++;
     /*
      * Make an equality check. If queue size is going down then it must hit
@@ -888,10 +888,11 @@ folly::coro::Task<void> PeerManager::processRibOutMsgLoop() noexcept {
         *msg,
         [&](const RibOutAnnouncement& announcement) {
           /*
-           * Incremental announcements come to PeerManager, which will be pushed
-           * to the individual AdjRibs. The number of RibOutAnnouncement updates
-           * may be large, and may go into multiple chunks with kRibChunkSize
-           * each. The last of these chunks will be flagged with sendWithEoR.
+           * Incremental announcements come to PeerManagerBase, which will be
+           * pushed to the individual AdjRibs. The number of RibOutAnnouncement
+           * updates may be large, and may go into multiple chunks with
+           * kRibChunkSize each. The last of these chunks will be flagged with
+           * sendWithEoR.
            */
           XLOG(DBG3, "Passing RibOutAnnouncement to all established peers.");
 
@@ -941,7 +942,7 @@ folly::coro::Task<void> PeerManager::processRibOutMsgLoop() noexcept {
   co_return;
 }
 
-folly::coro::Task<void> PeerManager::processRibDumpReqCoro(
+folly::coro::Task<void> PeerManagerBase::processRibDumpReqCoro(
     RibDumpReq ribDumpReq) {
   auto adjrib = adjRibs_.find(ribDumpReq.peerId);
   if (adjrib == adjRibs_.cend()) {
@@ -963,7 +964,7 @@ folly::coro::Task<void> PeerManager::processRibDumpReqCoro(
  * source so it can be superseded by a newer dump or cancelled on session
  * teardown.
  */
-folly::coro::Task<void> PeerManager::processRibDumpReqWithCancellationCoro(
+folly::coro::Task<void> PeerManagerBase::processRibDumpReqWithCancellationCoro(
     std::shared_ptr<AdjRib> adjRib) {
   auto cancelToken = co_await folly::coro::co_current_cancellation_token;
 
@@ -1016,11 +1017,11 @@ folly::coro::Task<void> PeerManager::processRibDumpReqWithCancellationCoro(
   co_return;
 }
 
-void PeerManager::processRibDumpReq(
+void PeerManagerBase::processRibDumpReq(
     const std::shared_ptr<AdjRib>& adjRib,
     bool sendAddPath,
     bool sendWithEoR) {
-  [[maybe_unused]] ScopedProfile profile("PeerManager::processRibDumpReq");
+  [[maybe_unused]] ScopedProfile profile("PeerManagerBase::processRibDumpReq");
   auto ribVersionBeforeWalk = adjRib->getLastSeenRibVersion();
   XLOGF(
       DBG1,
@@ -1164,7 +1165,7 @@ void PeerManager::processRibDumpReq(
       adjRib->getLastSeenRibVersion());
 }
 
-bool PeerManager::isRibDumpScheduledForAdjRib(
+bool PeerManagerBase::isRibDumpScheduledForAdjRib(
     const std::shared_ptr<AdjRib>& adjRib) const {
   /*
    * A dump is pending for this detached peer if it is either buffered (in
@@ -1176,7 +1177,7 @@ bool PeerManager::isRibDumpScheduledForAdjRib(
       pendingRibDumpAdjRibs_.contains(adjRib);
 }
 
-void PeerManager::cancelRibDumpForAdjRib(
+void PeerManagerBase::cancelRibDumpForAdjRib(
     const std::shared_ptr<AdjRib>& adjRib) {
   /*
    * Cancel a detached peer's pending rib dump. Invokes the cancellation from
@@ -1190,7 +1191,7 @@ void PeerManager::cancelRibDumpForAdjRib(
   adjRib->cancelRibDump();
 }
 
-void PeerManager::scheduleRibDumpForAdjRib(
+void PeerManagerBase::scheduleRibDumpForAdjRib(
     const std::shared_ptr<AdjRib>& adjRib) {
   /*
    * Coalesce: if a rib dump is already pending for this detached peer --
@@ -1206,7 +1207,8 @@ void PeerManager::scheduleRibDumpForAdjRib(
       adjRib->getCancellationTokenForNewRibDump());
 }
 
-void PeerManager::maybeBufferRibDumpReq(const std::shared_ptr<AdjRib>& adjRib) {
+void PeerManagerBase::maybeBufferRibDumpReq(
+    const std::shared_ptr<AdjRib>& adjRib) {
   /**
    *    Start     Rib is announcing...    Done
    *      | [A1, A2,    ....,          AN] |
@@ -1245,7 +1247,7 @@ void PeerManager::maybeBufferRibDumpReq(const std::shared_ptr<AdjRib>& adjRib) {
   }
 }
 
-folly::coro::Task<void> PeerManager::handleBufferedRibDumpReqs() {
+folly::coro::Task<void> PeerManagerBase::handleBufferedRibDumpReqs() {
   /*
    * This coroutine is only scheduled when ribInitialAnnouncementDone_ is true
    * (callers check before scheduling). ribInitialAnnouncementStarted_ is
@@ -1262,8 +1264,8 @@ folly::coro::Task<void> PeerManager::handleBufferedRibDumpReqs() {
   /**
    * Iterate over the buffered RibDumpReqs and schedule processRibDumpReq.
    * Here we do not need synchronization or lock because only one fiber
-   * or coro is running at once on PeerManager event base. This
-   * can change in the future if we make PeerManager multi-threaded.
+   * or coro is running at once on PeerManagerBase event base. This
+   * can change in the future if we make PeerManagerBase multi-threaded.
    */
   for (auto& req : curPendingRibDumpReqs_) {
     auto& peerId = req.first;
@@ -1285,7 +1287,7 @@ folly::coro::Task<void> PeerManager::handleBufferedRibDumpReqs() {
   co_return;
 }
 
-void PeerManager::maybeBufferRibDumpForDetachedPeer(
+void PeerManagerBase::maybeBufferRibDumpForDetachedPeer(
     const std::shared_ptr<AdjRib>& adjRib) {
   /**
    *    Start  Shadow Rib is populating  Done
@@ -1334,7 +1336,8 @@ void PeerManager::maybeBufferRibDumpForDetachedPeer(
   }
 }
 
-folly::coro::Task<void> PeerManager::handleBufferedRibDumpsForDetachedPeers() {
+folly::coro::Task<void>
+PeerManagerBase::handleBufferedRibDumpsForDetachedPeers() {
   /*
    * This coroutine is only scheduled when ribInitialAnnouncementDone_ is true
    * (callers check before scheduling). ribInitialAnnouncementStarted_ is
@@ -1349,7 +1352,8 @@ folly::coro::Task<void> PeerManager::handleBufferedRibDumpsForDetachedPeers() {
    * ShadowRib walks so a large batch does not monopolize the event base. Always
    * take begin(): requests buffered during a sleep are picked up by a later
    * iteration, so no copy or self-reschedule is needed. No lock is needed
-   * because only one fiber or coro runs at once on the PeerManager event base.
+   * because only one fiber or coro runs at once on the PeerManagerBase event
+   * base.
    */
   while (!pendingRibDumpAdjRibs_.empty()) {
     auto adjRib = *pendingRibDumpAdjRibs_.begin();
@@ -1385,7 +1389,7 @@ folly::coro::Task<void> PeerManager::handleBufferedRibDumpsForDetachedPeers() {
  *
  * @return void
  */
-void PeerManager::processChangeItemCompleteCallback(
+void PeerManagerBase::processChangeItemCompleteCallback(
     TrackableObject<ShadowRibEntry>* trackedObject) {
   ShadowRibEntry& srEntry = trackedObject->get();
   if (srEntry.bestpath) {
@@ -1423,7 +1427,7 @@ void PeerManager::processChangeItemCompleteCallback(
   }
 }
 
-void PeerManager::updateShadowRibEntryUtil(
+void PeerManagerBase::updateShadowRibEntryUtil(
     ShadowRibEntry& srEntry,
     const RibOutAnnouncementEntry& entry) {
   srEntry.switchId = entry.switchId;
@@ -1436,14 +1440,14 @@ void PeerManager::updateShadowRibEntryUtil(
   srEntry.ribVersion = entry.ribVersion;
 }
 
-const ConsumerBitmap& PeerManager::getConsumerBitmapForChange(
+const ConsumerBitmap& PeerManagerBase::getConsumerBitmapForChange(
     bool isBestpathChange) {
   // Simply return the appropriate bitmap based on change type
   // ChangeTracker will handle ORing if item is already on changelist
   return isBestpathChange ? nonAddPathConsumerBitmap_ : addPathConsumerBitmap_;
 }
 
-void PeerManager::handleShadowRibEntryAnnouncement(
+void PeerManagerBase::handleShadowRibEntryAnnouncement(
     const RibOutAnnouncement& announcement) {
   for (const auto& entry : announcement.entries) {
     // bestpath only advertisement, hence the pathId will always be 0
@@ -1562,7 +1566,7 @@ void PeerManager::handleShadowRibEntryAnnouncement(
   RibStats::publishShadowRibSize(shadowRibEntries_.size());
 }
 
-void PeerManager::handleShadowRibEntryWithdrawal(
+void PeerManagerBase::handleShadowRibEntryWithdrawal(
     const RibOutWithdrawal& withdrawal) {
   // process bestpath withdrawal
   for (const auto& entry : withdrawal.entries) {
@@ -1638,7 +1642,7 @@ void PeerManager::handleShadowRibEntryWithdrawal(
   RibStats::publishShadowRibSize(shadowRibEntries_.size());
 }
 
-PathId PeerManager::getPathId(const RibOutAnnouncementEntry& entry) {
+PathId PeerManagerBase::getPathId(const RibOutAnnouncementEntry& entry) {
   if (enableRibAllocatedPathId_) {
     return uint32_t(entry.pathIdToSend);
   } else {
@@ -1646,7 +1650,7 @@ PathId PeerManager::getPathId(const RibOutAnnouncementEntry& entry) {
   }
 }
 
-std::optional<PathId> PeerManager::getPathId(
+std::optional<PathId> PeerManagerBase::getPathId(
     const RibOutWithdrawalEntry& entry) {
   if (enableRibAllocatedPathId_) {
     return uint32_t(entry.pathIdToSend);
@@ -1657,7 +1661,7 @@ std::optional<PathId> PeerManager::getPathId(
   }
 }
 
-void PeerManager::processNeighborRouteChangeDuringInitialization(
+void PeerManagerBase::processNeighborRouteChangeDuringInitialization(
     const nettools::bgplib::BgpPeerId& peerId) noexcept {
   // Remove neighbor from static/dynamic EOR waiting list if present
   // It is a no-op if the key is not present in the unordered maps.
@@ -1697,7 +1701,7 @@ void PeerManager::processNeighborRouteChangeDuringInitialization(
   maybeMarkInitialized();
 }
 
-folly::coro::Task<void> PeerManager::handleNeighborEventMsg(
+folly::coro::Task<void> PeerManagerBase::handleNeighborEventMsg(
     const NeighborEventMsg& msg) noexcept {
   if (!msg.isUp) {
     XLOGF(
@@ -1737,7 +1741,8 @@ folly::coro::Task<void> PeerManager::handleNeighborEventMsg(
   }
 }
 
-folly::coro::Task<void> PeerManager::handleNeighborReachabilityMsg() noexcept {
+folly::coro::Task<void>
+PeerManagerBase::handleNeighborReachabilityMsg() noexcept {
   XLOG(INFO, "Received NeighborReachabilityMsg. Stopping all peers.");
   BgpStats::incDsfFastTearDownCount();
 
@@ -1763,7 +1768,8 @@ folly::coro::Task<void> PeerManager::handleNeighborReachabilityMsg() noexcept {
   }
 }
 
-folly::coro::Task<void> PeerManager::processNeighborRouteChangeLoop() noexcept {
+folly::coro::Task<void>
+PeerManagerBase::processNeighborRouteChangeLoop() noexcept {
   XLOG(DBG1, "Starting neighbor event processing coro task...");
   while (true) {
     // when cancelAndJoinAsync is called, guaranteed to exit
@@ -1794,7 +1800,7 @@ folly::coro::Task<void> PeerManager::processNeighborRouteChangeLoop() noexcept {
 
 // peerAddr state (established/terminated) has changed, update non graceful
 // counter for peer_tag of this peer
-void PeerManager::updateNonGracefulCounters(
+void PeerManagerBase::updateNonGracefulCounters(
     const folly::IPAddress& peerAddr,
     bool isTerminated) noexcept {
   auto peerConfig = configManager_->getConfig()->getConfigOfAPeer(peerAddr);
@@ -1809,7 +1815,7 @@ void PeerManager::updateNonGracefulCounters(
   }
 }
 
-folly::coro::Task<void> PeerManager::waitForSessionTerminateBaton(
+folly::coro::Task<void> PeerManagerBase::waitForSessionTerminateBaton(
     const BgpPeerId& peerId) noexcept {
   /*
    * Wait till adjRib sees the terminate notification. This ensures that
@@ -1862,7 +1868,7 @@ folly::coro::Task<void> PeerManager::waitForSessionTerminateBaton(
   co_return;
 }
 
-folly::coro::Task<void> PeerManager::cleanupPeerState(
+folly::coro::Task<void> PeerManagerBase::cleanupPeerState(
     const BgpPeerId& peerId,
     const folly::IPAddress& peerAddr) noexcept {
   XLOGF(
@@ -1952,9 +1958,9 @@ folly::coro::Task<void> PeerManager::cleanupPeerState(
   co_return;
 }
 
-folly::coro::Task<void> PeerManager::sessionEstablished(
+folly::coro::Task<void> PeerManagerBase::sessionEstablished(
     FiberBgpPeer::ObservableStateT evt) noexcept {
-  ScopedProfile profile("PeerManager::sessionEstablished");
+  ScopedProfile profile("PeerManagerBase::sessionEstablished");
   const auto& peerId = evt.peerId;
   const auto& versionNumber = evt.versionNumber;
   const auto& sessionInfo = evt.sessionInfo;
@@ -2254,9 +2260,9 @@ folly::coro::Task<void> PeerManager::sessionEstablished(
   co_return;
 }
 
-folly::coro::Task<void> PeerManager::sessionTerminated(
+folly::coro::Task<void> PeerManagerBase::sessionTerminated(
     const FiberBgpPeer::ObservableStateT& evt) noexcept {
-  ScopedProfile profile("PeerManager::sessionTerminated");
+  ScopedProfile profile("PeerManagerBase::sessionTerminated");
   const auto& peerId = evt.peerId;
   const auto& peerAddr = peerId.peerAddr;
   const auto& versionNumber = evt.versionNumber;
@@ -2364,7 +2370,8 @@ folly::coro::Task<void> PeerManager::sessionTerminated(
   co_return;
 }
 
-void PeerManager::notifyRibInitialPathComputation(bool timerFired) noexcept {
+void PeerManagerBase::notifyRibInitialPathComputation(
+    bool timerFired) noexcept {
   if (ribInitPathComputationNotified_) {
     XLOG(INFO, "Rib already notified about best-path start");
     return;
@@ -2404,7 +2411,7 @@ void PeerManager::notifyRibInitialPathComputation(bool timerFired) noexcept {
           *configManager_->getConfig()->getConfig().eor_time_s()));
 }
 
-void PeerManager::processPeerEoR(
+void PeerManagerBase::processPeerEoR(
     const nettools::bgplib::BgpPeerId& peerId) noexcept {
   XLOGF(INFO, "Process EoR from {}", peerId.str());
 
@@ -2448,7 +2455,7 @@ void PeerManager::processPeerEoR(
   checkAndNotifyAllEoRReceived();
 }
 
-void PeerManager::checkAndNotifyAllEoRReceived() noexcept {
+void PeerManagerBase::checkAndNotifyAllEoRReceived() noexcept {
   if (allPeerEorsReceived_) {
     // Already observed once; skip O(N) recomputation.
     return;
@@ -2476,7 +2483,7 @@ void PeerManager::checkAndNotifyAllEoRReceived() noexcept {
   maybeNotifyRibInitialPathComputation();
 }
 
-void PeerManager::handleRibOutNexthopResolutionReceived() noexcept {
+void PeerManagerBase::handleRibOutNexthopResolutionReceived() noexcept {
   if (nexthopResolutionReceived_) {
     // Defensive: RIB only pushes this signal once per daemon lifetime, but
     // tolerate repeats.
@@ -2490,7 +2497,7 @@ void PeerManager::handleRibOutNexthopResolutionReceived() noexcept {
   maybeNotifyRibInitialPathComputation();
 }
 
-void PeerManager::maybeNotifyRibInitialPathComputation() noexcept {
+void PeerManagerBase::maybeNotifyRibInitialPathComputation() noexcept {
   if (ribInitPathComputationNotified_) {
     return;
   }
@@ -2506,7 +2513,7 @@ void PeerManager::maybeNotifyRibInitialPathComputation() noexcept {
   notifyRibInitialPathComputation(/*timerFired=*/false);
 }
 
-void PeerManager::maybeMarkInitialized() noexcept {
+void PeerManagerBase::maybeMarkInitialized() noexcept {
   if (initialized_) {
     return;
   }
@@ -2564,7 +2571,7 @@ void PeerManager::maybeMarkInitialized() noexcept {
       eorTimerExpired_ ? " (EoR Timer Expired)" : "");
 }
 
-void PeerManager::processEgressEoR(
+void PeerManagerBase::processEgressEoR(
     const nettools::bgplib::BgpPeerId& peerId) noexcept {
   XLOGF(INFO, "Process EgressEoR towards {}", peerId.str());
 
@@ -2604,7 +2611,7 @@ void PeerManager::processEgressEoR(
   maybeMarkInitialized();
 }
 
-void PeerManager::processTriggerSafeMode() noexcept {
+void PeerManagerBase::processTriggerSafeMode() noexcept {
   XLOG(INFO, "Process TriggerSafeMode message");
   // write the safemode file
   try {
@@ -2622,7 +2629,7 @@ void PeerManager::processTriggerSafeMode() noexcept {
       &evb_, startAdjRibReEvaluationRoutine(RibPauseResumeCause::SAFE_MODE)));
 }
 
-bool PeerManager::checkAllEoRSent() {
+bool PeerManagerBase::checkAllEoRSent() {
   bool isAllEoRSent = true;
   for (const auto& [peerAddr, eoR] : staticPeerEoRReceived_) {
     if (!eoR.first) {
@@ -2662,12 +2669,12 @@ bool PeerManager::checkAllEoRSent() {
  * @brief  RibDumpReq is successful only when RIB has a confirmed state that
  *         conveys fib sync is done. This state in RIB is initialEorSent_.
  *         When RIB has finished enqueuing the last announcement from the
- *         initial Fib sync, PeerManager will eventually dequeue it and set
+ *         initial Fib sync, PeerManagerBase will eventually dequeue it and set
  *         ribInitialAnnouncementDone_ to true.
  *
  * @return bool
  */
-bool PeerManager::isRibInitialAnnouncementStart() {
+bool PeerManagerBase::isRibInitialAnnouncementStart() {
   return ribInitialAnnouncementStarted_;
 }
 
@@ -2682,7 +2689,7 @@ bool PeerManager::isRibInitialAnnouncementStart() {
  * The peer address is set to localhost (::1)
  */
 std::pair<folly::IPAddress, std::unique_ptr<PeeringParams>>
-PeerManager::getStreamPeeringParams() {
+PeerManagerBase::getStreamPeeringParams() {
   // Use localhost as the peer address for stream subscribers
   auto peerAddr = folly::IPAddress("::1");
   auto peeringParams = std::make_unique<PeeringParams>();
@@ -2718,7 +2725,7 @@ PeerManager::getStreamPeeringParams() {
  *
  * @params subscriber  StreamSubscriber handle
  */
-void PeerManager::resetSubscriberAdjRib(StreamSubscriber& subscriber) {
+void PeerManagerBase::resetSubscriberAdjRib(StreamSubscriber& subscriber) {
   // Sent stop signal to corresponding AdjRib
   subscriber.peerOutputQ->forcePush(FiberBgpPeer::BgpSessionStop{false});
 
@@ -2753,7 +2760,7 @@ void PeerManager::resetSubscriberAdjRib(StreamSubscriber& subscriber) {
  * @params subscriber  StreamSubscriber handle
  * @params adjRib      subscriber related adjRib
  */
-void PeerManager::setSubscriberAdjRib(
+void PeerManagerBase::setSubscriberAdjRib(
     StreamSubscriber& subscriber,
     std::shared_ptr<AdjRib>& adjRib) {
   auto addPathCapa = nettools::bgplib::BgpAddPathSendRec::SEND;
@@ -2790,7 +2797,7 @@ void PeerManager::setSubscriberAdjRib(
  * @params subscriberName  string name of a subscriber
  * @params publisherId     unique id assigned when subscriber was created
  */
-void PeerManager::cancelSubscriberStream(
+void PeerManagerBase::cancelSubscriberStream(
     nettools::bgplib::BgpPeerId peerId,
     const std::string& subscriberName,
     uint32_t publisherId) {
@@ -2825,7 +2832,7 @@ void PeerManager::cancelSubscriberStream(
  *
  * @return Number of established subscriber sessions.
  */
-uint32_t PeerManager::numStreamSubscribers(void) {
+uint32_t PeerManagerBase::numStreamSubscribers(void) {
   uint32_t establishedSessions = 0;
   for (const auto& [subscriberName, subscriber] : streamSubscribers_) {
     if (subscriber.state == TBgpPeerState::ESTABLISHED) {
@@ -2842,7 +2849,7 @@ uint32_t PeerManager::numStreamSubscribers(void) {
  * @return true if the number of established stream peers exceeds the stream
  * subscriber limit, false otherwise.
  */
-bool PeerManager::exceedsStreamSubscriberLimit() {
+bool PeerManagerBase::exceedsStreamSubscriberLimit() {
   auto globalConfig = configManager_->getConfig()->getBgpGlobalConfig();
 
   // If subscriber limit is not set, treat limit as infinite.
@@ -2852,7 +2859,7 @@ bool PeerManager::exceedsStreamSubscriberLimit() {
   return numStreamSubscribers() >= globalConfig->streamSubscriberLimit;
 }
 
-apache::thrift::ServerStream<TBgpRouteDelta> PeerManager::subscribe(
+apache::thrift::ServerStream<TBgpRouteDelta> PeerManagerBase::subscribe(
     const std::unique_ptr<std::string>& subscriberName_p) {
   std::unique_ptr<apache::thrift::ServerStream<TBgpRouteDelta>> result_stream{
       nullptr};
@@ -3045,7 +3052,7 @@ apache::thrift::ServerStream<TBgpRouteDelta> PeerManager::subscribe(
  *
  * @return std::string
  */
-std::string PeerManager::buildAdjRibOutGroupName(
+std::string PeerManagerBase::buildAdjRibOutGroupName(
     const nettools::bgplib::BgpPeerId& peerId,
     const PeeringParams& peeringParams) noexcept {
   if (peeringParams.peerGroupName.has_value()) {
@@ -3062,7 +3069,7 @@ std::string PeerManager::buildAdjRibOutGroupName(
  *
  * @return std::shared_ptr<AdjRibOutGroup>
  */
-std::shared_ptr<AdjRibOutGroup> PeerManager::findAdjRibOutGroup(
+std::shared_ptr<AdjRibOutGroup> PeerManagerBase::findAdjRibOutGroup(
     const std::string& groupName) noexcept {
   auto match = adjRibOutGroups_.find(groupName);
   if (match == adjRibOutGroups_.cend()) {
@@ -3079,7 +3086,7 @@ std::shared_ptr<AdjRibOutGroup> PeerManager::findAdjRibOutGroup(
  *
  * @return std::shared_ptr<AdjRibOutGroup>
  */
-std::shared_ptr<AdjRibOutGroup> PeerManager::createAdjRibOutGroup(
+std::shared_ptr<AdjRibOutGroup> PeerManagerBase::createAdjRibOutGroup(
     const std::string& groupName) noexcept {
   std::shared_ptr<AdjRibOutGroup> adjRibOutGroup;
 
@@ -3090,7 +3097,7 @@ std::shared_ptr<AdjRibOutGroup> PeerManager::createAdjRibOutGroup(
   return adjRibOutGroup;
 }
 
-std::shared_ptr<AdjRib> PeerManager::createAdjRib(
+std::shared_ptr<AdjRib> PeerManagerBase::createAdjRib(
     const BgpPeerId& peerId,
     const PeeringParams& peeringParams) noexcept {
   std::shared_ptr<AdjRib> adjRib;
@@ -3130,7 +3137,7 @@ std::shared_ptr<AdjRib> PeerManager::createAdjRib(
   return adjRib;
 }
 
-std::shared_ptr<AdjRib> PeerManager::findAdjRib(
+std::shared_ptr<AdjRib> PeerManagerBase::findAdjRib(
     const BgpPeerId& peerId) noexcept {
   auto match = adjRibs_.find(peerId);
   if (match == adjRibs_.cend()) {
@@ -3147,7 +3154,7 @@ std::shared_ptr<AdjRib> PeerManager::findAdjRib(
  *
  * @return True if the peer is dynamic, false otherwise.
  */
-bool PeerManager::isPeerDynamic(const folly::IPAddress& peerAddr) {
+bool PeerManagerBase::isPeerDynamic(const folly::IPAddress& peerAddr) {
   auto dynamicPeerToConfigs =
       configManager_->getConfig()->getDynamicPeerToConfig();
 
@@ -3160,7 +3167,7 @@ bool PeerManager::isPeerDynamic(const folly::IPAddress& peerAddr) {
   return false;
 }
 
-folly::coro::Task<void> PeerManager::updatePeerCounters() {
+folly::coro::Task<void> PeerManagerBase::updatePeerCounters() {
   if (daemonShutdown_) {
     co_return;
   }
@@ -3190,7 +3197,7 @@ folly::coro::Task<void> PeerManager::updatePeerCounters() {
   PeerStats::setTotalPeerWithNoRouteExchange(establishedNoRoutePeers);
 }
 
-void PeerManager::setSessionManager(
+void PeerManagerBase::setSessionManager(
     std::shared_ptr<SessionManager> sessionManager) {
   if (sessionManager != nullptr) {
     if (sessionMgr_) {
@@ -3206,12 +3213,12 @@ void PeerManager::setSessionManager(
   }
 }
 
-void PeerManager::updateEntryStats(TEntryStats& stats) const noexcept {
+void PeerManagerBase::updateEntryStats(TEntryStats& stats) const noexcept {
   stats.total_adj_ribs() = adjRibs_.size();
   stats.total_shadow_rib_entries() = shadowRibEntries_.size();
 }
 
-void PeerManager::saveGrState() {
+void PeerManagerBase::saveGrState() {
   evb_.runImmediatelyOrRunInEventBaseThreadAndWait([this] {
     std::ofstream grFile;
 
@@ -3265,7 +3272,7 @@ void PeerManager::saveGrState() {
   });
 }
 
-void PeerManager::logEoRPeers(const bool isIngressEoR) noexcept {
+void PeerManagerBase::logEoRPeers(const bool isIngressEoR) noexcept {
   if (isIngressEoR) { // Case 1
     // Log static peer addresses of the pending ingress EoR
     std::vector<std::string> staticEorNotRcvdFrom;
@@ -3325,7 +3332,7 @@ void PeerManager::logEoRPeers(const bool isIngressEoR) noexcept {
   }
 }
 
-GrLoadResult PeerManager::readGrState() const noexcept {
+GrLoadResult PeerManagerBase::readGrState() const noexcept {
   std::string line;
   std::vector<std::string> lines;
   std::ifstream grFile;
@@ -3423,7 +3430,7 @@ GrLoadResult PeerManager::readGrState() const noexcept {
   };
 }
 
-void PeerManager::setRouteFilterPolicy(
+void PeerManagerBase::setRouteFilterPolicy(
     std::unique_ptr<RouteFilterPolicy> policy,
     bool forceUpdate) noexcept {
   evb_.runInEventBaseThread([policy = std::move(policy),
@@ -3502,7 +3509,7 @@ void PeerManager::setRouteFilterPolicy(
   });
 }
 
-void PeerManager::clearIngressEgressRouteFiltersPolicy() noexcept {
+void PeerManagerBase::clearIngressEgressRouteFiltersPolicy() noexcept {
   evb_.runInEventBaseThread([this]() mutable {
     std::vector<BgpPeerId> affectedAdjRibs;
     affectedAdjRibs.reserve(adjRibs_.size());
@@ -3522,7 +3529,7 @@ void PeerManager::clearIngressEgressRouteFiltersPolicy() noexcept {
   });
 }
 
-void PeerManager::clearGoldenPrefixesPolicy() noexcept {
+void PeerManagerBase::clearGoldenPrefixesPolicy() noexcept {
   goldenPrefixesPolicyActive_ = false;
   evb_.runInEventBaseThread([this]() mutable {
     std::vector<BgpPeerId> affectedAdjRibs;
@@ -3536,7 +3543,7 @@ void PeerManager::clearGoldenPrefixesPolicy() noexcept {
   });
 }
 
-void PeerManager::updateIngressEgressPolicyNames(
+void PeerManagerBase::updateIngressEgressPolicyNames(
     std::unique_ptr<PeerToPolicyMap> peerToPolicyNames) noexcept {
   evb_.runInEventBaseThread([peerToPolicyNames = std::move(peerToPolicyNames),
                              this]() mutable {
@@ -3603,7 +3610,7 @@ void PeerManager::updateIngressEgressPolicyNames(
   });
 }
 
-std::tuple<bool, bool> PeerManager::updateIngressEgressPolicyNamesForAdjRib(
+std::tuple<bool, bool> PeerManagerBase::updateIngressEgressPolicyNamesForAdjRib(
     std::shared_ptr<AdjRib> adjRib,
     const PeerToPolicyMap& peerToPolicyNames) noexcept {
   const auto& peeringParams = adjRib->getPeeringParams();
@@ -3624,7 +3631,7 @@ std::tuple<bool, bool> PeerManager::updateIngressEgressPolicyNamesForAdjRib(
   return adjRib->updateIngressEgressPolicyNames(policyIt->second);
 }
 
-std::tuple<bool, bool> PeerManager::setRouteFilterStatement(
+std::tuple<bool, bool> PeerManagerBase::setRouteFilterStatement(
     std::shared_ptr<AdjRib> adjRib) noexcept {
   if (!adjRib) {
     return std::make_tuple(false, false);
@@ -3677,7 +3684,7 @@ std::tuple<bool, bool> PeerManager::setRouteFilterStatement(
   return adjRib->setRouteFilterStatement(nullptr);
 }
 
-bool PeerManager::setGoldenPrefixPolicy(
+bool PeerManagerBase::setGoldenPrefixPolicy(
     std::shared_ptr<AdjRib> adjRib,
     bool initializeAdjRib) noexcept {
   if (!adjRib) {
@@ -3699,19 +3706,19 @@ bool PeerManager::setGoldenPrefixPolicy(
   return adjRib->setGoldenPrefixPolicy(nullptr);
 }
 
-bool PeerManager::getIsInitialized() const {
+bool PeerManagerBase::getIsInitialized() const {
   return initialized_;
 }
 
-bool PeerManager::getIsSafeModeOn() const {
+bool PeerManagerBase::getIsSafeModeOn() const {
   return *isSafeModeOn_;
 }
 
-bool PeerManager::getIsGoldenPrefixPolicyActive() const {
+bool PeerManagerBase::getIsGoldenPrefixPolicyActive() const {
   return goldenPrefixesPolicyActive_;
 }
 
-void PeerManager::removeSafeModeFile() {
+void PeerManagerBase::removeSafeModeFile() {
   try {
     if (boost::filesystem::exists(FLAGS_safemode_file)) {
       boost::filesystem::remove(FLAGS_safemode_file);
@@ -3727,9 +3734,9 @@ void PeerManager::removeSafeModeFile() {
   return;
 }
 
-folly::coro::Task<void> PeerManager::startAdjRibReEvaluationRoutine(
+folly::coro::Task<void> PeerManagerBase::startAdjRibReEvaluationRoutine(
     RibPauseResumeCause cause) {
-  ScopedProfile profile("PeerManager::startAdjRibReEvaluationRoutine");
+  ScopedProfile profile("PeerManagerBase::startAdjRibReEvaluationRoutine");
   XLOGF(
       INFO,
       "Starting AdjRib Re-evaluation for {}",
@@ -3781,7 +3788,7 @@ folly::coro::Task<void> PeerManager::startAdjRibReEvaluationRoutine(
   co_await ribInQ_.push(ResumeBestPathAndFibProgramming(cause));
 }
 
-folly::coro::Task<void> PeerManager::processAdjRibReEvaluationTask(
+folly::coro::Task<void> PeerManagerBase::processAdjRibReEvaluationTask(
     std::shared_ptr<AdjRib> adjRib,
     RibPauseResumeCause cause,
     bool policyUpdate) {
@@ -3801,7 +3808,8 @@ folly::coro::Task<void> PeerManager::processAdjRibReEvaluationTask(
   co_return;
 }
 
-folly::coro::Task<void> PeerManager::startPeriodicPolicyCacheEvictionRoutine() {
+folly::coro::Task<void>
+PeerManagerBase::startPeriodicPolicyCacheEvictionRoutine() {
   XLOG(INFO, "Starting Periodic Policy Cache Eviction");
   while (true) {
     // when cancelAndJoinAsync is called, loop will be broken to exit
@@ -3819,7 +3827,8 @@ folly::coro::Task<void> PeerManager::startPeriodicPolicyCacheEvictionRoutine() {
   }
 }
 
-folly::coro::Task<void> PeerManager::startPeriodicUpdatePeerCountersRoutine() {
+folly::coro::Task<void>
+PeerManagerBase::startPeriodicUpdatePeerCountersRoutine() {
   XLOG(DBG1, "Start Counter Update Loop");
   while (true) {
     // when cancelAndJoinAsync is called, loop will be broken to exit
@@ -3867,7 +3876,7 @@ void publishDeduplicatedAttributesSizes() {
  * CancellableAsyncScope.
  */
 folly::coro::Task<void>
-PeerManager::periodicEvictFromDeduplicatorLoop() noexcept {
+PeerManagerBase::periodicEvictFromDeduplicatorLoop() noexcept {
   void (*evictFunctions[])(void) = {
       nettools::bgplib::DeDuplicatedBgpAttributesC::
           evictDeletedEntriesFromDeduplicator,
@@ -3896,7 +3905,7 @@ PeerManager::periodicEvictFromDeduplicatorLoop() noexcept {
 }
 
 folly::F14NodeSet<std::shared_ptr<AdjRibOutGroup>>
-PeerManager::getPolicyReEvalPendingGroups() {
+PeerManagerBase::getPolicyReEvalPendingGroups() {
   folly::F14NodeSet<std::shared_ptr<AdjRibOutGroup>> affectedGroups;
   for (const auto& [peerId, adjRib] : adjRibs_) {
     if (adjRib->isEgressPolicyUpdateRequired() &&
@@ -3910,7 +3919,7 @@ PeerManager::getPolicyReEvalPendingGroups() {
   return affectedGroups;
 }
 
-void PeerManager::schedulePolicyReEvalForAdjRibs() {
+void PeerManagerBase::schedulePolicyReEvalForAdjRibs() {
   for (const auto& [peerId, adjRib] : adjRibs_) {
     if (adjRib->isEgressPolicyUpdateRequired() &&
         !adjRib->inInitialAnnouncement()) {
@@ -3930,7 +3939,7 @@ void PeerManager::schedulePolicyReEvalForAdjRibs() {
 }
 
 folly::coro::Task<void>
-PeerManager::processUpdateGroupsEgressPolicyReevaluation() {
+PeerManagerBase::processUpdateGroupsEgressPolicyReevaluation() {
   /*
    * Always clear the scheduled flag on exit -- normal completion, cancellation,
    * or an exception from any step below. Leaving it set would make
@@ -4128,7 +4137,7 @@ PeerManager::processUpdateGroupsEgressPolicyReevaluation() {
   co_return;
 }
 
-void PeerManager::handleEgressPolicyUpdate() {
+void PeerManagerBase::handleEgressPolicyUpdate() {
   XLOGF(INFO, "handleEgressPolicyUpdate called");
   if (enableUpdateGroup_) {
     /*
@@ -4147,7 +4156,7 @@ void PeerManager::handleEgressPolicyUpdate() {
   }
 }
 
-void PeerManager::distributeRibOutAnnouncementToAdjRibs(
+void PeerManagerBase::distributeRibOutAnnouncementToAdjRibs(
     const RibOutAnnouncement& announcement) {
   auto ribMsg = std::make_shared<const RibOutMessage>(announcement);
   for (const auto& [_, adjRib] : adjRibs_) {
@@ -4195,17 +4204,17 @@ void PeerManager::distributeRibOutAnnouncementToAdjRibs(
   }
 }
 
-folly::coro::Task<void> PeerManager::processRibDumpReqForEgressPolicyUpdate(
+folly::coro::Task<void> PeerManagerBase::processRibDumpReqForEgressPolicyUpdate(
     const nettools::bgplib::BgpPeerId& peerId,
     std::shared_ptr<AdjRib> adjRib) {
   co_await processRibDumpReqCoro(RibDumpReq(peerId, adjRib->sendAddPath()));
   adjRib->clearPendingEgressPolicyUpdate(); // Clear flag after completion
 }
 
-void PeerManager::processGroupEgressPolicyReEvaluation(
+void PeerManagerBase::processGroupEgressPolicyReEvaluation(
     std::shared_ptr<AdjRibOutGroup> group) {
   [[maybe_unused]] ScopedProfile profile(
-      "PeerManager::processGroupEgressPolicyReEvaluation");
+      "PeerManagerBase::processGroupEgressPolicyReEvaluation");
 
   XLOGF(
       INFO,
@@ -4257,7 +4266,8 @@ void PeerManager::processGroupEgressPolicyReEvaluation(
       group->getAdjRibGroupName());
 }
 
-folly::coro::Task<void> PeerManager::processIngressAndEgressRouteFilterUpdate(
+folly::coro::Task<void>
+PeerManagerBase::processIngressAndEgressRouteFilterUpdate(
     size_t ingressAffectedCount,
     size_t egressAffectedCount) {
   // Check if dynamic policy evaluation is enabled and there are adjRibs
@@ -4312,7 +4322,7 @@ folly::coro::Task<void> PeerManager::processIngressAndEgressRouteFilterUpdate(
 }
 
 std::vector<nettools::bgplib::BgpPeerId>
-PeerManager::triggerRouteRefreshRequestsForPeers(
+PeerManagerBase::triggerRouteRefreshRequestsForPeers(
     std::vector<nettools::bgplib::BgpPeerId> peerIds) {
   // Check if BGP is initialized
   if (!initialized_) {
@@ -4330,7 +4340,7 @@ PeerManager::triggerRouteRefreshRequestsForPeers(
   return failedPeerIds;
 }
 
-bool PeerManager::triggerRouteRefreshRequestForPeer(
+bool PeerManagerBase::triggerRouteRefreshRequestForPeer(
     const BgpPeerId& peerId) noexcept {
   auto peerIdAdjRib = adjRibs_.find(peerId);
   if (peerIdAdjRib == adjRibs_.cend()) {

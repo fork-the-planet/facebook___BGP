@@ -441,7 +441,7 @@ class RibFixture : public testing::Test {
   void resetFsdbSyncerState();
   bool isFsdbSyncerStarted() const;
   // True after RibBase::processNexthopResolutionUpdate has pushed the
-  // RibOutNexthopResolutionReceived signal to PeerManager (one-shot per
+  // RibOutNexthopResolutionReceived signal to PeerManagerBase (one-shot per
   // daemon lifetime).
   bool isFirstNdpSignalSent() const;
   void waitForFsdbPublisherConnected();

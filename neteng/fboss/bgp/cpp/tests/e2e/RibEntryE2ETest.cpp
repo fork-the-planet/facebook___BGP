@@ -20,7 +20,7 @@
  * E2E tests converted from RibEntryTest.cpp
  * Tests RIB entry behavior through complete BGP flows end-to-end
  * Mocked: FIB (TestFib), SessionManager (MockSessionManager)
- * Real: RIB, PeerManager, AdjRib
+ * Real: RIB, PeerManagerBase, AdjRib
  */
 
 #include <gtest/gtest.h>

@@ -145,7 +145,7 @@ folly::coro::Task<void> AdjRib::processPeerMessageLoop(
     logPeerEvent("SHUTDOWN_TERMINATE_BATON_POSTED", BGP_LOG_SRC());
 
     /* Post the terminate baton LAST to unblock
-     * PeerManager::sessionEstablished(). */
+     * PeerManagerBase::sessionEstablished(). */
     terminateBaton->post();
   };
 
@@ -795,7 +795,7 @@ folly::coro::Task<void> AdjRib::processPeerUpdate(
 
 folly::coro::Task<void> AdjRib::processPeerEoR(
     const nettools::bgplib::BgpEndOfRib& eor) noexcept {
-  // EoR is piped to AdjRib and then back to PeerManager to make sure
+  // EoR is piped to AdjRib and then back to PeerManagerBase to make sure
   // AdjRib has done processing updates from this peer
   XLOGF(
       DBG1,
@@ -1241,7 +1241,7 @@ bool AdjRib::dropPrefixForOverloadProtection(
     case thrift::OverloadProtectionMode::APPLY_GOLDEN_PREFIX_POLICY:
       if (exceededSwitchPrefixLimit && !isSafeModeOn()) {
         // Set safe mode on this peer's AdjRib and send TriggerSafeMode to
-        // PeerManager that saves a safe mode file and initiates the rest
+        // PeerManagerBase that saves a safe mode file and initiates the rest
         // of the safe mode purging process.
         // See http://fburl.com/bgp_safe_mode for more details
         setSafeModeOn();

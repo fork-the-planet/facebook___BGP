@@ -27,7 +27,7 @@ class E2ETestSessionManager;
  * through the real notifyCoroQueue pipeline via E2ETestSessionManager.
  *
  * Key difference from E2ETestFixture: bringUpPeer/bringDownPeer push
- * events through the coro queue, so PeerManager::processPeerEventLoop()
+ * events through the coro queue, so PeerManagerBase::processPeerEventLoop()
  * processes them asynchronously. Tests must call waitForSessionEstablished()
  * or use bringUpPeerAndWait() to ensure processing completes.
  */

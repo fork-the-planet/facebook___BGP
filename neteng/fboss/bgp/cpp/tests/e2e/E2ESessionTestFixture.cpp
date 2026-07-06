@@ -76,7 +76,7 @@ void E2ESessionTestFixture::createPeerManager(
     bool enableUpdateGroup,
     bool enableEgressBackpressure,
     bool enableSerializeGroupPdu) {
-  XLOG(INFO, "=== Creating PeerManager with E2ETestSessionManager... ===");
+  XLOG(INFO, "=== Creating PeerManagerBase with E2ETestSessionManager... ===");
 
   FLAGS_enable_egress_backpressure_in_peer_mgr_tests = enableEgressBackpressure;
 
@@ -96,19 +96,19 @@ void E2ESessionTestFixture::createPeerManager(
         std::make_shared<PolicyManager>(*policyConfig_, globalConfig.get());
   }
 
-  peerManager_ = std::make_unique<PeerManager>(
+  peerManager_ = std::make_unique<PeerManagerBase>(
       configManager, policyManager, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   peerManager_->setSessionManager(testSessionManager_);
 
   peerMgrThread_ = std::thread([this]() {
-    XLOG(INFO, "PeerManager thread started (E2ETestSessionManager)");
+    XLOG(INFO, "PeerManagerBase thread started (E2ETestSessionManager)");
     peerManager_->run();
-    XLOG(INFO, "PeerManager thread exiting");
+    XLOG(INFO, "PeerManagerBase thread exiting");
   });
 
   peerManager_->getEventBase().waitUntilRunning();
-  XLOG(INFO, "PeerManager running with E2ETestSessionManager");
+  XLOG(INFO, "PeerManagerBase running with E2ETestSessionManager");
 }
 
 void E2ESessionTestFixture::bringUpPeer(
@@ -212,19 +212,19 @@ bool E2ESessionTestFixture::waitForSessionEstablished(
   BgpPeerId peerId{peerAddr, peerAddr.asV4().toLongHBO()};
 
   /*
-   * Poll until PeerManager has processed the ESTABLISHED event.
-   * We check by running a task on the PeerManager's EVB — if the
+   * Poll until PeerManagerBase has processed the ESTABLISHED event.
+   * We check by running a task on the PeerManagerBase's EVB — if the
    * EVB is processing our check, it has already processed any
    * earlier events in the queue (events are processed in order).
    * Then we verify the peer's queues have been registered by checking
-   * testSessionManager's state matches what PeerManager would have used.
+   * testSessionManager's state matches what PeerManagerBase would have used.
    */
   for (int i = 0; i < maxRetries; i++) {
     bool processed = false;
     auto& evb = peerManager_->getEventBase();
     evb.runInEventBaseThreadAndWait([&]() {
       /*
-       * If we're executing on the PeerManager EVB, all prior events
+       * If we're executing on the PeerManagerBase EVB, all prior events
        * (including the ESTABLISHED event) have been processed.
        * The session event was pushed to notifyCoroQueue, which is
        * drained by processPeerEventLoop on this same EVB thread.
@@ -255,7 +255,7 @@ bool E2ESessionTestFixture::waitForSessionTerminated(
     const folly::IPAddress& peerAddr,
     int /*maxRetries*/) {
   /*
-   * Drain the PeerManager EVB twice to ensure the TERMINATED event
+   * Drain the PeerManagerBase EVB twice to ensure the TERMINATED event
    * has been fully processed. The first drain ensures the event is
    * dequeued, the yield + second drain ensures any follow-up work
    * (like AdjRib cleanup) completes.

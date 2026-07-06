@@ -18,7 +18,7 @@
  * E2E tests for route selection based on AS Path length.
  *
  * Mocked: FIB (TestFib), SessionManager (MockSessionManager)
- * Real: RIB, PeerManager, AdjRib, RouteInfoSelector
+ * Real: RIB, PeerManagerBase, AdjRib, RouteInfoSelector
  */
 
 #include <gtest/gtest.h>

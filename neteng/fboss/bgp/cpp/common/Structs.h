@@ -104,7 +104,7 @@ struct NeighborEventMsg {
 
 struct NeighborReachabilityMsg {};
 
-// used for communication between NeighborWatcher and PeerManager
+// used for communication between NeighborWatcher and PeerManagerBase
 using NeighborWatcherMessage =
     std::variant<NeighborEventMsg, NeighborReachabilityMsg>;
 

@@ -251,9 +251,9 @@ namespace facebook {
 namespace bgp {
 
 namespace {
-// Helper to replicate getBgpSummary() via the split sessionMgr + PeerManager
-// pattern
-std::vector<TBgpSession> getSessionsViaSessionMgr(PeerManager& peerMgr) {
+// Helper to replicate getBgpSummary() via the split sessionMgr +
+// PeerManagerBase pattern
+std::vector<TBgpSession> getSessionsViaSessionMgr(PeerManagerBase& peerMgr) {
   auto allPeers = folly::coro::blockingWait(
       peerMgr.getSessionManager()->co_getAllPeerDisplayInfos());
   return peerMgr.getSessionInfos(allPeers);
@@ -315,7 +315,7 @@ TEST_F(PeerManagerTestFixture, SharedAdjRibOutGroupNameTest) {
   auto globalConfig = config->getBgpGlobalConfig();
 
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager,
       nullptr,
       ribInQ_, /* write to the queue */
@@ -324,7 +324,7 @@ TEST_F(PeerManagerTestFixture, SharedAdjRibOutGroupNameTest) {
   auto localSessionMgr = std::make_shared<SessionManager>(
       *globalConfig,
       false, /* enableMessagesOverNotifyQueue */
-      true); /* enableCoroNotifyQueue - required for PeerManager's
+      true); /* enableCoroNotifyQueue - required for PeerManagerBase's
                 processPeerEventLoop */
   peerMgr->setSessionManager(localSessionMgr);
 
@@ -372,11 +372,12 @@ TEST_F(PeerManagerTestFixture, SharedAdjRibOutGroupNameTest) {
       EXPECT_TRUE(callback2_.isSessionUp(kLocalPeerId1));
       EXPECT_TRUE(callback3_.isSessionUp(kLocalPeerId1));
 
-      // Wait for PeerManager to establish sessions (create adjRibs).
+      // Wait for PeerManagerBase to establish sessions (create adjRibs).
       // Sessions are established asynchronously via asyncScope_, so we need
       // to wait for them to complete before calling stop().
       // Use a timeout to avoid infinite loops if something goes wrong.
-      // Access adjRibs_ via the PeerManager's event base to avoid data races.
+      // Access adjRibs_ via the PeerManagerBase's event base to avoid data
+      // races.
       int waitCount = 0;
       constexpr int maxWait = 500; // 5 seconds max (500 * 10ms)
       size_t adjRibsSize = 0;
@@ -431,7 +432,7 @@ TEST_F(PeerManagerTestFixture, SharedAdjRibOutGroupNameTest) {
           tcData->getCounter(BgpStats::kAdjRibOutGroupsCount));
 
       // Verify ODS counter still matches establishedGrPeers_ size
-      // (decrement doesn't happen here because PeerManager's event base
+      // (decrement doesn't happen here because PeerManagerBase's event base
       // stops before sessionTerminated() callbacks are delivered)
       tcData->publishStats();
       EXPECT_EQ(
@@ -477,7 +478,7 @@ TEST_F(PeerManagerTestFixture, SharedAdjRibOutGroupNameTest) {
   facebook::bgp::test::boundedBatonWait(
       stopPeerBaton, "stopPeerBaton", facebook::bgp::test::kDefaultPopTimeout);
   /*
-   * stop sessions by shutting down PeerManager
+   * stop sessions by shutting down PeerManagerBase
    */
   peerMgr->markDaemonShutdown();
   localSessionMgr->stop();
@@ -601,7 +602,7 @@ TEST_F(PeerManagerTestFixture, AdjRibOutGroupPeerEntriesTest) {
     EXPECT_EQ(0, adjRib1->getRibTreePeerEntriesCount(false, false));
     EXPECT_EQ(0, adjRib2->getRibTreePeerEntriesCount(false, false));
 
-    // Stop PeerManager
+    // Stop PeerManagerBase
     fiberSleepFor(10ms);
     peerMgr->markDaemonShutdown();
     sessionMgr->stop();
@@ -713,7 +714,7 @@ TEST_F(PeerManagerTestFixture, AdjRibOutGroupAddPathPeerEntriesTest) {
     EXPECT_EQ(0, adjRib1->getRibTreePeerEntriesCount(false, true));
     EXPECT_EQ(0, adjRib2->getRibTreePeerEntriesCount(false, true));
 
-    // Stop PeerManager
+    // Stop PeerManagerBase
     fiberSleepFor(10ms);
     peerMgr->stop();
   });
@@ -803,7 +804,7 @@ TEST_F(PeerManagerTestFixture, ThriftStreamSubscribePreInitializationTest) {
   // i.e, Rib, AdjRib, SessionManager
   auto config = getConfig(false, false, true /* include BgpMonitorPeer */);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
   auto& evb = peerMgr->getEventBase();
 
@@ -1369,7 +1370,7 @@ TEST_F(PeerManagerTestFixture, ShutdownPeerMsgTest) {
     folly::coro::blockingWait(
         mockPeerMgr->processAdjRibEvent(std::move(shutDownMsgFromStaticPeer1)));
 
-    // stop PeerManager
+    // stop PeerManagerBase
     mockPeerMgr->stop();
     mockSessionMgr->stop();
     sessionMgrThread.join();
@@ -1618,7 +1619,7 @@ TEST_F(PeerManagerTestFixture, StatefulGrTest4) {
 }
 
 /**
- * Verifies that PeerManager does not wait for peers from the previous
+ * Verifies that PeerManagerBase does not wait for peers from the previous
  * incarnation when NeighborWatcher reports a neighbor as down. Additionally,
  * this test ensures that other processing, such as purging stale routes, is
  * not impacted.
@@ -1718,7 +1719,7 @@ TEST_F(PeerManagerTestFixture, StatefulGrConvergenceTest) {
     }
 
     /*
-     * Stop PeerManager — cancel local coroutines before stop() since
+     * Stop PeerManagerBase — cancel local coroutines before stop() since
      * stop() terminates the evb and coroutines can't process cancellation
      * on a dead event loop.
      */
@@ -1838,7 +1839,7 @@ TEST_F(PeerManagerTestFixture, StatefulGrConvergenceTestWithNoGrNeighbor) {
     }
 
     /*
-     * Stop PeerManager — cancel local coroutines before stop() since
+     * Stop PeerManagerBase — cancel local coroutines before stop() since
      * stop() terminates the evb and coroutines can't process cancellation
      * on a dead event loop.
      */
@@ -1982,7 +1983,7 @@ TEST_F(PeerManagerTestFixture, StatefulGrConvergenceTestWithNoGrNeighbor2) {
     EXPECT_TRUE(peerMgr->initialized_);
 
     /*
-     * Stop PeerManager — cancel local coroutines before stop() since
+     * Stop PeerManagerBase — cancel local coroutines before stop() since
      * stop() terminates the evb and coroutines can't process cancellation
      * on a dead event loop.
      */
@@ -2694,7 +2695,7 @@ TEST_F(PeerManagerTestFixture, GetAttributeStatsTest) {
       adjRib2->adjRibInLiteTree_.clear();
     }
 
-    // stop PeerManager
+    // stop PeerManagerBase
     fiberSleepFor(10ms);
     peerMgr->stop();
   });
@@ -3246,7 +3247,7 @@ TEST_F(PeerManagerTestFixture, NeighborReachabilityMsgNoGrTest) {
     EXPECT_TRUE(messages[1].first.getMessage().starts_with("Stopping peer:"));
 
     // Remove test log handler before concurrent shutdown to avoid TSAN race
-    // between main thread (PeerManager::stop -> logEoRPeers) and session
+    // between main thread (PeerManagerBase::stop -> logEoRPeers) and session
     // manager thread (FiberBgpPeerManager shutdown logging).
     folly::LoggerDB::get().getCategory("")->clearHandlers();
 
@@ -3358,7 +3359,7 @@ TEST_F(PeerManagerTestFixture, NeighborReachabilityMsgWithGrTest) {
             "Stopping peer while peer in GR state:"));
 
     // Remove test log handler before concurrent shutdown to avoid TSAN race
-    // between main thread (PeerManager::stop -> logEoRPeers) and session
+    // between main thread (PeerManagerBase::stop -> logEoRPeers) and session
     // manager thread (FiberBgpPeerManager shutdown logging).
     folly::LoggerDB::get().getCategory("")->clearHandlers();
 
@@ -3384,7 +3385,7 @@ TEST_F(PeerManagerTestFixture, NeighborReachabilityMsgWithGrTest) {
 
 /*
  * 1. Verify that different AdjRibs get their matching router filter statements.
- * 2. Verify that PeerManager sends RibDumpReqs for AdjRibs that receive a
+ * 2. Verify that PeerManagerBase sends RibDumpReqs for AdjRibs that receive a
  *    different route filter statement.
  * 3. Verify that AdjRib receiving the same statement is a no-op.
  * 4. Verify that ALL AdjRibs get the same golden prefix policy.
@@ -3404,7 +3405,7 @@ TEST_F(PeerManagerTestFixture, SetRouteFilterPolicyTest) {
       true /* enable switch level limit */,
       true /* enable golden prefixes policy */);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto globalConfig = config->getBgpGlobalConfig();
@@ -3613,7 +3614,7 @@ TEST_F(PeerManagerTestFixture, SetRouteFilterPolicyVersionCheckTest) {
       true /* enable switch level limit */,
       true /* enable golden prefixes policy */);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto globalConfig = config->getBgpGlobalConfig();
@@ -3745,7 +3746,7 @@ TEST_F(PeerManagerTestFixture, SetRouteFilterPolicyForceUpdateTest) {
       true /* enable switch level limit */,
       true /* enable golden prefixes policy */);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto globalConfig = config->getBgpGlobalConfig();
@@ -3873,7 +3874,7 @@ TEST_F(
       false /* enable switch level limit */,
       false /* enable golden prefixes policy */);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto globalConfig = config->getBgpGlobalConfig();
@@ -3995,7 +3996,7 @@ TEST_F(
   // Enable dynamic policy evaluation
   SetUp(true /* enableDynamicPolicyEvaluation */);
   auto configManager = std::make_shared<ConfigManager>(config_);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto globalConfig = config_->getBgpGlobalConfig();
@@ -4225,7 +4226,7 @@ TEST_F(
   // Enable dynamic policy evaluation
   SetUp(true /* enableDynamicPolicyEvaluation */);
   auto configManager = std::make_shared<ConfigManager>(config_);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto globalConfig = config_->getBgpGlobalConfig();
@@ -4392,7 +4393,7 @@ TEST_F(
   // Enable dynamic policy evaluation
   SetUp(true /* enableDynamicPolicyEvaluation */);
   auto configManager = std::make_shared<ConfigManager>(config_);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto globalConfig = config_->getBgpGlobalConfig();
@@ -4602,7 +4603,7 @@ TEST_F(PeerManagerTestFixture, GoldenPrefixesPolicyStatusTestDropMode) {
       true /* enable switch level limit */,
       false /* disable golden prefixes policy */);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto globalConfig = config->getBgpGlobalConfig();
@@ -4685,7 +4686,7 @@ TEST_F(PeerManagerTestFixture, GoldenPrefixesPolicyStatusTestSwitchLimitUnset) {
       false,
       false /* disable switch level limit*/);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto globalConfig = config->getBgpGlobalConfig();
@@ -4855,7 +4856,7 @@ TEST_F(PeerManagerTestFixture, PolicyCachePeriodicEvictionTest) {
     EXPECT_EQ(0, policyCache->size());
 
     /*
-     * Stop PeerManager — cancel local coroutines before stop() since
+     * Stop PeerManagerBase — cancel local coroutines before stop() since
      * stop() terminates the evb and coroutines can't process cancellation
      * on a dead event loop.
      */
@@ -4876,7 +4877,7 @@ class SafeModeTestFixture : public PeerManagerTestFixture,
                             public testing::WithParamInterface<bool> {};
 
 // When a new AdjRib is created, verify that it gets the golden prefix policy
-// from PeerManager.
+// from PeerManagerBase.
 TEST_P(SafeModeTestFixture, InitializeAdjRibWithGoldenPrefixPolicy) {
   auto mockPeerMgr = setupMockPeerManager(
       true /* includeStaticPeer */,
@@ -4941,16 +4942,16 @@ INSTANTIATE_TEST_SUITE_P(
     SafeModeTestFixture,
     testing::Bool() /* isSafeModeOn */);
 
-// Verify that PeerManager clear the Ingress Egress Route Filter statements in
-// each adjrib, and trigger RIB Dump
+// Verify that PeerManagerBase clear the Ingress Egress Route Filter statements
+// in each adjrib, and trigger RIB Dump
 TEST_F(PeerManagerTestFixture, ClearIngressEgressRouteFiltersPolicyTest) {
   auto config = getConfig(true, true);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto globalConfig = config->getBgpGlobalConfig();
-  // attach sessionMgr just to allow PeerManager to run
+  // attach sessionMgr just to allow PeerManagerBase to run
   auto sessionMgr = std::make_shared<SessionManager>(*globalConfig, false);
   peerMgr->setSessionManager(sessionMgr);
 
@@ -5008,17 +5009,17 @@ TEST_F(PeerManagerTestFixture, ClearIngressEgressRouteFiltersPolicyTest) {
   SUCCEED();
 }
 
-// Verify that PeerManager clear the Golden Prefixes policy in
+// Verify that PeerManagerBase clear the Golden Prefixes policy in
 // each adjrib.
 TEST_F(PeerManagerTestFixture, ClearGoldenPrefixesPolicyTest) {
   auto config =
       getConfig(true, true, false, false, false, false /* enableVipService */);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto globalConfig = config->getBgpGlobalConfig();
-  // just to allow PeerManager to start
+  // just to allow PeerManagerBase to start
   auto sessionMgr = std::make_shared<SessionManager>(*globalConfig, false);
   peerMgr->setSessionManager(sessionMgr);
 
@@ -5108,7 +5109,7 @@ TEST_F(PeerManagerTestFixture, DisableScubaLoggingTest) {
   auto config =
       getConfig(true, true, false, false, false, false /* enableVipService */);
   auto configManager = std::make_shared<ConfigManager>(config);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto globalConfig = config->getBgpGlobalConfig();
@@ -5411,7 +5412,7 @@ TEST_F(PeerManagerTestFixture, TriggerSafeModeMsgTest) {
     ASSERT_TRUE(
         std::holds_alternative<ResumeBestPathAndFibProgramming>(ribInQItem1));
 
-    // Stop PeerManager
+    // Stop PeerManagerBase
     fiberSleepFor(10ms);
     peerMgr->stop();
   });
@@ -5460,7 +5461,7 @@ TEST_F(PeerManagerTestFixture, RemoveSafeModeFileTest) {
     peerMgr->removeSafeModeFile();
     // Verify safe mode file is removed
     EXPECT_FALSE(boost::filesystem::exists(FLAGS_safemode_file));
-    // Stop PeerManager
+    // Stop PeerManagerBase
     fiberSleepFor(200ms);
     peerMgr->stop();
   });
@@ -5841,15 +5842,16 @@ TEST_F(PeerManagerTestFixture, WaitForSessionTerminateBatonTest) {
   auto sessionTerminateBaton = std::make_shared<folly::coro::Baton>();
   mockPeerMgr->sessionTerminateBatons_[kPeerId] = sessionTerminateBaton;
 
-  // Scope the subscription to the PeerManager log category. PeerManager.cpp
-  // has no XLOG_SET_CATEGORY_NAME, so its XLOGF messages land in the
-  // path-derived category below. Subscribing to the root ("") instead captured
-  // stray DBG1 logs emitted by other components active during the wait, which
-  // made messages.size() exceed 2 and shifted the expected ordering (observed
-  // ~20/300 failures, all with size == 3). This matches the scoping the other
-  // PeerManager log-assertion tests in this file already use.
+  // Scope the subscription to the PeerManagerBase log category.
+  // PeerManagerBase.cpp has no XLOG_SET_CATEGORY_NAME, so its XLOGF messages
+  // land in the path-derived category below. Subscribing to the root ("")
+  // instead captured stray DBG1 logs emitted by other components active during
+  // the wait, which made messages.size() exceed 2 and shifted the expected
+  // ordering (observed ~20/300 failures, all with size == 3). This matches the
+  // scoping the other PeerManagerBase log-assertion tests in this file already
+  // use.
   auto& messages = subscribeToLogMessages(
-      "neteng.fboss.bgp.cpp.peer.PeerManager", folly::LogLevel::DBG1);
+      "neteng.fboss.bgp.cpp.peer.PeerManagerBase", folly::LogLevel::DBG1);
 
   // Drive the coroutine under test on a ManualExecutor on THIS thread. This
   // keeps all logging on a single thread (TestLogHandler is not thread-safe)
@@ -5949,7 +5951,7 @@ TEST_F(
        "egress_policy_v4"});
 
   auto configManager = std::make_shared<ConfigManager>(config_);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, policyManager, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto globalConfig = config_->getBgpGlobalConfig();
@@ -6065,7 +6067,7 @@ TEST_F(
 
   // Create policy name map keyed by peer IP addresses.
   // BgpServiceBase is now responsible for resolving group → per-peer
-  // policies, so PeerManager receives per-peer maps.
+  // policies, so PeerManagerBase receives per-peer maps.
   std::string peerAddr1 = adjRib1->peeringParams_.peerAddr.str(); // 1.1.1.1
   std::string peerAddr2 = adjRib2->peeringParams_.peerAddr.str(); // 2.2.2.2
   std::string peerAddr4 = adjRib4->peeringParams_.peerAddr.str(); // 127.4.0.1
@@ -6199,7 +6201,7 @@ TEST_F(
        "egress_policy_peer2"});
 
   auto configManager = std::make_shared<ConfigManager>(config_);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, policyManager, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto globalConfig = config_->getBgpGlobalConfig();
@@ -6278,8 +6280,8 @@ TEST_F(
   auto sessionMgrThread = sessionMgr->runInThread();
 
   // Create policy name map for IP addresses
-  // Use the actual peerAddr from AdjRib peeringParams to match PeerManager's
-  // matchKey logic
+  // Use the actual peerAddr from AdjRib peeringParams to match
+  // PeerManagerBase's matchKey logic
   std::string peerAddr1 = adjRib1->peeringParams_.peerAddr.str();
   std::string peerAddr2 = adjRib2->peeringParams_.peerAddr.str();
 
@@ -6374,7 +6376,7 @@ TEST_F(
   // empty maps)
   auto policyManager = setupPolicyManagerWithMultiplePolicies({});
   auto configManager = std::make_shared<ConfigManager>(config_);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, policyManager, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto globalConfig = config_->getBgpGlobalConfig();
@@ -6464,7 +6466,7 @@ TEST_F(
       {"ingress_policy_v1", "egress_policy_v1"});
 
   auto configManager = std::make_shared<ConfigManager>(config_);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, policyManager, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto globalConfig = config_->getBgpGlobalConfig();
@@ -6552,7 +6554,7 @@ TEST_F(PeerManagerDynamicPolicyEvaluationFixture, StalePolicyUpdateIsSkipped) {
       {"policy_v1", "policy_v2", "stale_policy"});
 
   auto configManager = std::make_shared<ConfigManager>(config_);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, policyManager, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto globalConfig = config_->getBgpGlobalConfig();
@@ -6655,7 +6657,7 @@ TEST_F(
       {"rapid_policy_v1", "rapid_policy_v2", "rapid_policy_v3"});
 
   auto configManager = std::make_shared<ConfigManager>(config_);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, policyManager, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto globalConfig = config_->getBgpGlobalConfig();
@@ -6749,7 +6751,7 @@ TEST_F(
       setupPolicyManagerWithMultiplePolicies({"initial_policy"});
 
   auto configManager = std::make_shared<ConfigManager>(config_);
-  auto peerMgr = std::make_shared<PeerManager>(
+  auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, policyManager, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
   auto globalConfig = config_->getBgpGlobalConfig();
@@ -7024,7 +7026,8 @@ TEST_F(PeerManagerTestFixture, MarkDaemonShutdownClearsAdjRibTreesTest) {
 
     // Note: adjRibOutGroup_ trees are NOT cleared by sessionTerminated()
     // because they are shared across peers. They are cleared by
-    // PeerManager::~PeerManager() destructor during BGP daemon shutdown.
+    // PeerManagerBase::~PeerManagerBase() destructor during BGP daemon
+    // shutdown.
 
     fiberSleepFor(10ms);
     peerMgr->stop();
@@ -7038,7 +7041,7 @@ TEST_F(PeerManagerTestFixture, MarkDaemonShutdownClearsAdjRibTreesTest) {
 }
 
 /**
- * @brief Test PeerManager::addPeers() adds peers successfully and returns
+ * @brief Test PeerManagerBase::addPeers() adds peers successfully and returns
  *        PEER_EXISTS_ALREADY on duplicate.
  */
 TEST_F(PeerManagerTestFixture, AddPeersTest) {

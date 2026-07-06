@@ -324,7 +324,7 @@ class RibDC : public RibBase {
    * One-shot flag: set true after the first NexthopResolutionUpdate has been
    * processed (and any conditional routes advertised). Used to suppress
    * repeat pushes of the RibOutNexthopResolutionReceived signal to
-   * PeerManager — PeerManager only needs the first one to satisfy its
+   * PeerManagerBase — PeerManagerBase only needs the first one to satisfy its
    * NDP-received precondition for sending RibInInitialPathComputation.
    */
   bool firstNdpSignalSent_{false};

@@ -23,7 +23,7 @@
  *
  * Derived from: RibTest.cpp, AdjRibOutTest.cpp
  * Mocked: FIB (TestFib), SessionManager (MockSessionManager)
- * Real: RIB, PeerManager, AdjRib
+ * Real: RIB, PeerManagerBase, AdjRib
  */
 
 #include <gtest/gtest.h>

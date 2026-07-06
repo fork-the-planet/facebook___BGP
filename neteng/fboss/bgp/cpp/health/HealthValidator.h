@@ -30,7 +30,7 @@ namespace facebook::bgp {
 
 class ConfigManager;
 class NexthopHandler;
-class PeerManager;
+class PeerManagerBase;
 class RibBase;
 class Watchdog;
 
@@ -49,7 +49,7 @@ class Watchdog;
 class HealthValidator {
  public:
   HealthValidator(
-      PeerManager* peerMgr,
+      PeerManagerBase* peerMgr,
       RibBase* rib,
       Watchdog* watchdog,
       NexthopHandler* nexthopHandler = nullptr,
@@ -63,7 +63,7 @@ class HealthValidator {
    * (e.g. co_getBgpSessions() for per-peer checks).
    *
    * IMPORTANT: Must be called from a thrift server thread, NOT from
-   * PeerManager or Rib event base threads. Some checks call module
+   * PeerManagerBase or Rib event base threads. Some checks call module
    * methods that use runInEventBaseThreadAndWait() which would
    * deadlock if called from the owning event base.
    */
@@ -74,7 +74,7 @@ class HealthValidator {
    * WARN (listing each affected peer with its exact PR dropped count) when any
    * peer has dropped received routes due to its configured per-peer prefix
    * limit, else PASS. Pure and static so it can be unit tested without a live
-   * PeerManager.
+   * PeerManagerBase.
    */
   static neteng::fboss::bgp::thrift::THealthCheckResult
   evaluatePrefixLimitDrops(
@@ -121,7 +121,7 @@ class HealthValidator {
   static HealthCheckStatus computeOverallStatus(
       const std::vector<THealthCheckResult>& checks);
 
-  PeerManager* peerMgr_;
+  PeerManagerBase* peerMgr_;
 
   /*
    * Holds the base Rib pointer. For platform-specific health checks,

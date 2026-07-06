@@ -29,7 +29,7 @@
  * preserved
  *
  * Mocked: FIB (TestFib), SessionManager (MockSessionManager)
- * Real: RIB, PeerManager, AdjRib, PolicyManager
+ * Real: RIB, PeerManagerBase, AdjRib, PolicyManager
  */
 
 #include <gtest/gtest.h>
@@ -95,7 +95,7 @@ class E2ENexthopSelfPolicyOverrideTest : public E2ETestFixture {
   }
 
   /**
-   * Setup peers, create RIB + PeerManager, bring up peers, complete EoR.
+   * Setup peers, create RIB + PeerManagerBase, bring up peers, complete EoR.
    */
   void setupAndBringUpPeers(
       const BgpPeerSpec& sourceSpec,

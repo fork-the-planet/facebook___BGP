@@ -392,7 +392,7 @@ void FsdbNeighborWatcher::getNbrEntryChanges(
 }
 
 // TODO: Instead of comparing old vs new interfaceMap to look for changes, keep
-// a list of ip-addresses of interest to us and notify PeerManager if any of
+// a list of ip-addresses of interest to us and notify PeerManagerBase if any of
 // them went down.  This is more resilient to FSDB going down/up
 folly::coro::Task<void> FsdbNeighborWatcher::processInterfaceMapChanges(
     std::map<int32_t, fboss::state::InterfaceFields> newInterfaceMap) {
@@ -432,7 +432,7 @@ folly::coro::Task<void> FsdbNeighborWatcher::processInterfaceMapChanges(
     for (const auto& ipAddress : deletedAddrs) {
       XLOGF(
           INFO,
-          "FSDB: neighbor disappeared: {}: enqueue to PeerManager",
+          "FSDB: neighbor disappeared: {}: enqueue to PeerManagerBase",
           ipAddress.str());
       neighborEventQ_.push(NeighborEventMsg(ipAddress, false));
     }

@@ -16,7 +16,7 @@
 
 /*
  * E2E tests for BGP Update Group MVP functionality - Runtime Route scenarios
- * Tests complete flow: RIB → PeerManager → UpdateGroup → Peers
+ * Tests complete flow: RIB → PeerManagerBase → UpdateGroup → Peers
  * Requires: Change List Tracker + Update Group + Egress Backpressure
  *
  * This file contains minimal runtime route tests.
@@ -43,8 +43,8 @@ TEST_P(UpdateGroupRuntimeRouteTest, MinimalRuntimeRoute) {
   XLOG(INFO, "Adding peer config for 127.3.0.1");
   addPeer(kDefaultPeerSpec3);
 
-  /* Create RIB and PeerManager with update groups - NO INITIAL ROUTES */
-  XLOG(INFO, "Creating RIB and PeerManager");
+  /* Create RIB and PeerManagerBase with update groups - NO INITIAL ROUTES */
+  XLOG(INFO, "Creating RIB and PeerManagerBase");
   setupComponents();
 
   /* Bring up peer */
@@ -150,8 +150,8 @@ TEST_P(UpdateGroupRuntimeRouteTest, MinimalRuntimeRouteTwoPeers) {
   addPeer(kDefaultPeerSpec3);
   addPeer(kDefaultPeerSpec4);
 
-  /* Create RIB and PeerManager - NO INITIAL ROUTES */
-  XLOG(INFO, "Creating RIB and PeerManager");
+  /* Create RIB and PeerManagerBase - NO INITIAL ROUTES */
+  XLOG(INFO, "Creating RIB and PeerManagerBase");
   setupComponents();
 
   /* Bring up BOTH peers */

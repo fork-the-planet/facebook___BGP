@@ -50,7 +50,7 @@ class PeerManagerUpdateGroupTestFixture : public PeerManagerTestFixture {
         true /* enableUpdateGroup */);
 
     auto configManager = std::make_shared<ConfigManager>(config);
-    peerMgr_ = std::make_shared<PeerManager>(
+    peerMgr_ = std::make_shared<PeerManagerBase>(
         configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
 
     auto versionNumber = std::make_shared<VersionNumber>(version_);
@@ -69,7 +69,7 @@ class PeerManagerUpdateGroupTestFixture : public PeerManagerTestFixture {
     peerMgr_->stop();
   }
 
-  std::shared_ptr<PeerManager> peerMgr_;
+  std::shared_ptr<PeerManagerBase> peerMgr_;
   folly::coro::CancellableAsyncScope asyncScope_;
 
   uint64_t version_ = 0x100;
@@ -88,7 +88,7 @@ class PeerManagerUpdateGroupTestFixture : public PeerManagerTestFixture {
 
 /*
  * This test verifies the updateGroup creation when directly invoking
- * sessionEstablished() call from PeerManager.
+ * sessionEstablished() call from PeerManagerBase.
  */
 TEST_F(PeerManagerUpdateGroupTestFixture, UpdateGroupConstructionTest) {
   auto& evb = peerMgr_->getEventBase();

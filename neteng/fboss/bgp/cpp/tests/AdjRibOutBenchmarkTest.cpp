@@ -24,7 +24,7 @@
 using namespace facebook::bgp;
 using namespace facebook::nettools::bgplib;
 
-// Benchmark the PeerManager -> AdjRibOut message processing with different
+// Benchmark the PeerManagerBase -> AdjRibOut message processing with different
 // numbers of prefixes.
 void BM_ProcessAdjRibOutMsgLoop(uint32_t iters, size_t numPrefixes) {
   AdjRibOutboundFixture fixture;

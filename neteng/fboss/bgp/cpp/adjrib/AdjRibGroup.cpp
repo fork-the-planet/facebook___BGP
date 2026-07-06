@@ -581,7 +581,7 @@ void AdjRibOutGroup::scheduleInitialDump() noexcept {
  * Used by both initial dump and policy re-evaluation.
  */
 uint64_t AdjRibOutGroup::walkAndProcessShadowRib(bool sendWithEoR) {
-  // Build announcement struct, same as PeerManager::processRibDumpReq
+  // Build announcement struct, same as PeerManagerBase::processRibDumpReq
   RibOutAnnouncement announcement;
   announcement.initialDump = true;
 
@@ -2413,7 +2413,7 @@ void AdjRibOutGroup::registerPeer(const std::shared_ptr<AdjRib>& adjRib) {
      * mirroring the INIT branch above. It was never
      * registered with the ChangeTracker, so leaving it in place makes
      * registerDetachedConsumer() short-circuit on its `if
-     * (changeListConsumer_)` guard when PeerManager::processRibDumpReq
+     * (changeListConsumer_)` guard when PeerManagerBase::processRibDumpReq
      * registers this detached peer. That skips creation of
      * changeListConsumeTimer_, so detached CL consumption would never start for
      * a peer entering a running group.
@@ -2421,7 +2421,7 @@ void AdjRibOutGroup::registerPeer(const std::shared_ptr<AdjRib>& adjRib) {
     adjRib->resetChangeListConsumer();
 
     // Schedule individual initial dump for this peer
-    // This will be done by PeerManager after registerPeer returns
+    // This will be done by PeerManagerBase after registerPeer returns
   }
 }
 

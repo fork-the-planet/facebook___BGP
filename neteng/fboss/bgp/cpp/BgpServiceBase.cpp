@@ -35,7 +35,7 @@
 #include "neteng/fboss/bgp/cpp/BgpServiceBase.h"
 #include "neteng/fboss/bgp/cpp/BgpServiceUtil.h"
 #include "neteng/fboss/bgp/cpp/common/EvbUtils.h"
-#include "neteng/fboss/bgp/cpp/peer/PeerManager.h"
+#include "neteng/fboss/bgp/cpp/peer/PeerManagerBase.h"
 #include "neteng/fboss/bgp/cpp/stats/Stats.h"
 #include "neteng/fboss/bgp/if/gen-cpp2/bgp_thrift_types.h"
 
@@ -81,7 +81,7 @@ TBgpNetwork toBgpNetwork(const TIpPrefix& prefix, const TBgpPath& path) {
 namespace facebook::bgp {
 
 BgpServiceBase::BgpServiceBase(
-    PeerManager& peerMgr,
+    PeerManagerBase& peerMgr,
     std::shared_ptr<ConfigManager> configManager,
     RibBase& rib,
     Watchdog& watchdog,
@@ -261,7 +261,7 @@ BgpServiceBase::co_getBgpSessions() {
   }
 
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
-    XLOGF(ERR, "getBgpSessions timed out — PeerManager evb unresponsive");
+    XLOGF(ERR, "getBgpSessions timed out — PeerManagerBase evb unresponsive");
   } else {
     XLOGF(ERR, "getBgpSessions failed: {}", result.exception().what());
   }
@@ -293,7 +293,9 @@ BgpServiceBase::co_getBgpStreamSessions() {
   }
 
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
-    XLOGF(ERR, "getBgpStreamSessions timed out — PeerManager evb unresponsive");
+    XLOGF(
+        ERR,
+        "getBgpStreamSessions timed out — PeerManagerBase evb unresponsive");
   } else {
     XLOGF(ERR, "getBgpStreamSessions failed: {}", result.exception().what());
   }
@@ -359,7 +361,7 @@ BgpServiceBase::co_getBgpNeighbors(
   }
 
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
-    XLOGF(ERR, "getBgpNeighbors timed out — PeerManager evb unresponsive");
+    XLOGF(ERR, "getBgpNeighbors timed out — PeerManagerBase evb unresponsive");
   } else {
     XLOGF(ERR, "getBgpNeighbors failed: {}", result.exception().what());
   }
@@ -479,7 +481,7 @@ BgpServiceBase::co_getBgpNeighborsFromSession(
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
     XLOGF(
         ERR,
-        "getBgpNeighborsFromSession timed out — PeerManager evb unresponsive");
+        "getBgpNeighborsFromSession timed out — PeerManagerBase evb unresponsive");
   } else {
     XLOGF(
         ERR,
@@ -552,7 +554,7 @@ BgpServiceBase::co_getPrefilterReceivedNetworks(std::unique_ptr<string> peer) {
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
     XLOGF(
         ERR,
-        "getPrefilterReceivedNetworks for peer {} timed out — PeerManager evb unresponsive",
+        "getPrefilterReceivedNetworks for peer {} timed out — PeerManagerBase evb unresponsive",
         *peer);
   } else {
     XLOGF(
@@ -602,7 +604,7 @@ BgpServiceBase::co_getPrefilterReceivedNetworks2(std::unique_ptr<string> peer) {
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
     XLOGF(
         ERR,
-        "getPrefilterReceivedNetworks2 for peer {} timed out — PeerManager evb unresponsive",
+        "getPrefilterReceivedNetworks2 for peer {} timed out — PeerManagerBase evb unresponsive",
         *peer);
   } else {
     XLOGF(
@@ -657,7 +659,7 @@ BgpServiceBase::co_getPrefilterReceivedNetworksFromSession(
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
     XLOGF(
         ERR,
-        "getPrefilterReceivedNetworksFromSession for peer {} session {} timed out — PeerManager evb unresponsive",
+        "getPrefilterReceivedNetworksFromSession for peer {} session {} timed out — PeerManagerBase evb unresponsive",
         *peer,
         *sessionBgpId);
   } else {
@@ -714,7 +716,7 @@ BgpServiceBase::co_getPrefilterReceivedNetworksFromSession2(
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
     XLOGF(
         ERR,
-        "getPrefilterReceivedNetworksFromSession2 for peer {} session {} timed out — PeerManager evb unresponsive",
+        "getPrefilterReceivedNetworksFromSession2 for peer {} session {} timed out — PeerManagerBase evb unresponsive",
         *peer,
         *sessionBgpId);
   } else {
@@ -766,7 +768,7 @@ BgpServiceBase::co_getPostfilterReceivedNetworks(std::unique_ptr<string> peer) {
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
     XLOGF(
         ERR,
-        "getPostfilterReceivedNetworks for peer {} timed out — PeerManager evb unresponsive",
+        "getPostfilterReceivedNetworks for peer {} timed out — PeerManagerBase evb unresponsive",
         *peer);
   } else {
     XLOGF(
@@ -817,7 +819,7 @@ BgpServiceBase::co_getPostfilterReceivedNetworks2(
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
     XLOGF(
         ERR,
-        "getPostfilterReceivedNetworks2 for peer {} timed out — PeerManager evb unresponsive",
+        "getPostfilterReceivedNetworks2 for peer {} timed out — PeerManagerBase evb unresponsive",
         *peer);
   } else {
     XLOGF(
@@ -872,7 +874,7 @@ BgpServiceBase::co_getPostfilterReceivedNetworksFromSession(
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
     XLOGF(
         ERR,
-        "getPostfilterReceivedNetworksFromSession for peer {} session {} timed out — PeerManager evb unresponsive",
+        "getPostfilterReceivedNetworksFromSession for peer {} session {} timed out — PeerManagerBase evb unresponsive",
         *peer,
         *sessionBgpId);
   } else {
@@ -929,7 +931,7 @@ BgpServiceBase::co_getPostfilterReceivedNetworksFromSession2(
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
     XLOGF(
         ERR,
-        "getPostfilterReceivedNetworksFromSession2 for peer {} session {} timed out — PeerManager evb unresponsive",
+        "getPostfilterReceivedNetworksFromSession2 for peer {} session {} timed out — PeerManagerBase evb unresponsive",
         *peer,
         *sessionBgpId);
   } else {
@@ -982,7 +984,7 @@ BgpServiceBase::co_getPrefilterAdvertisedNetworks(
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
     XLOGF(
         ERR,
-        "getPrefilterAdvertisedNetworks timed out — PeerManager evb unresponsive");
+        "getPrefilterAdvertisedNetworks timed out — PeerManagerBase evb unresponsive");
   } else {
     XLOGF(
         ERR,
@@ -1031,7 +1033,7 @@ BgpServiceBase::co_getPrefilterAdvertisedNetworks2(
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
     XLOGF(
         ERR,
-        "getPrefilterAdvertisedNetworks2 timed out — PeerManager evb unresponsive");
+        "getPrefilterAdvertisedNetworks2 timed out — PeerManagerBase evb unresponsive");
   } else {
     XLOGF(
         ERR,
@@ -1080,7 +1082,7 @@ BgpServiceBase::co_getPostfilterAdvertisedNetworks(
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
     XLOGF(
         ERR,
-        "getPostfilterAdvertisedNetworks timed out — PeerManager evb unresponsive");
+        "getPostfilterAdvertisedNetworks timed out — PeerManagerBase evb unresponsive");
   } else {
     XLOGF(
         ERR,
@@ -1129,7 +1131,7 @@ BgpServiceBase::co_getPostfilterAdvertisedNetworks2(
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
     XLOGF(
         ERR,
-        "getPostfilterAdvertisedNetworks2 timed out — PeerManager evb unresponsive");
+        "getPostfilterAdvertisedNetworks2 timed out — PeerManagerBase evb unresponsive");
   } else {
     XLOGF(
         ERR,
@@ -1186,7 +1188,7 @@ BgpServiceBase::co_getDryRunPostfilterReceivedNetworks(
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
     XLOGF(
         ERR,
-        "getDryRunPostfilterReceivedNetworks timed out — PeerManager evb unresponsive");
+        "getDryRunPostfilterReceivedNetworks timed out — PeerManagerBase evb unresponsive");
   } else {
     XLOGF(
         ERR,
@@ -1243,7 +1245,7 @@ BgpServiceBase::co_getDryRunPostfilterAdvertisedNetworks(
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
     XLOGF(
         ERR,
-        "getDryRunPostfilterAdvertisedNetworks timed out — PeerManager evb unresponsive");
+        "getDryRunPostfilterAdvertisedNetworks timed out — PeerManagerBase evb unresponsive");
   } else {
     XLOGF(
         ERR,
@@ -1301,7 +1303,7 @@ BgpServiceBase::co_getSubscriberNetworkInfo(
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
     XLOGF(
         ERR,
-        "getSubscriberNetworkInfo timed out — PeerManager evb unresponsive");
+        "getSubscriberNetworkInfo timed out — PeerManagerBase evb unresponsive");
   } else {
     XLOGF(
         ERR, "getSubscriberNetworkInfo failed: {}", result.exception().what());
@@ -1489,7 +1491,7 @@ BgpServiceBase::co_getAdvertisedNetworksFiltered(
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
     XLOGF(
         ERR,
-        "getAdvertisedNetworksFiltered timed out — PeerManager evb unresponsive");
+        "getAdvertisedNetworksFiltered timed out — PeerManagerBase evb unresponsive");
   } else {
     XLOGF(
         ERR,
@@ -1539,7 +1541,9 @@ BgpServiceBase::co_getReceivedNetworks(std::unique_ptr<string> peer) {
   }
 
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
-    XLOGF(ERR, "getReceivedNetworks timed out — PeerManager evb unresponsive");
+    XLOGF(
+        ERR,
+        "getReceivedNetworks timed out — PeerManagerBase evb unresponsive");
   } else {
     XLOGF(ERR, "getReceivedNetworks failed: {}", result.exception().what());
   }
@@ -1586,7 +1590,8 @@ BgpServiceBase::co_getAdvertisedNetworks(std::unique_ptr<string> peer) {
 
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
     XLOGF(
-        ERR, "getAdvertisedNetworks timed out — PeerManager evb unresponsive");
+        ERR,
+        "getAdvertisedNetworks timed out — PeerManagerBase evb unresponsive");
   } else {
     XLOGF(ERR, "getAdvertisedNetworks failed: {}", result.exception().what());
   }
@@ -1618,7 +1623,8 @@ BgpServiceBase::co_getAttributeStats() {
   }
 
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
-    XLOGF(ERR, "getAttributeStats timed out — PeerManager evb unresponsive");
+    XLOGF(
+        ERR, "getAttributeStats timed out — PeerManagerBase evb unresponsive");
   } else {
     XLOGF(ERR, "getAttributeStats failed: {}", result.exception().what());
   }
@@ -1658,7 +1664,7 @@ BgpServiceBase::co_getPolicyStats() {
   }
 
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
-    XLOGF(ERR, "getPolicyStats timed out — PeerManager evb unresponsive");
+    XLOGF(ERR, "getPolicyStats timed out — PeerManagerBase evb unresponsive");
   } else {
     XLOGF(ERR, "getPolicyStats failed: {}", result.exception().what());
   }
@@ -2170,7 +2176,9 @@ BgpServiceBase::co_getChangeListEntries(TBgpAfi afi) {
   }
 
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
-    XLOGF(ERR, "getChangeListEntries timed out — PeerManager evb unresponsive");
+    XLOGF(
+        ERR,
+        "getChangeListEntries timed out — PeerManagerBase evb unresponsive");
   } else {
     XLOGF(ERR, "getChangeListEntries failed: {}", result.exception().what());
   }
@@ -2202,7 +2210,9 @@ BgpServiceBase::co_getShadowRibEntries(TBgpAfi afi) {
   }
 
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
-    XLOGF(ERR, "getShadowRibEntries timed out — PeerManager evb unresponsive");
+    XLOGF(
+        ERR,
+        "getShadowRibEntries timed out — PeerManagerBase evb unresponsive");
   } else {
     XLOGF(ERR, "getShadowRibEntries failed: {}", result.exception().what());
   }
@@ -2240,7 +2250,8 @@ BgpServiceBase::co_getPeerEgressStats() {
   }
 
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
-    XLOGF(ERR, "getPeerEgressStats timed out — PeerManager evb unresponsive");
+    XLOGF(
+        ERR, "getPeerEgressStats timed out — PeerManagerBase evb unresponsive");
   } else {
     XLOGF(ERR, "getPeerEgressStats failed: {}", result.exception().what());
   }
@@ -2283,7 +2294,8 @@ BgpServiceBase::co_getUpdateGroupInfo(
   }
 
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
-    XLOGF(ERR, "getUpdateGroupInfo timed out — PeerManager evb unresponsive");
+    XLOGF(
+        ERR, "getUpdateGroupInfo timed out — PeerManagerBase evb unresponsive");
   } else {
     XLOGF(ERR, "getUpdateGroupInfo failed: {}", result.exception().what());
   }
@@ -2667,7 +2679,7 @@ BgpServiceBase::co_getAttributeStatsFiltered(
   if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
     XLOGF(
         ERR,
-        "getAttributeStatsFiltered timed out — PeerManager evb unresponsive");
+        "getAttributeStatsFiltered timed out — PeerManagerBase evb unresponsive");
   } else {
     XLOGF(
         ERR, "getAttributeStatsFiltered failed: {}", result.exception().what());

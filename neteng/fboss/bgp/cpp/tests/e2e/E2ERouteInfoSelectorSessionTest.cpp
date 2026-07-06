@@ -18,7 +18,7 @@
  * E2E tests for route selection session and multipath behavior.
  *
  * Mocked: FIB (TestFib), SessionManager (MockSessionManager)
- * Real: RIB, PeerManager, AdjRib, RouteInfoSelector
+ * Real: RIB, PeerManagerBase, AdjRib, RouteInfoSelector
  */
 
 #include <gtest/gtest.h>

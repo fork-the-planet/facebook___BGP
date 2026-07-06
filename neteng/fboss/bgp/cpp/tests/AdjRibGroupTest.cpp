@@ -128,7 +128,7 @@ class AdjRibGroupTest : public ::testing::Test {
   MonitoredMPMCQueue<AdjRib::ObservableMessageT> observerQ_;
 
   /*
-   * Dummy bitmaps for testing (normally owned by PeerManager)
+   * Dummy bitmaps for testing (normally owned by PeerManagerBase)
    * These are required by AdjRibOutGroupConsumer constructor
    */
   ConsumerBitmap addPathConsumerBitmap_;

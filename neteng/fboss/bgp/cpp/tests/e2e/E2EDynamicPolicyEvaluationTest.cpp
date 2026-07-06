@@ -32,7 +32,7 @@
  * flowing.
  *
  * Mocked: FIB (TestFib), SessionManager (MockSessionManager)
- * Real: RIB, PeerManager, AdjRib, PolicyManager, BgpServiceBB
+ * Real: RIB, PeerManagerBase, AdjRib, PolicyManager, BgpServiceBB
  */
 
 #include <gtest/gtest.h>
@@ -111,9 +111,9 @@ class E2EDynamicPolicyEvaluationTest : public E2ETestFixture {
   }
 
   /**
-   * Create PeerManager and BgpServiceBB instance for runtime API calls.
+   * Create PeerManagerBase and BgpServiceBB instance for runtime API calls.
    * This extends the base createPeerManager to also create the service layer.
-   * Both PeerManager and BgpServiceBB share the same ConfigManager so that
+   * Both PeerManagerBase and BgpServiceBB share the same ConfigManager so that
    * config version tracking is consistent across policy updates.
    */
   void createPeerManagerWithBgpService(bool enableUpdateGroup = false) {

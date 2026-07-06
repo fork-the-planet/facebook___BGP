@@ -18,7 +18,7 @@
  * E2E tests for RibEntry UCMP (Unequal Cost Multi-Path) behavior.
  *
  * Mocked: FIB (TestFib), SessionManager (MockSessionManager)
- * Real: RIB, PeerManager, AdjRib, RibEntry
+ * Real: RIB, PeerManagerBase, AdjRib, RibEntry
  */
 
 #include <gtest/gtest.h>

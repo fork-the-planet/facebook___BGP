@@ -29,7 +29,7 @@ namespace facebook::bgp {
 class BgpServiceDC : public BgpServiceBase {
  public:
   BgpServiceDC(
-      PeerManager& peerMgr,
+      PeerManagerBase& peerMgr,
       std::shared_ptr<ConfigManager> configManager,
       RibDC& rib,
       std::shared_ptr<NeighborWatcher> neighborWatcher,

@@ -102,12 +102,12 @@ struct GrLoadResult {
   }
 };
 
-class PeerManager : public BgpModuleBase, public MonitoredModule {
+class PeerManagerBase : public BgpModuleBase, public MonitoredModule {
  public:
   //
-  // Creates PeerManager instance with given configuration
+  // Creates PeerManagerBase instance with given configuration
   //
-  PeerManager(
+  PeerManagerBase(
       std::shared_ptr<ConfigManager> configManager,
       const std::shared_ptr<PolicyManager> policyManager,
       nettools::bgplib::MonitoredBackPressuredQueue<RibInMessage>& ribInQ,
@@ -135,7 +135,7 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
       std::chrono::milliseconds maxSessionDampenDur_ =
           std::chrono::milliseconds(FLAGS_max_session_dampen_time_ms));
 
-  virtual ~PeerManager();
+  virtual ~PeerManagerBase();
 
   //
   // Bgp peer manager main event loop. This creates child fibers.
@@ -629,7 +629,7 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
    * receive the routes from this BGP speaker's RIB.
    * There are two vehicles to get the Rib dump.
    *
-   * A) Peer calls for a RibDumpReq through PeerManager who serves
+   * A) Peer calls for a RibDumpReq through PeerManagerBase who serves
    * the @shadowRibEntries_ that were received from RIB while handling
    * RibOutAnnouncements processed from ribOutQ_ in processRibOutMsgLoop.
    *
@@ -779,7 +779,7 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
   /*
    * [AdjRib Event]
    *
-   * AdjRib(per session) currently sends 3 types of messages to PeerManager:
+   * AdjRib(per session) currently sends 3 types of messages to PeerManagerBase:
    *  - AdjRib::EoR: this is th INGRESS_EOR received from peers via socket;
    *  - AdjRib::EgressEoR: this is the EGRESS_EOR received from local adjribs
    *                       to mark initialization event;
@@ -961,9 +961,10 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
   std::unique_ptr<RouteFilterLoggerFactory> routeFilterLoggerFactory_{nullptr};
 
   /*
-   * [AdjRib/PeerManager -> Rib]
+   * [AdjRib/PeerManagerBase -> Rib]
    *
-   * ribInQ_ represents the uni-directional flow from AdjRib/PeerManager -> Rib
+   * ribInQ_ represents the uni-directional flow from AdjRib/PeerManagerBase ->
+   * Rib
    *
    * As the name suggests, Rib will be the ONLY reader of the queue;
    *
@@ -976,9 +977,10 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
   nettools::bgplib::MonitoredBackPressuredQueue<RibInMessage>& ribInQ_;
 
   /*
-   * [Rib -> AdjRib/PeerManager]
+   * [Rib -> AdjRib/PeerManagerBase]
    *
-   * ribOutQ_ represents the uni-directional flow from Rib -> AdjRib/PeerManager
+   * ribOutQ_ represents the uni-directional flow from Rib ->
+   * AdjRib/PeerManagerBase
    *
    * As the name suggests, Rib will be the ONLY writer of the queue;
    *
@@ -989,14 +991,14 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
   MonitoredMPMCQueue<RibOutMessage>& ribOutQ_;
 
   /*
-   * [NeighborWatcher -> PeerManager]
+   * [NeighborWatcher -> PeerManagerBase]
    *
    * Wait on nbr route events if supported
    */
   std::optional<MonitoredMPMCQueue<NeighborWatcherMessage>>& nbrRouteChangeQ_;
 
   /*
-   * [AdjRib -> PeerManager]
+   * [AdjRib -> PeerManagerBase]
    *
    * fromAdjRibQ_ is the MPSC (Multiple-Producer-Single-Consumer) queue between
    * multiple adjribs and peer-manager to transmit multiple adjRib events:
@@ -1155,7 +1157,7 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
    * flags are true; the eorTimer_ callback bypasses these and fires
    * unconditionally as the max-cap fallback.
    *
-   * Set on the PeerManager evb thread:
+   * Set on the PeerManagerBase evb thread:
    *  - allPeerEorsReceived_: flipped inside checkAndNotifyAllEoRReceived
    *    after all expected static + dynamic peers have sent EOR.
    *  - nexthopResolutionReceived_: flipped by the
@@ -1168,7 +1170,7 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
    * GR-retained conditional routes on BGP daemon restart.
    */
   bool allPeerEorsReceived_{false};
-  // Initial value derived from PeerManager's requireNexthopResolution ctor
+  // Initial value derived from PeerManagerBase's requireNexthopResolution ctor
   // parameter: false → gate pre-satisfied at construction (EBB / tests
   // without a real NDP source — the default). true → gate enabled, flipped
   // when the RibOutNexthopResolutionReceived signal arrives from RIB (DC
@@ -1213,7 +1215,7 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
 
   /*
    * Enable group PDU serialization for zero-copy distribution
-   * Checked globally at PeerManager level
+   * Checked globally at PeerManagerBase level
    */
   bool enableSerializeGroupPdu_{false};
 

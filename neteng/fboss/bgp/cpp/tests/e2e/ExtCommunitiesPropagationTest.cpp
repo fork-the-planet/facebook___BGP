@@ -35,7 +35,7 @@
  *   ReceiveLinkBandwidth: prunes or accepts non-transitive LBW at ingress.
  *
  * Mocked: FIB (TestFib), SessionManager (MockSessionManager)
- * Real: RIB, PeerManager, AdjRib
+ * Real: RIB, PeerManagerBase, AdjRib
  */
 
 #include <gtest/gtest.h>
@@ -206,7 +206,7 @@ class ExtCommunitiesPropagationTest : public E2ETestFixture {
   }
 
   /*
-   * Common setup: add peers, create RIB + PeerManager, bring up peers.
+   * Common setup: add peers, create RIB + PeerManagerBase, bring up peers.
    * sourcePeer injects routes. destPeer receives them.
    */
   void setupPeers(const BgpPeerSpec& sourceSpec, const BgpPeerSpec& destSpec) {

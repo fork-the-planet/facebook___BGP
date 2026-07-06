@@ -15,13 +15,13 @@
  */
 
 /*
- * E2E tests for PeerManager session lifecycle.
+ * E2E tests for PeerManagerBase session lifecycle.
  *
  * These tests verify peer session establishment, termination, and restart
  * scenarios through the complete BGP pipeline.
  *
  * Mocked: FIB (TestFib), SessionManager (MockSessionManager)
- * Real: RIB, PeerManager, AdjRib
+ * Real: RIB, PeerManagerBase, AdjRib
  */
 
 #include <gtest/gtest.h>
@@ -234,8 +234,9 @@ TEST_F(E2EPeerManagerTest, RapidSessionFlapWithVersionCompressionE2e) {
   EXPECT_TRUE(verifyRouteWithdraw("v4", "10.0.0.0", 8, kPeerAddr5));
 
   // Step 2: Dispatch a STALE sessionEstablished event.
-  // PeerManager will wait on the baton (passes -- still posted from step 1),
-  // detect the version mismatch, and return early WITHOUT resetting the baton.
+  // PeerManagerBase will wait on the baton (passes -- still posted from step
+  // 1), detect the version mismatch, and return early WITHOUT resetting the
+  // baton.
   dispatchStaleSessionEstablished(kPeerAddr3);
 
   // Step 3: Bring peer3 back up with a VALID version.
@@ -256,7 +257,7 @@ TEST_F(E2EPeerManagerTest, RapidSessionFlapWithVersionCompressionE2e) {
 
 /*
  * Test: peerDelete=true on the IDLE ObservableStateT triggers
- * cleanupPeerState end-to-end through PeerManager::sessionTerminated.
+ * cleanupPeerState end-to-end through PeerManagerBase::sessionTerminated.
  *
  * Mirrors the production path that delPeers initiates:
  *   delPeers → co_dropPeer(peerDelete=true) → BgpSessionStop{peerDelete}
@@ -265,7 +266,7 @@ TEST_F(E2EPeerManagerTest, RapidSessionFlapWithVersionCompressionE2e) {
  *
  * E2E uses MockSessionManager (no real FSM), so we synthesize the IDLE
  * event with peerDelete=true via bringDownPeer(addr, /*peerDelete=*\/true)
- * to drive the same PeerManager-side logic. After cleanup the peer can be
+ * to drive the same PeerManagerBase-side logic. After cleanup the peer can be
  * brought back up on the same address with a fresh AdjRib instance,
  * proving no stale state leaked.
  */
@@ -290,7 +291,7 @@ TEST_F(E2EPeerManagerTest, PeerDeleteTriggersCleanupAndAllowsReBringup) {
   ASSERT_NE(nullptr, oldAdjRib);
 
   // bringDownPeer(addr, peerDelete=true) dispatches an IDLE event with
-  // peerDelete=true to PeerManager::sessionTerminated, which co_awaits
+  // peerDelete=true to PeerManagerBase::sessionTerminated, which co_awaits
   // cleanupPeerState inline. By the time bringDownPeer returns the
   // AdjRib must be erased.
   bringDownPeer(kPeerAddr3, /*peerDelete=*/true);
@@ -298,7 +299,7 @@ TEST_F(E2EPeerManagerTest, PeerDeleteTriggersCleanupAndAllowsReBringup) {
   EXPECT_EQ(nullptr, getAdjRibByAddr(kPeerAddr3))
       << "AdjRib for peer3 was not erased after bringDownPeer with peerDelete";
 
-  // Re-bringup on the same address — PeerManager creates a fresh AdjRib
+  // Re-bringup on the same address — PeerManagerBase creates a fresh AdjRib
   // whose identity must differ from the pre-cleanup one.
   bringUpPeer(kPeerAddr3, /*versionNumber=*/2);
   sendEoRToPeer(peerId3);
@@ -394,7 +395,7 @@ TEST_F(E2EPeerManagerTest, NoPeerDeleteKeepsAdjRibForReEstablish) {
  * Scenario:
  * - Fixture adds peer4 and peer5 only; peer3 is never registered.
  * - Calling delPeerAtRuntime(kPeerAddr3) routes through
- *   PeerManager::delPeers, which catches the PEER_DOES_NOT_EXIST error
+ *   PeerManagerBase::delPeers, which catches the PEER_DOES_NOT_EXIST error
  *   from sessionMgr_->co_dropPeer and returns success (folly::unit).
  * - No AdjRib should be created for the unknown peer.
  * - Shadow RIB should remain empty for the control prefix.

@@ -388,7 +388,7 @@ TEST_P(UpdateGroupEoRLifecycleTest, DurationDetachDuringInitDump_EoRDelivered) {
    * The critical assertion: peer3 must have received EoR via
    * accumulated changes even though duration timer detached it
    * without sendWithEoR. Verify by injecting a runtime route —
-   * if EoR was not sent, PeerManager would still be waiting for
+   * if EoR was not sent, PeerManagerBase would still be waiting for
    * it and the route would not flow.
    */
   drainPeerQueueCompletely(peerId4);
