@@ -103,12 +103,15 @@
       RibWithLocalRouteFixture, ConditionalLocalRoute_UnknownNexthopNoOp);     \
   FRIEND_TEST(RibFixture, RibVersionIncrementsOnBestpathChange);               \
   FRIEND_TEST(RibFixture, RibVersionNoChangeOnDuplicateRoute);                 \
-  FRIEND_TEST(RibFixture, CreateBestPathOnlyTRibEntry);
+  FRIEND_TEST(RibFixture, CreateBestPathOnlyTRibEntry);                        \
+  FRIEND_TEST(RibFixture, CreateTRibEntryBestGroupReflectsBestPathPresence);
 
 #define RibEntry_TEST_FRIENDS \
   FRIEND_TEST(RibFixture, AnnounceAndWithdrawAddPathsBasedOnDeltaTest);
 
-#define RibDC_TEST_FRIENDS FRIEND_TEST(RibFixture, CreateBestPathOnlyTRibEntry);
+#define RibDC_TEST_FRIENDS                              \
+  FRIEND_TEST(RibFixture, CreateBestPathOnlyTRibEntry); \
+  FRIEND_TEST(RibFixture, CreateTRibEntryBestGroupReflectsBestPathPresence);
 
 #include <boost/algorithm/string.hpp>
 #include <algorithm>
@@ -4094,6 +4097,37 @@ TEST_F(RibFixture, CreateBestPathOnlyTRibEntry) {
   EXPECT_FALSE(
       rib_->createBestPathOnlyTRibEntry(*rib_->ribEntries_.find(kV4Prefix2))
           .has_value());
+}
+
+/*
+ * The full builder labels best_group only when a best path was actually
+ * selected: a resolved entry gets best_group == "best" (with a "best" group in
+ * paths), while an entry with no best path leaves best_group empty and no
+ * "best" group -- so best_group reads as a presence signal, not a constant.
+ */
+TEST_F(RibFixture, CreateTRibEntryBestGroupReflectsBestPathPresence) {
+  // Entry WITH a selected best path -> best_group == "best".
+  auto attrs =
+      std::make_shared<facebook::bgp::BgpPath>(*buildBgpPathFields(4, 4, 4, 4));
+  attrs->publish();
+  RibEntry withBest(kV4Prefix1);
+  withBest.updatePath(eBgpPeer1_, attrs, false);
+  RibBase::selectBestPath(
+      withBest, multipathSelector, bestpathSelector, false, 0);
+  rib_->ribEntries_.emplace(make_pair(kV4Prefix1, std::move(withBest)));
+
+  auto resolved = rib_->createTRibEntry(*rib_->ribEntries_.find(kV4Prefix1));
+  EXPECT_EQ(kBestPathGroup, *resolved.best_group());
+  EXPECT_NE(resolved.paths()->end(), resolved.paths()->find(kBestPathGroup));
+
+  // Entry with NO best path -> best_group empty, no "best" group in paths.
+  RibEntry noBest(kV4Prefix2);
+  rib_->ribEntries_.emplace(make_pair(kV4Prefix2, std::move(noBest)));
+
+  auto unresolved = rib_->createTRibEntry(*rib_->ribEntries_.find(kV4Prefix2));
+  EXPECT_TRUE(unresolved.best_group()->empty());
+  EXPECT_EQ(
+      unresolved.paths()->end(), unresolved.paths()->find(kBestPathGroup));
 }
 
 TEST_F(RibFixture, UpdateEntryStatsTest) {

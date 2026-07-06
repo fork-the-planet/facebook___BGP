@@ -1169,12 +1169,16 @@ RibDC::createTRibEntryWithFilter(
   std::map<std::string, std::vector<TBgpPath>> pathGrps;
   if (tBestPaths.size()) {
     pathGrps.emplace(facebook::bgp::kBestPathGroup, tBestPaths);
+    /*
+     * best_group labels the selected group only when a best path exists;
+     * left empty otherwise so it reads as a presence signal, not a constant.
+     */
+    tRibEntry.best_group() = facebook::bgp::kBestPathGroup;
   }
   if (tDefaultPaths.size()) {
     pathGrps.emplace(facebook::bgp::kDefaultPathGroup, tDefaultPaths);
   }
   tRibEntry.paths() = pathGrps;
-  tRibEntry.best_group() = facebook::bgp::kBestPathGroup;
 
   if (ribEntry.needPathSelection()) {
     tRibEntry.path_selection_pending() = true;

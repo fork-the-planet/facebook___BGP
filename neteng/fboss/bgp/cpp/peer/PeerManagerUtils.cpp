@@ -300,6 +300,11 @@ PeerManager::createTRibEntryWithFilter(
     tPath.path_id_to_send() = bestpath->pathIdToSend;
     tBestPaths.emplace_back(tPath);
     pathGrps.emplace(facebook::bgp::kBestPathGroup, tBestPaths);
+    /*
+     * best_group labels the selected group only when a best path exists;
+     * left empty otherwise so it reads as a presence signal, not a constant.
+     */
+    tRibEntry.best_group() = facebook::bgp::kBestPathGroup;
   }
 
   for (const auto& routeinfo : srEntry.multipaths) {
@@ -316,7 +321,6 @@ PeerManager::createTRibEntryWithFilter(
     pathGrps.emplace(facebook::bgp::kMultiPathGroup, tMultiPaths);
   }
   tRibEntry.paths() = pathGrps;
-  tRibEntry.best_group() = facebook::bgp::kBestPathGroup;
 
   return tRibEntry;
 }
