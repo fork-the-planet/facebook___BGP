@@ -797,13 +797,6 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
       std::optional<RibPauseResumeCause> cause = std::nullopt) noexcept;
 
   /*
-   * [Rib <-> Watchdog]
-   *
-   * This section contains the methods of message handling from Watchdog.
-   */
-  folly::coro::Task<void> processWatchdogMsgLoop() noexcept;
-
-  /*
    * [Rib <-> Fib]
    *
    * This section contains the methods to handle interaction between RIB and

@@ -65,7 +65,6 @@
   FRIEND_TEST(RibFixture, ScubaLoggingTest);                                   \
   FRIEND_TEST(RibFixture, ReplaceRouteFilterPolicyLoggingTest);                \
   FRIEND_TEST(RibFixture, ReplacePathSelectionPolicyLoggingTest);              \
-  FRIEND_TEST(RibFixture, WatchdogNotificationTest);                           \
   FRIEND_TEST(RibFixture, RibPauseTimeOutTest);                                \
   FRIEND_TEST(RibFixture, RibPauseTimeOutMultipleTasksTest);                   \
   FRIEND_TEST(RibFixture, RouteChurnDetectionTest);                            \
@@ -6352,8 +6351,9 @@ TEST_F(RibFixture, RibPauseTimeOutMultipleTasksTest) {
   // Step 3: Send PauseBestPathAndFibProgramming message to rib from SAFE_MODE
   sendPauseBestPathAndFibProgramming(RibPauseResumeCause::SAFE_MODE);
 
-  // Step 4: Send PauseBestPathAndFibProgramming message to rib from WATCHDOG
-  sendPauseBestPathAndFibProgramming(RibPauseResumeCause::WATCHDOG);
+  // Step 4: Send PauseBestPathAndFibProgramming message to rib from
+  // BACKPRESSURE
+  sendPauseBestPathAndFibProgramming(RibPauseResumeCause::BACKPRESSURE);
   fibFuture.wait();
 
   // Step 5: Verify best path and Fib programming is paused and size of
@@ -6370,7 +6370,7 @@ TEST_F(RibFixture, RibPauseTimeOutMultipleTasksTest) {
 
         // Step 7: Verify bestPathAndFibProgrammingPausedBy_ is cleared after
         // timeout
-        sendResumeBestPathAndFibProgramming(RibPauseResumeCause::WATCHDOG);
+        sendResumeBestPathAndFibProgramming(RibPauseResumeCause::BACKPRESSURE);
 
         WITH_RETRIES(
             { ASSERT_EVENTUALLY_FALSE(isBestPathAndFibProgrammingPaused()); });
@@ -6387,36 +6387,6 @@ TEST_F(RibFixture, RibPauseTimeOutMultipleTasksTest) {
 
   // let eventbase run
   testEvb.loop();
-}
-
-/*
- * This test verifies the signal received from Watchdog to Rib with the
- * corresponding logging.
- */
-TEST_F(RibFixture, WatchdogNotificationTest) {
-  auto& notificationQ = rib_->getNotificationQueue();
-  {
-    WatchdogEventMessage msg(std::nullopt, OperationStatus::PAUSE);
-    notificationQ.push(std::move(msg));
-
-    // confirm content in the queue is consumed
-    WITH_RETRIES({ ASSERT_EVENTUALLY_TRUE(notificationQ.size() == 0); });
-
-    // confirm state is set properly
-    WITH_RETRIES(
-        { ASSERT_EVENTUALLY_TRUE(rib_->pauseBestPathAndFibProgramming_); });
-  }
-  {
-    WatchdogEventMessage msg(std::nullopt, OperationStatus::RESUME);
-    notificationQ.push(std::move(msg));
-
-    // confirm content in the queue is consumed
-    WITH_RETRIES({ ASSERT_EVENTUALLY_TRUE(notificationQ.size() == 0); });
-
-    // confirm state is set properly
-    WITH_RETRIES(
-        { ASSERT_EVENTUALLY_FALSE(rib_->pauseBestPathAndFibProgramming_); });
-  }
 }
 
 TEST_F(RibFixture, GetSwitchIdTest) {

@@ -64,16 +64,20 @@ TEST_F(RibFixture, MultipleRibPauseResumeFromDifferentTasksTest) {
   sendPauseBestPathAndFibProgramming(RibPauseResumeCause::BACKPRESSURE);
 
   // Step 4: Send PauseBestPathAndFibProgramming message to rib from
-  // WATCHDOG and verify best path and Fib programming is paused
-  sendPauseBestPathAndFibProgramming(RibPauseResumeCause::WATCHDOG);
+  // ROUTE_FILTER_POLICY_UPDATE and verify best path and Fib programming is
+  // paused
+  sendPauseBestPathAndFibProgramming(
+      RibPauseResumeCause::ROUTE_FILTER_POLICY_UPDATE);
 
   // Step 5: Send ResumeBestPathAndFibProgramming message to rib from
-  // WATCHDOG
-  sendResumeBestPathAndFibProgramming(RibPauseResumeCause::WATCHDOG);
+  // ROUTE_FILTER_POLICY_UPDATE
+  sendResumeBestPathAndFibProgramming(
+      RibPauseResumeCause::ROUTE_FILTER_POLICY_UPDATE);
 
   // Step 6: Send ResumeBestPathAndFibProgramming message to rib from
-  // WATCHDOG again and ensure RIB is not resumed
-  sendResumeBestPathAndFibProgramming(RibPauseResumeCause::WATCHDOG);
+  // ROUTE_FILTER_POLICY_UPDATE again and ensure RIB is not resumed
+  sendResumeBestPathAndFibProgramming(
+      RibPauseResumeCause::ROUTE_FILTER_POLICY_UPDATE);
   fibFuture.wait();
   EXPECT_TRUE(isBestPathAndFibProgrammingPaused());
 

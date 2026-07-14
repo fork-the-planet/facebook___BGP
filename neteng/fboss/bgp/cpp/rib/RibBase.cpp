@@ -236,7 +236,6 @@ void RibBase::run() noexcept {
   // Attention: processLocalRoutesRoutine() should be initialized after
   // processRibInMsgLoop()
   asyncScope_.add(co_withExecutor(&evb_, processLocalRoutesRoutine()));
-  asyncScope_.add(co_withExecutor(&evb_, processWatchdogMsgLoop()));
   if (FLAGS_bgp_coro_profiler_export_ods) {
     asyncScope_.add(co_withExecutor(&evb_, co_exportProfilerStatsLoop()));
   }
@@ -895,16 +894,15 @@ void RibBase::processPauseBestPathAndFibProgramming(
     }
   }
 
-  if ((taskName == RibPauseResumeCause::WATCHDOG) ||
-      (taskName == RibPauseResumeCause::BACKPRESSURE)) {
-    // Case 1: WATCHDOG/BACKPRESSURE pause will not invoke pause timer.
-    // Pause from WATCHDOG/BACKPRESSURE is a hardblocker and will not
+  if (taskName == RibPauseResumeCause::BACKPRESSURE) {
+    // Case 1: BACKPRESSURE pause will not invoke pause timer.
+    // Pause from BACKPRESSURE is a hardblocker and will not
     // rely on ribPauseTimer to unblock, whereas the other tasks will have a
     // max-cap timer duration.
     return;
   }
 
-  // Create/extend ribPauseTimer if it is not WATCHDOG/BACKPRESSURE
+  // Create/extend ribPauseTimer if it is not BACKPRESSURE
   if (ribPauseTimer_) {
     // Case 2: other tasks will extend ribPauseTimer if scheduled.
     XLOGF(
@@ -975,30 +973,24 @@ void RibBase::mayResumeBestPathAndFibProgramming(
      * Case 1: invoked from ribPauseTimer.
      * Best path and FIB programming was resumed due to timeout, clear
      * bestPathAndFibProgrammingPausedBy_ collection except
-     * WATCHDOG/BACKPRESSURE.
+     * BACKPRESSURE.
      *
      * Case 2: invoked from processResumeBestPathAndFibProgramming.
      * The pause reason has already been removed from the caller.
      */
-    folly::F14NodeSet<facebook::bgp::RibPauseResumeCause> causes;
-    if (bestPathAndFibProgrammingPausedBy_.rlock()->contains(
-            RibPauseResumeCause::WATCHDOG)) {
-      causes.insert(RibPauseResumeCause::WATCHDOG);
-    }
     if (bestPathAndFibProgrammingPausedBy_.rlock()->contains(
             RibPauseResumeCause::BACKPRESSURE)) {
-      causes.insert(RibPauseResumeCause::BACKPRESSURE);
-    }
-    if (!causes.empty()) {
       XLOG(
           DBG1,
-          "Skip resuming bestpath selection/fib programming due to WATCHDOG/BACKPRESSURE blocking");
+          "Skip resuming bestpath selection/fib programming due to BACKPRESSURE blocking");
 
+      folly::F14NodeSet<facebook::bgp::RibPauseResumeCause> causes;
+      causes.insert(RibPauseResumeCause::BACKPRESSURE);
       bestPathAndFibProgrammingPausedBy_.wlock()->swap(causes);
       return;
     } else {
       // Clear all entries in bestPathAndFibProgrammingPausedBy_ if
-      // WATCHDOG/BACKPRESSURE is not present
+      // BACKPRESSURE is not present
       bestPathAndFibProgrammingPausedBy_.wlock()->clear();
     }
   }
@@ -3050,36 +3042,6 @@ void RibBase::appendRibPolicyChangeHistory(
         ERR,
         "Could not write RIB policy change history: {}",
         folly::exceptionStr(ex));
-  }
-}
-
-folly::coro::Task<void> RibBase::processWatchdogMsgLoop() noexcept {
-  XLOG(INFO, "Starting watchdog message processing coro task...");
-
-  auto& notificationQ = this->getNotificationQueue();
-  while (true) {
-    // when cancelAndJoinAsync is called, guaranteed to exit
-    co_await folly::coro::co_safe_point;
-
-    auto msg = co_await co_awaitTry(notificationQ.pop());
-    if (!msg.hasValue()) {
-      XLOG(
-          INFO,
-          "[Exit] Coro task cancelled. Terminating processWatchdogMsgLoop");
-      break;
-    }
-
-    if (msg->opStatus_ == OperationStatus::PAUSE) {
-      co_await ribInQ_.push(
-          PauseBestPathAndFibProgramming(RibPauseResumeCause::WATCHDOG));
-
-      XLOG(INFO, "PauseBestPathAndFibProgramming message sent");
-    } else {
-      co_await ribInQ_.push(
-          ResumeBestPathAndFibProgramming(RibPauseResumeCause::WATCHDOG));
-
-      XLOG(INFO, "ResumeBestPathAndFibProgramming message sent");
-    }
   }
 }
 
