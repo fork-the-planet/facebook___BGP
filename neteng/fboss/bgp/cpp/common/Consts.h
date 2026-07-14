@@ -261,9 +261,6 @@ constexpr auto kInitEventCounterFormat{"initialization.{}.duration_ms"};
 constexpr uint16_t kBgpThriftPort = 6909;
 constexpr uint16_t kBgpStreamPort = 6910;
 
-// Time duration of queue size checking interval in watchdog.
-constexpr auto kWatchdogQueueSizeCheckInterval = std::chrono::seconds(3);
-
 // Time duration of system metrics monitoring interval in watchdog.
 constexpr std::chrono::seconds kWatchdogSystemMetricsInterval =
     std::chrono::seconds(5);
@@ -272,14 +269,6 @@ constexpr std::chrono::seconds kWatchdogSystemMetricsInterval =
 constexpr std::chrono::seconds kWatchdogHeartbeatSnapshotInterval =
     std::chrono::seconds(60);
 constexpr size_t kMaxHeartbeatSnapshots = 3;
-
-// Queue size threshold monitored by the watchdog.
-// TODO: make this a configurable BgpSetting from config
-constexpr uint64_t kWatchdogSharedQueueSizePauseThreshold = 4000;
-constexpr uint64_t kWatchdogSharedQueueSizeResumeThreshold = 1000;
-// TODO: tune this threshold later to match DC scale
-constexpr uint64_t kWatchdogPerPeerQueueSizePauseThreshold = 400;
-constexpr uint64_t kWatchdogPerPeerQueueSizeResumeThreshold = 100;
 
 /*
  * RibOut queue size threshold monitored by backpressure

@@ -90,94 +90,10 @@ class Watchdog : public BgpModuleBase {
   int64_t getUptimeSeconds() const;
 
  private:
-  folly::coro::Task<void> monitorQueueSizeLoop();
   folly::coro::Task<void> monitorSystemMetricsLoop();
   folly::coro::Task<void> snapshotHeartbeatsLoop();
   folly::coro::Task<void> dumpHeapProfileLoop(const int32_t intervalInSecond);
   void updateSystemMetrics();
-
-  void processQueueSizeMap(const QueueSizeMapT& queueSizeMap);
-
-  /*
-   * This is the util function to send notification to sessionManager.
-   *
-   * @param: queueName - queue name for logging purpose.
-   * @param: val - queue size for logging purpose.
-   * @param: maybePeerId - the std::optional wrapper of BgpPeerId.
-   *                       std::nullopt will represent to all peers.
-   * @param: opStatus - operational status (PAUSE/RESUME)
-   * @return: none
-   */
-  void sendNotificationToSessionMgrWrapper(
-      const std::string& queueName,
-      int64_t val,
-      std::optional<nettools::bgplib::BgpPeerId>&& maybePeerId,
-      OperationStatus opStatus);
-  void sendNotificationToSessionMgr(
-      std::optional<nettools::bgplib::BgpPeerId>&& maybePeerId,
-      OperationStatus opStatus);
-
-  /*
-   * This is the util function to send notification to Rib.
-   *
-   * @param: queueName - queue name for logging purpose.
-   * @param: val - queue size for logging purpose.
-   * @param: opStatus - operational status (PAUSE/RESUME)
-   */
-  void sendNotificationToRib(
-      const std::string& queuName,
-      int64_t val,
-      OperationStatus opStatus);
-
-  /*
-   * This is the util function to parse queueName based on the matcher string.
-   *
-   * @param: queueName - the std::string representation of queue to be parsed
-   * @param: matcher - the pattern substring to be matched against queueNAme.
-   *
-   * @return: std::nullopt - no valid matching/parsing result.
-   *          nettools::bgplib::BgpPeerId - a valid BgpPeerId
-   */
-  static std::optional<nettools::bgplib::BgpPeerId> matchQueueName(
-      const std::string& queueName,
-      const std::string& matcher);
-
-  /*
-   * Set of util function to process ingress and egress per-peer queue
-   *  - 1) build-up
-   *  - 2) mitigation
-   */
-  void processRibInQueueBuildUp(const std::string& queueName, uint64_t val);
-  void processRibInQueueMitigation(const std::string& queueName, uint64_t val);
-  void processRibOutQueueBuildUp(const std::string& queueName, uint64_t val);
-  void processRibOutQueueMitigation(const std::string& queueName, uint64_t val);
-  void maybeProcessIngressQueueBuildUp(
-      const std::string& queueName,
-      uint64_t val);
-  void maybeProcessIngressQueueMitigation(
-      const std::string& queueName,
-      uint64_t val);
-  void maybeProcessEgressQueueBuildUp(
-      const std::string& queueName,
-      uint64_t val);
-  void maybeProcessEgressQueueMitigation(
-      const std::string& queueName,
-      uint64_t val);
-
-  // make the function private for UT purpose
-  void setMonitoredPaths(MonitoredPathT&& paths) {
-    monitoredPaths_ = std::move(paths);
-  }
-
-  // make the function private for UT purpose
-  void setQueueSizeThreshold(
-      uint64_t pauseThreshold,
-      uint64_t resumeThreshold) {
-    sharedQueueSizePauseThreshold_ = pauseThreshold;
-    sharedQueueSizeResumeThreshold_ = resumeThreshold;
-    perPeerQueueSizePauseThreshold_ = pauseThreshold;
-    perPeerQueueSizeResumeThreshold_ = resumeThreshold;
-  }
 
   // shared_ptr to the BGP++ config
   std::shared_ptr<const Config> config_;
@@ -198,34 +114,6 @@ class Watchdog : public BgpModuleBase {
   folly::Synchronized<
       folly::F14FastMap<std::string, std::deque<HeartbeatSnapshot>>>
       heartbeatSnapshots_;
-
-  /*
-   * This is the state to remember queue build-up or not. They will be used to
-   * determine if a resume message should be sent out.
-   */
-  bool isRibInQueueBuildUp_{false};
-  bool isRibOutQueueBuildUp_{false};
-  folly::F14NodeMap<std::string /* queue name */, bool /* in build-up state */>
-      isPeerQueueBuildUp_;
-
-  /*
-   * This is the list of modules watchdog will montior on.
-   * NOTE: Watchdog will skip the monitoring if the paths given is empty.
-   */
-  static inline MonitoredPathT monitoredPaths_{
-      fmt::format("{}.{}", kModuleRib, kQueueNameRibIn),
-      fmt::format("{}.{}", kModuleRib, kQueueNameRibOut),
-      fmt::format("{}.{}", kModulePeerManager, kModuleSessionManager),
-  };
-
-  static inline uint64_t sharedQueueSizePauseThreshold_{
-      kWatchdogSharedQueueSizePauseThreshold};
-  static inline uint64_t sharedQueueSizeResumeThreshold_{
-      kWatchdogSharedQueueSizeResumeThreshold};
-  static inline uint64_t perPeerQueueSizePauseThreshold_{
-      kWatchdogPerPeerQueueSizePauseThreshold};
-  static inline uint64_t perPeerQueueSizeResumeThreshold_{
-      kWatchdogPerPeerQueueSizeResumeThreshold};
 
 // per class placeholder for test code injection
 // only need to be setup once here
