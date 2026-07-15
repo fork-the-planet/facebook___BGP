@@ -203,6 +203,41 @@ BgpServiceDC::co_setRouteAttributePolicy(
     decrRequestsInExecution();
   };
 
+  /*
+   * Log the incoming policy at the service boundary so an empty-vs-full push
+   * (numStatements == 0) and its expiration window (min/max over the
+   * per-statement expiration_time_s; normally uniform, so min == max) are
+   * visible before the RIB evb processes it.
+   */
+  int64_t minExpirationTimeS = 0;
+  int64_t maxExpirationTimeS = 0;
+  bool anyExpiration = false;
+  for (const auto& statementPair : *policy->statements()) {
+    const auto& statement = statementPair.second;
+    if (!statement.expiration_time_s().has_value()) {
+      continue;
+    }
+    const int64_t expirationTimeS = *statement.expiration_time_s();
+    if (!anyExpiration) {
+      minExpirationTimeS = expirationTimeS;
+      maxExpirationTimeS = expirationTimeS;
+      anyExpiration = true;
+    } else {
+      if (expirationTimeS < minExpirationTimeS) {
+        minExpirationTimeS = expirationTimeS;
+      }
+      if (expirationTimeS > maxExpirationTimeS) {
+        maxExpirationTimeS = expirationTimeS;
+      }
+    }
+  }
+  XLOGF(
+      INFO,
+      "[CTE] co_setRouteAttributePolicy received: numStatements={}, minExpirationTimeS={}, maxExpirationTimeS={}",
+      policy->statements()->size(),
+      anyExpiration ? std::to_string(minExpirationTimeS) : "N/A",
+      anyExpiration ? std::to_string(maxExpirationTimeS) : "N/A");
+
   auto result = co_await co_runOnEvbWithTimeout(
       rib_.getEventBase(),
       [this, p = std::move(policy)]() mutable {

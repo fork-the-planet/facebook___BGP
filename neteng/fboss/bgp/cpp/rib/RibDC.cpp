@@ -42,6 +42,20 @@ using namespace facebook::neteng::fboss::bgp::thrift;
 
 namespace facebook::bgp {
 
+namespace {
+/*
+ * Format a policy's most-recent (soonest) expiration timestamp for logging.
+ * A policy with no statements has no expiration to report, so render it as
+ * "N/A"; otherwise report the epoch-seconds value.
+ */
+std::string formatMostRecentExpirationTimeS(
+    const RouteAttributePolicy& policy) {
+  return policy.getStatements().empty()
+      ? "N/A"
+      : std::to_string(policy.getMostRecentExpirationTime());
+}
+} // namespace
+
 RibDC::CrfResolution RibDC::resolveCrfPolicy(
     std::unique_ptr<RibPolicy> cachedPolicy,
     const std::optional<rib_policy::CrfPolicyArtifact>& artifact) {
@@ -503,6 +517,18 @@ RibDC::CacheMigrationResult RibDC::migrateRouteAttributePolicyCache(
     result.needsReEvaluation = true;
   }
 
+  XLOGF(
+      INFO,
+      "[CTE] Cache migration: classification, oldStatements={}, newStatements={}, statementsRemoved={}, statementsWithNewContent={}, statementsWithNewMatcher={}, hasNewStatements={}, hasUpdate={}, needsReEvaluation={}",
+      oldStmts.size(),
+      newStmts.size(),
+      statementsRemoved.size(),
+      statementsWithNewContent.size(),
+      statementsWithNewMatcher.size(),
+      hasNewStatements,
+      result.hasUpdate,
+      result.needsReEvaluation);
+
   // If no update at all, old policy keeps its cache and remains active
   if (!result.hasUpdate) {
     XLOGF(
@@ -596,9 +622,20 @@ bool RibDC::replaceRouteAttributePolicy(
   bool needsReEvaluation = false;
   std::vector<folly::CIDRNetwork> prefixesNeedingReEvaluation;
 
+  XLOGF(
+      INFO,
+      "[CTE] replaceRouteAttributePolicy: hasExistingPolicy={}, newPolicyPresent={}, newNumStatements={}, newMostRecentExpirationTimeS={}",
+      routeAttributePolicy_ != nullptr,
+      newPolicy != nullptr,
+      newPolicy ? newPolicy->getStatements().size() : 0,
+      newPolicy ? formatMostRecentExpirationTimeS(*newPolicy) : "N/A");
+
   if (routeAttributePolicy_) {
     if (!newPolicy) {
       // Policy cleared - need full re-evaluation
+      XLOGF(
+          INFO,
+          "[CTE] replaceRouteAttributePolicy: existing policy cleared (newPolicy null) -> full re-evaluation");
       hasUpdate = true;
       needsReEvaluation = true;
     } else {
@@ -618,7 +655,20 @@ bool RibDC::replaceRouteAttributePolicy(
     // No existing policy - hasUpdate if newPolicy is not nullptr
     hasUpdate = (newPolicy != nullptr);
     needsReEvaluation = hasUpdate;
+    XLOGF(
+        INFO,
+        "[CTE] replaceRouteAttributePolicy: no existing policy, hasUpdate={}, needsReEvaluation={}",
+        hasUpdate,
+        needsReEvaluation);
   }
+
+  XLOGF(
+      INFO,
+      "[CTE] replaceRouteAttributePolicy decision: hasUpdate={}, needsReEvaluation={}, affectedPrefixes={}, ribEoRReceived={}",
+      hasUpdate,
+      needsReEvaluation,
+      prefixesNeedingReEvaluation.size(),
+      ribEoRReceived_);
 
   /* We should replace routeAttributePolicy_ not only when its content changes
      but also when its expiration time changes. */
@@ -692,6 +742,10 @@ bool RibDC::replaceRouteAttributePolicy(
     }
 
     schedulePrepareFibProgrammingTimer();
+  } else if (needsReEvaluation && !ribEoRReceived_) {
+    XLOGF(
+        INFO,
+        "[CTE] replaceRouteAttributePolicy: needsReEvaluation but ribEoR not yet received; deferring path selection to initial FULL_SYNC");
   }
 
   return hasUpdate;
