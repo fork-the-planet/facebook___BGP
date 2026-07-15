@@ -257,7 +257,19 @@ void LbwExtCommunityAction::applyAction(
   CHECK(data.has_value());
   auto& policyActionData = *data;
   CHECK(policyActionData != nullptr);
-  CHECK(policyActionData->lbwActionData.has_value());
+  /*
+   * Injected/synthesized routes (offline simulator) can reach an LBW egress
+   * action without lbwActionData populated; treat that as no-op rather than
+   * aborting. Production always populates it, so this guard is a sim-only path.
+   */
+  if (!policyActionData->lbwActionData.has_value()) {
+    XLOGF_EVERY_MS(
+        WARN,
+        60000,
+        "LBW ext-community action missing lbwActionData; treating as no-op. action_type={}",
+        apache::thrift::util::enumNameSafe(*lbwExtCommunityAction_.type()));
+    return;
+  }
   const auto& lbwActionData = *policyActionData->lbwActionData;
 
   switch (*lbwExtCommunityAction_.type()) {

@@ -22,6 +22,7 @@
 #include "neteng/fboss/bgp/cpp/common/Consts.h"
 #include "neteng/fboss/bgp/cpp/lib/BgpStructs.h"
 #include "neteng/fboss/bgp/cpp/policy/PolicyAction.h"
+#include "neteng/fboss/bgp/cpp/policy/PolicyStructs.h"
 #include "neteng/fboss/bgp/cpp/policy/PolicyUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/PolicyUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/Utils.h"
@@ -1579,6 +1580,35 @@ TEST_F(ExtCommunityPolicyTest, RemoveExtCommunitiesLinkBandwidthTest) {
   EXPECT_TRUE(hasExtCommunity(result, BgpAttrExtCommunityC(lbw1)));
   EXPECT_FALSE(hasExtCommunity(result, BgpAttrExtCommunityC(lbw2)));
   EXPECT_TRUE(hasExtCommunity(result, BgpAttrExtCommunityC(lbw3)));
+}
+
+/*
+ * An LBW egress action can be reached by an injected/synthesized route (the
+ * offline simulator's injection path) whose BgpPolicyActionData carries no
+ * lbwActionData. applyAction must treat that as a no-op rather than
+ * CHECK-aborting: the LBW ext-community already on the path is left untouched.
+ */
+TEST_F(ExtCommunityPolicyTest, LbwActionWithoutLbwActionDataIsNoOp) {
+  auto action = std::make_shared<LbwExtCommunityAction>(
+      createBgpPolicyLbwExtCommunityAction(
+          bgp_policy::LbwExtCommunityActionType::DISABLE));
+
+  auto path = createBgpPath();
+  path->setNonTransitiveLbwExtCommunity(/*asn=*/65000, /*lbwValue=*/1e9);
+  ASSERT_TRUE(path->hasNonTransitiveLbwExtCommunity());
+
+  auto data = std::make_shared<BgpPolicyActionData>(
+      /*switchId=*/std::nullopt,
+      /*multiPathSize=*/std::nullopt,
+      /*lbwActionData=*/std::nullopt);
+
+  action->applyAction(path, data);
+
+  /*
+   * The guard returned before the DISABLE switch, so the LBW ext-community was
+   * NOT pruned -- the action was a no-op.
+   */
+  EXPECT_TRUE(path->hasNonTransitiveLbwExtCommunity());
 }
 
 } /* namespace facebook::bgp */
