@@ -287,6 +287,17 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
     return localRoutes_;
   }
 
+  /*
+   * True when at least one local route is configured to originate
+   * conditionally on nexthop resolution (populated in the ctor from each
+   * route's require_nexthop_resolution flag). The composition root uses this
+   * to arm PeerManagerBase's nexthop-resolution gate without a separate config
+   * knob — conditionalLocalRoutes_ is the single source of truth.
+   */
+  bool hasConditionalLocalRoutes() const {
+    return !conditionalLocalRoutes_.empty();
+  }
+
   /**
    * @brief Retrieves NexthopInfo for a given nexthop IP address from the
    * nexthopInfoMap_.

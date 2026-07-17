@@ -3334,6 +3334,25 @@ getMultipleConditionalLocalRoutes() {
   return routes;
 }
 
+// hasConditionalLocalRoutes() must reflect whether any configured local route
+// requires nexthop resolution. This is the single source of truth the
+// composition root (Main.cpp) uses to arm PeerManagerBase's nexthop-resolution
+// gate, so it must be true whenever conditionalLocalRoutes_ is populated in the
+// RIB ctor and false otherwise.
+TEST_F(
+    RibWithLocalRouteFixture,
+    HasConditionalLocalRoutes_TrueWhenRoutesRequireResolution) {
+  setUpRibAndFib(getMultipleConditionalLocalRoutes());
+  EXPECT_TRUE(rib_->hasConditionalLocalRoutes());
+}
+
+TEST_F(
+    RibWithLocalRouteFixture,
+    HasConditionalLocalRoutes_FalseWhenNoRouteRequiresResolution) {
+  setUpRibAndFib(getDefaultLocalRoutes());
+  EXPECT_FALSE(rib_->hasConditionalLocalRoutes());
+}
+
 // Test that conditional local routes are NOT originated at startup
 // when the nexthop is not resolved
 TEST_F(
