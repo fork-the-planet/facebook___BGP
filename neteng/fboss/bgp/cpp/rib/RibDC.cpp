@@ -488,6 +488,7 @@ RibDC::CacheMigrationResult RibDC::migrateRouteAttributePolicyCache(
   folly::F14FastSet<std::string> statementsWithNewMatcher;
   folly::F14FastSet<std::string> statementsRemoved;
   bool hasNewStatements = false;
+  bool hasReactivatedStatement = false;
 
   // Check old statements against new (find changed/removed)
   for (const auto& [name, oldStmt] : oldStmts) {
@@ -507,6 +508,15 @@ RibDC::CacheMigrationResult RibDC::migrateRouteAttributePolicyCache(
           statementsWithNewMatcher.insert(name);
         }
       }
+      /*
+       * A statement that was expired (inactive) in the old policy but is active
+       * in the new one can now match prefixes that were cached as negative (no
+       * match) while it was inactive. Those negative entries must be
+       * re-evaluated, exactly like a newly added statement would require.
+       */
+      if (!oldStmt.isActive() && it->second.isActive()) {
+        hasReactivatedStatement = true;
+      }
     }
   }
 
@@ -519,13 +529,14 @@ RibDC::CacheMigrationResult RibDC::migrateRouteAttributePolicyCache(
 
   XLOGF(
       INFO,
-      "[CTE] Cache migration: classification, oldStatements={}, newStatements={}, statementsRemoved={}, statementsWithNewContent={}, statementsWithNewMatcher={}, hasNewStatements={}, hasUpdate={}, needsReEvaluation={}",
+      "[CTE] Cache migration: classification, oldStatements={}, newStatements={}, statementsRemoved={}, statementsWithNewContent={}, statementsWithNewMatcher={}, hasNewStatements={}, hasReactivatedStatement={}, hasUpdate={}, needsReEvaluation={}",
       oldStmts.size(),
       newStmts.size(),
       statementsRemoved.size(),
       statementsWithNewContent.size(),
       statementsWithNewMatcher.size(),
       hasNewStatements,
+      hasReactivatedStatement,
       result.hasUpdate,
       result.needsReEvaluation);
 
@@ -585,14 +596,14 @@ RibDC::CacheMigrationResult RibDC::migrateRouteAttributePolicyCache(
       }
     } else {
       // Negative cache entry (prefix matched no statement)
-      if (hasNewStatements) {
+      if (hasNewStatements || hasReactivatedStatement) {
         /*
-         * New statements might match this prefix - need to re-evaluate.
-         * Invalidate cache and mark as affected.
+         * A new or newly-reactivated statement might match this prefix - need
+         * to re-evaluate. Invalidate cache and mark as affected.
          */
         result.affectedPrefixes.push_back(prefix);
       } else {
-        // No new statements - negative cache is still valid
+        // No new/reactivated statements - negative cache is still valid
         newPolicy.setCacheEntry(prefix, std::nullopt);
         ++preserved;
       }

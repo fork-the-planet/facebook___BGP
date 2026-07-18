@@ -1758,6 +1758,62 @@ TEST_P(
 }
 
 /**
+ * Test: CacheMigrationReactivatedStatementReEvaluatesNegativeCache
+ *
+ * A statement that is expired (inactive) when a prefix is first evaluated
+ * caches that prefix as a negative (no-match) entry. When the statement is
+ * later reactivated by extending its expiration -- an expiration-only content
+ * delta, with no new statement added -- those negative entries must be
+ * re-evaluated so the prefix picks up the now-active statement. Otherwise the
+ * prefix stays stuck at "no match" and never receives the statement's
+ * attributes (under-application).
+ */
+TEST_F(
+    RibFixtureAddPathTestSuite,
+    CacheMigrationReactivatedStatementReEvaluatesNegativeCache) {
+  int64_t weight = 100;
+  auto now = std::chrono::seconds(std::time(nullptr));
+  auto pastExpiration = now.count() - 100; // stale: expired 100s ago
+  auto futureExpiration = now.count() + 3600; // active
+
+  // Old policy: stmt1 structurally matches prefix1, but is expired (inactive).
+  auto tOldPolicy = createTRouteAttributePolicyLbw(
+      {kV4Prefix1}, weight, "stmt1", pastExpiration);
+  RouteAttributePolicy oldPolicy{tOldPolicy};
+
+  // Warm the cache: prefix1 matches stmt1's matcher, but because stmt1 is
+  // inactive it resolves to no match -> negative cache entry.
+  RibEntry entry1(kV4Prefix1);
+  RouteAttributePolicy::RibChange warmupChange;
+  EXPECT_FALSE(oldPolicy.overwriteRouteAttributes(entry1, warmupChange));
+  ASSERT_TRUE(oldPolicy.getCache().contains(kV4Prefix1));
+  EXPECT_FALSE(oldPolicy.getCache().at(kV4Prefix1).has_value()); // negative
+
+  // New policy: same stmt1 (same matcher and action), expiration extended into
+  // the future -> reactivated (stale -> active), no other content change.
+  auto tNewPolicy = createTRouteAttributePolicyLbw(
+      {kV4Prefix1}, weight, "stmt1", futureExpiration);
+  RouteAttributePolicy newPolicy{tNewPolicy};
+
+  auto result = rib_->migrateRouteAttributePolicyCache(oldPolicy, newPolicy);
+
+  EXPECT_TRUE(result.hasUpdate);
+  EXPECT_TRUE(result.needsReEvaluation);
+  // The stale negative entry must be invalidated + re-evaluated so it can pick
+  // up the reactivated statement (rather than being preserved as no-match).
+  EXPECT_THAT(result.affectedPrefixes, ::testing::Contains(kV4Prefix1));
+  EXPECT_FALSE(newPolicy.getCache().contains(kV4Prefix1));
+
+  // End-to-end: re-evaluating prefix1 against the new policy now matches the
+  // reactivated statement.
+  RibEntry reEvalEntry(kV4Prefix1);
+  RouteAttributePolicy::RibChange reEvalChange;
+  EXPECT_TRUE(newPolicy.overwriteRouteAttributes(reEvalEntry, reEvalChange));
+  ASSERT_TRUE(newPolicy.getCache().at(kV4Prefix1).has_value());
+  EXPECT_EQ("stmt1", newPolicy.getCache().at(kV4Prefix1)->getStatementName());
+}
+
+/**
  * Test: CacheMigrationBothExpiredIdentical
  *
  * Verifies that when both old and new policies have identical content AND
